@@ -12,10 +12,11 @@ class NKIGather(NKIOp):
 
     NAME: ClassVar[str] = "dma_copy"
     INDIRECT_DMA_MODE: ClassVar[str | None] = "gather"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"src": ("P", "F"), "indices": ("P", "I"), "dst": ("P", "F")}
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"src": ("S", "F"), "indices": ("P", "I"), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src", "indices"})
-    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128, "I": 1}
-    MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None, "I": 1}
+    NON_TILABLE_AXES: ClassVar[frozenset[str]] = frozenset({"S"})
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"S": 1, "P": 1, "F": 1, "I": 1}
+    MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"S": None, "P": 128, "F": None, "I": 1}
     OUTPUT_ROLE: ClassVar[str] = "sbuf"
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 

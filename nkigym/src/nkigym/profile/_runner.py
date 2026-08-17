@@ -130,6 +130,3 @@ def run_profile(
         compile_s=compile_s,
         profile_s=profile_s,
     )
-
-
-__all__ = ["run_profile"]

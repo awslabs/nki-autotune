@@ -15,4 +15,5 @@ reportMissingImports = "none"
 
 [tool.pytest.ini_options]
 pythonpath = ["nkigym/src"]
+required_plugins = ["pytest-timeout"]
 testpaths = ["test"]

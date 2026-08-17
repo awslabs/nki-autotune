@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import AccessPattern, Add, Const, Expr, KernelIR, Mul, substitute, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import AxisRole, BatchedPermutationContract, PermutationContract
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
-from nkigym.transforms.helper.tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
+from nkigym.search.state_facts import operation_facts
+from nkigym.transforms.base import (
+    Transform,
+    TransformLegalityError,
+    TransformOption,
+    copy_for_rewrite,
+    intersects_software_pipeline,
+    software_pipeline_overlap_nodes,
+)
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
 
 @dataclass(frozen=True)
@@ -38,9 +45,13 @@ class BatchPermutation(Transform[BatchPermutationOption]):
 
     def analyze(self, ir: KernelIR) -> list[BatchPermutationOption]:
         """Return every directly tensorizable permutation loop."""
+        if not operation_facts(ir).has_batched_permutation:
+            return []
         options: list[BatchPermutationOption] = []
+        buffers = ir.all_buffers()
+        overlap_nodes = software_pipeline_overlap_nodes(ir)
         for nid in ir.tree.preorder():
-            if _match_loop(ir, nid) is not None:
+            if isinstance(ir.tree.data(nid), ForNode) and _match_loop(ir, nid, buffers, overlap_nodes) is not None:
                 options.append(BatchPermutationOption(loop_nid=nid))
         return options
 
@@ -51,7 +62,7 @@ class BatchPermutation(Transform[BatchPermutationOption]):
             raise TransformLegalityError(
                 f"BatchPermutation loop {option.loop_nid} is not an eligible permutation batch"
             )
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         copied_match = _match_option(new_ir, option)
         if copied_match is None:
             raise AssertionError("BatchPermutation match disappeared after deepcopy")
@@ -64,13 +75,17 @@ def _match_option(ir: KernelIR, option: BatchPermutationOption) -> _BatchMatch |
     """Resolve ``option`` without accepting an unknown node id."""
     result: _BatchMatch | None = None
     if option.loop_nid in ir.tree.graph:
-        result = _match_loop(ir, option.loop_nid)
+        result = _match_loop(ir, option.loop_nid, ir.all_buffers())
     return result
 
 
-def _match_loop(ir: KernelIR, loop_nid: int) -> _BatchMatch | None:
+def _match_loop(
+    ir: KernelIR, loop_nid: int, buffers: dict[str, Buffer], overlap_nodes: frozenset[int] | None = None
+) -> _BatchMatch | None:
     """Return the contract and geometry for one eligible loop."""
     result: _BatchMatch | None = None
+    if intersects_software_pipeline(ir, (loop_nid,), overlap_nodes):
+        return result
     node = ir.tree.data(loop_nid)
     children = ir.tree.children(loop_nid) if isinstance(node, ForNode) else []
     if isinstance(node, ForNode) and node.extent > 1 and len(children) == 1:
@@ -80,7 +95,7 @@ def _match_loop(ir: KernelIR, loop_nid: int) -> _BatchMatch | None:
             contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
             if isinstance(contract, PermutationContract) and contract.batching is not None:
                 block_nid = _owning_block(ir, leaf_nid)
-                axes = _match_geometry(ir, block_nid, node, leaf, contract)
+                axes = _match_geometry(ir, block_nid, node, leaf, contract, buffers)
                 if axes is not None:
                     result = _BatchMatch(
                         block_nid=block_nid,
@@ -95,7 +110,12 @@ def _match_loop(ir: KernelIR, loop_nid: int) -> _BatchMatch | None:
 
 
 def _match_geometry(
-    ir: KernelIR, block_nid: int, loop: ForNode, leaf: ISANode, contract: PermutationContract
+    ir: KernelIR,
+    block_nid: int,
+    loop: ForNode,
+    leaf: ISANode,
+    contract: PermutationContract,
+    buffers: dict[str, Buffer],
 ) -> tuple[int, int] | None:
     """Return varying input/output axes when regions form contiguous batches."""
     result: tuple[int, int] | None = None
@@ -108,8 +128,8 @@ def _match_geometry(
     output = leaf.operand_bindings[contract.output_operand]
     if source.tensor == output.tensor or len(source.ranges) != 2 or len(output.ranges) != 2:
         return result
-    source_buffer = ir.buffer(source.tensor)
-    output_buffer = ir.buffer(output.tensor)
+    source_buffer = buffers[source.tensor]
+    output_buffer = buffers[output.tensor]
     if not _supported_buffer(source_buffer) or not _supported_buffer(output_buffer):
         return result
     if output_buffer.location != "sbuf":
@@ -227,7 +247,6 @@ def _apply_match(ir: KernelIR, match: _BatchMatch) -> None:
         raise AssertionError(f"batch loop {match.loop_nid} has no parent")
     _replace_in_parent_children(ir.tree, parent, [match.loop_nid], [match.leaf_nid])
     ir.tree.graph.remove_node(match.loop_nid)
-    invalidate_stale_software_pipelines(ir)
 
     source_buffer = ir.buffer(source.tensor)
     output_buffer = ir.buffer(output.tensor)

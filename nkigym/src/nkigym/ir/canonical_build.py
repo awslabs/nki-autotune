@@ -10,22 +10,29 @@ Every compute op (including memset) becomes a sibling leaf block under
 the root block, preserving source order.
 
 Buffer placement is delegated to
-:func:`nkigym.ir.buffer_placement.place_buffers`.
+:func:`nkigym.search.buffer_placement.place_buffers`.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING
 
 from nkigym.ir.arith.expr import Const, Var
-from nkigym.ir.dimension_analysis import _OpRecord
+from nkigym.ir.dimension_analysis import TensorDims, _AnalysisResult, _OpRecord
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole
 from nkigym.ops.memset import NKIMemset
 
-if TYPE_CHECKING:
-    from nkigym.ir.dimension_analysis import TensorDims, _AnalysisResult
+
+class CanonicalTileError(ValueError):
+    """A dimension cannot be divided into legal canonical tiles."""
+
+    def __init__(self, message: str, dimension: str, extent: int, minimum: int) -> None:
+        """Record the failed concrete dimension and minimum legal tile."""
+        super().__init__(message)
+        self.dimension = dimension
+        self.extent = extent
+        self.minimum = minimum
 
 
 def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
@@ -35,7 +42,7 @@ def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
     Build leaf blocks under it, seed all Buffers on the root, then run
     LCA placement to distribute them to their lifetime-dominating blocks.
     """
-    from nkigym.ir.buffer_placement import place_buffers
+    from nkigym.search.buffer_placement import place_buffers
 
     tree = KernelTree()
     op_records = list(analysis.ops)
@@ -79,11 +86,15 @@ def _tile_size(rec: "_OpRecord", abstract: str, analysis: "_AnalysisResult") -> 
     extent = analysis.dim_sizes[rec.axis_map[abstract]]
     minimum = min(rec.op_cls.MIN_TILE_SIZE.get(abstract, 1), extent)
     maximum = rec.op_cls.MAX_TILE_SIZE.get(abstract)
-    tile = extent if maximum is None else min(extent, maximum)
-    if tile < minimum:
-        raise ValueError(f"{rec.op_cls.__name__}.{abstract} tile {tile} is below canonical minimum {minimum}")
-    if extent % tile != 0:
-        raise ValueError(f"{rec.op_cls.__name__}.{abstract} extent {extent} is not divisible by canonical tile {tile}")
+    upper = extent if maximum is None else min(extent, maximum)
+    tile = next((candidate for candidate in range(upper, minimum - 1, -1) if extent % candidate == 0), None)
+    if tile is None:
+        raise CanonicalTileError(
+            f"{rec.op_cls.__name__}.{abstract} extent {extent} has no canonical tile between {minimum} and {upper}",
+            rec.axis_map[abstract],
+            extent,
+            minimum,
+        )
     return tile
 
 

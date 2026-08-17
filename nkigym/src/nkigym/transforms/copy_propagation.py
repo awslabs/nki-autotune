@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ISANode
 from nkigym.ops.base import CopyContract
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
-from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, remove_buffers, single_leaf
-from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
+from nkigym.search.state_facts import operation_facts
+from nkigym.transforms.base import (
+    Transform,
+    TransformLegalityError,
+    TransformOption,
+    copy_for_rewrite,
+    intersects_software_pipeline,
+    software_pipeline_overlap_nodes,
+)
+from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, single_leaf
 
 
 @dataclass(frozen=True)
@@ -34,12 +40,16 @@ class _CopyPropagationMatch:
 
 
 class CopyPropagation(Transform[CopyPropagationOption]):
-    """Remove a value-preserving copy after scheduling it beside its consumer."""
+    """Substitute one value-preserving copy source into its consumer."""
 
     def analyze(self, ir: KernelIR) -> list[CopyPropagationOption]:
         """Return every adjacent copy-consumer pair accepted by storage contracts."""
+        if not operation_facts(ir).has_copy:
+            return []
         options: list[CopyPropagationOption] = []
         buffers = ir.all_buffers()
+        overlap_nodes = software_pipeline_overlap_nodes(ir)
+        positions = {nid: index for index, nid in enumerate(ir.tree.preorder())}
         for parent_nid in ir.tree.preorder():
             children = ir.tree.children(parent_nid)
             for copy_nid, consumer_nid in zip(children, children[1:]):
@@ -55,16 +65,19 @@ class CopyPropagation(Transform[CopyPropagationOption]):
                     option = CopyPropagationOption(
                         copy_block_nid=copy_nid, consumer_block_nid=consumer_nid, consumer_operand=operand
                     )
-                    if self._resolve(ir, option, buffers) is not None:
+                    if (
+                        self._resolve(ir, option, buffers, overlap_nodes, adjacent=True, positions=positions)
+                        is not None
+                    ):
                         options.append(option)
         return options
 
     def apply(self, ir: KernelIR, option: CopyPropagationOption) -> KernelIR:
-        """Recheck, copy, propagate the source region, and delete the copy."""
+        """Recheck, copy, and propagate the source region into one consumer."""
         match = self._resolve(ir, option, ir.all_buffers())
         if match is None:
             raise TransformLegalityError(f"illegal CopyPropagation option: {option}")
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         copied_match = self._resolve(new_ir, option, new_ir.all_buffers())
         if copied_match is None:
             raise AssertionError(f"CopyPropagation option disappeared after deepcopy: {option}")
@@ -72,7 +85,13 @@ class CopyPropagation(Transform[CopyPropagationOption]):
         return new_ir
 
     def _resolve(
-        self, ir: KernelIR, option: CopyPropagationOption, buffers: dict[str, Buffer]
+        self,
+        ir: KernelIR,
+        option: CopyPropagationOption,
+        buffers: dict[str, Buffer],
+        overlap_nodes: frozenset[int] | None = None,
+        adjacent: bool | None = None,
+        positions: dict[int, int] | None = None,
     ) -> _CopyPropagationMatch | None:
         """Resolve an option when copy semantics, storage, and use-def all agree."""
         result: _CopyPropagationMatch | None = None
@@ -82,14 +101,18 @@ class CopyPropagation(Transform[CopyPropagationOption]):
             return result
         if not isinstance(ir.tree.data(copy_nid), BlockNode) or not isinstance(ir.tree.data(consumer_nid), BlockNode):
             return result
-        parent = ir.tree.parent(copy_nid)
-        siblings = ir.tree.children(parent) if parent is not None else []
-        if (
-            parent is None
-            or ir.tree.parent(consumer_nid) != parent
-            or copy_nid not in siblings
-            or siblings.index(consumer_nid) != siblings.index(copy_nid) + 1
-        ):
+        if intersects_software_pipeline(ir, (copy_nid, consumer_nid), overlap_nodes):
+            return result
+        if adjacent is None:
+            parent = ir.tree.parent(copy_nid)
+            siblings = ir.tree.children(parent) if parent is not None else []
+            adjacent = (
+                parent is not None
+                and ir.tree.parent(consumer_nid) == parent
+                and copy_nid in siblings
+                and siblings.index(consumer_nid) == siblings.index(copy_nid) + 1
+            )
+        if not adjacent:
             return result
         copy_leaf_nid = single_leaf(ir.tree, copy_nid)
         consumer_leaf_nid = single_leaf(ir.tree, consumer_nid)
@@ -111,11 +134,26 @@ class CopyPropagation(Transform[CopyPropagationOption]):
             return result
         copied_buffer = buffers[copied.tensor]
         source_buffer = buffers[source.tensor]
-        accepted = consumer_leaf.op_cls.INPUT_LOCATIONS.get(option.consumer_operand, frozenset())
+        locations = {
+            operand: buffers[region.tensor].location
+            for operand, region in consumer_leaf.operand_bindings.items()
+            if operand in consumer_leaf.op_cls.INPUT_OPERANDS
+        }
+        locations[option.consumer_operand] = source_buffer.location
+        dtypes = {
+            operand: buffers[region.tensor].physical_dtype()
+            for operand, region in consumer_leaf.operand_bindings.items()
+            if operand in consumer_leaf.op_cls.INPUT_OPERANDS
+        }
+        dtypes[option.consumer_operand] = source_buffer.physical_dtype()
         required_dtype = consumer_leaf.op_cls.REQUIRED_INPUT_STORAGE_DTYPES.get(option.consumer_operand)
         if (
             copied_buffer.location == "shared_hbm"
-            or source_buffer.location not in accepted
+            or source_buffer.location not in {"sbuf", "psum"}
+            or (source_buffer.dtype, source_buffer.physical_dtype())
+            != (copied_buffer.dtype, copied_buffer.physical_dtype())
+            or not consumer_leaf.op_cls.accepts_input_locations(locations)
+            or not consumer_leaf.op_cls.accepts_input_storage_dtypes(dtypes)
             or (required_dtype is not None and source_buffer.physical_dtype() != required_dtype)
             or source.tensor == copied.tensor
             or len(source.ranges) != len(copied.ranges)
@@ -127,6 +165,14 @@ class CopyPropagation(Transform[CopyPropagationOption]):
         if any(buffer.name != copied.tensor for buffer in copy_block.alloc_buffers):
             return result
         if not self._has_single_use_and_definition(ir, copied.tensor, copy_leaf_nid, consumer_leaf_nid):
+            return result
+        if not self._source_remains_stable(
+            ir,
+            source.tensor,
+            copy_leaf_nid,
+            consumer_leaf_nid,
+            positions if positions is not None else {nid: index for index, nid in enumerate(ir.tree.preorder())},
+        ):
             return result
         result = _CopyPropagationMatch(
             option=option,
@@ -143,10 +189,9 @@ class CopyPropagation(Transform[CopyPropagationOption]):
         """Return whether the copied tensor has exactly one writer and one reader."""
         readers: list[int] = []
         writers: list[int] = []
-        for nid in ir.tree.preorder():
+        for nid in ir.dependency.touches_by_tensor.get(tensor, ()):
             node = ir.tree.data(nid)
-            if not isinstance(node, ISANode):
-                continue
+            assert isinstance(node, ISANode)
             rmw_operands = node.op_cls.rmw_operands(node.kwargs)
             for slot, region in node.operand_bindings.items():
                 if region.tensor != tensor:
@@ -157,8 +202,27 @@ class CopyPropagation(Transform[CopyPropagationOption]):
                     writers.append(nid)
         return readers == [consumer_leaf_nid] and writers == [copy_leaf_nid]
 
+    def _source_remains_stable(
+        self, ir: KernelIR, tensor: str, copy_leaf_nid: int, consumer_leaf_nid: int, positions: dict[int, int]
+    ) -> bool:
+        """Return whether no intervening instruction overwrites ``tensor``."""
+        copy_position = positions[copy_leaf_nid]
+        consumer_position = positions[consumer_leaf_nid]
+        if copy_position >= consumer_position:
+            return False
+        for nid in ir.dependency.touches_by_tensor.get(tensor, ()):
+            position = positions[nid]
+            if copy_position < position <= consumer_position:
+                node = ir.tree.isa(nid)
+                if any(
+                    region.tensor == tensor and operand not in node.op_cls.INPUT_OPERANDS
+                    for operand, region in node.operand_bindings.items()
+                ):
+                    return False
+        return True
+
     def _rewrite(self, ir: KernelIR, match: _CopyPropagationMatch) -> None:
-        """Retarget the consumer, remove the copy block, and rebuild metadata."""
+        """Retarget the consumer and rebuild derived metadata."""
         consumer = ir.tree.isa(match.consumer_leaf_nid)
         bindings = dict(consumer.operand_bindings)
         bindings[match.option.consumer_operand] = match.source
@@ -178,24 +242,6 @@ class CopyPropagation(Transform[CopyPropagationOption]):
                 f"consumer block {match.option.consumer_block_nid} does not read {match.copied.tensor!r}"
             )
         ir.tree.graph.nodes[match.option.consumer_block_nid]["data"] = replace(consumer_block, reads=tuple(reads))
-
-        parent = ir.tree.parent(match.option.copy_block_nid)
-        if parent is None:
-            raise AssertionError(f"copy block {match.option.copy_block_nid} has no parent")
-        copy_parent = ir.tree.parent(match.copy_leaf_nid)
-        if copy_parent is None:
-            raise AssertionError(f"copy leaf {match.copy_leaf_nid} has no parent")
-        remove_buffers(ir, {match.copied.tensor})
-        ir.tree.graph.remove_node(match.copy_leaf_nid)
-        while copy_parent != match.option.copy_block_nid and not ir.tree.children(copy_parent):
-            empty_loop = copy_parent
-            copy_parent = ir.tree.parent(empty_loop)
-            if copy_parent is None:
-                raise AssertionError(f"copy loop {empty_loop} has no parent")
-            ir.tree.graph.remove_node(empty_loop)
-        remaining = ir.tree.children(match.option.copy_block_nid)
-        _replace_in_parent_children(ir.tree, parent, [match.option.copy_block_nid], remaining)
-        ir.tree.graph.remove_node(match.option.copy_block_nid)
         finalize_rewrite(ir)
 
 

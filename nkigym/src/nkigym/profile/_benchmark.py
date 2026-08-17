@@ -73,6 +73,3 @@ def benchmark_kernel(neff_path: Path, artifacts_dir: Path, lnc: int, visible_cor
     if not isinstance(raw_summary, dict):
         raise RuntimeError("Neuron Explorer returned a non-object model summary")
     return dict(raw_summary)
-
-
-__all__ = ["benchmark_kernel"]

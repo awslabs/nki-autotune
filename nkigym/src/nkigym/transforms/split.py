@@ -2,24 +2,28 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
+from functools import cache
+from math import isqrt
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.analyzer import Analyzer
 from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var
-from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
+from nkigym.ir.dependency_rebind import rebind_exact_retile
+from nkigym.ir.tree import BlockNode, Buffer, ForNode, ISANode, KernelTree
 from nkigym.ops.base import ReductionContract
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.base import (
+    Transform,
+    TransformLegalityError,
+    TransformOption,
+    copy_for_rewrite,
+    intersects_software_pipeline,
+    software_pipeline_overlap_nodes,
+)
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
 from nkigym.transforms.helper.normalize import _substitute_block_regions, normalize_block
 from nkigym.transforms.helper.tile_region import retile_region
-from nkigym.transforms.helper.tree_ops import (
-    _block_local_descendants,
-    _replace_in_parent_children,
-    invalidate_stale_software_pipelines,
-)
+from nkigym.transforms.helper.tree_ops import _block_local_descendants, _replace_in_parent_children
 
 
 @dataclass(frozen=True)
@@ -47,8 +51,12 @@ class Split(Transform[SplitOption]):
 
     def analyze(self, ir: KernelIR) -> list[SplitOption]:
         options: list[SplitOption] = []
+        buffers = ir.all_buffers()
+        overlap_nodes = software_pipeline_overlap_nodes(ir)
         for nid in ir.tree.preorder():
             data = ir.tree.data(nid)
+            if nid in overlap_nodes:
+                continue
             if isinstance(data, (ForNode, ISANode)) and subtree_has_access_patterns(ir.tree, nid):
                 continue
             if isinstance(data, ForNode):
@@ -63,7 +71,7 @@ class Split(Transform[SplitOption]):
                 block_nid, block = _find_enclosing_block(ir.tree, nid)
                 for iv in block.iter_vars:
                     concrete = iv.axis
-                    if _is_slot_reduction_axis(ir, nid, concrete):
+                    if _is_static_axis(data, block, concrete) or _is_slot_reduction_axis(ir, nid, concrete):
                         continue
                     """Tile width currently bound on the leaf (max_tile or full extent)."""
                     current = _current_tensorize_width(data, block, concrete)
@@ -71,20 +79,22 @@ class Split(Transform[SplitOption]):
                         continue
                     floor = _min_tile_floor(data, block, concrete)
                     for factors in _factorizations(current):
-                        if floor is not None and factors[-1] < floor:
+                        if (floor is not None and factors[-1] < floor) or not _partition_width_valid(
+                            data, block, concrete, factors[-1], buffers
+                        ):
                             continue
                         options.append(SplitOption(target_nid=nid, factors=factors, target_axis=concrete))
         return options
 
     def apply(self, ir: KernelIR, option: SplitOption) -> KernelIR:
         self._check_legality(ir, option)
-        new_ir = copy.deepcopy(ir)
+        block_nid, _block = _find_enclosing_block(ir.tree, option.target_nid)
+        new_ir = copy_for_rewrite(ir)
         if option.target_axis is None:
             self._do_outer_trip(new_ir, option)
         else:
             self._do_tensorize(new_ir, option)
-        invalidate_stale_software_pipelines(new_ir)
-        new_ir.dependency = Dependency(new_ir.tree)
+        new_ir.dependency = rebind_exact_retile(ir.dependency, new_ir.tree, block_nid)
         return new_ir
 
     def _check_legality(self, ir: KernelIR, option: SplitOption) -> None:
@@ -93,6 +103,8 @@ class Split(Transform[SplitOption]):
         if any(f < 2 for f in option.factors):
             raise TransformLegalityError(f"Split.factors entries must be >= 2; got {option.factors}")
         target = _resolve(ir.tree, option.target_nid)
+        if intersects_software_pipeline(ir, (option.target_nid,)):
+            raise TransformLegalityError("Split cannot alter an active software-pipeline scope")
         if subtree_has_access_patterns(ir.tree, option.target_nid):
             raise TransformLegalityError("Split cannot rewrite a loop or ISA operand with an explicit access pattern")
         if option.target_axis is None:
@@ -110,9 +122,11 @@ class Split(Transform[SplitOption]):
                 raise TransformLegalityError(
                     f"Split tensorize flavour requires target to be ISANode; got {type(target).__name__}"
                 )
+            _block_nid, block = _find_enclosing_block(ir.tree, option.target_nid)
+            if _is_static_axis(target, block, option.target_axis):
+                raise TransformLegalityError("Split cannot partition a fixed or statically sliced instruction axis")
             if _is_slot_reduction_axis(ir, option.target_nid, option.target_axis):
                 raise TransformLegalityError("Split cannot partition a slot reduction; use RFactor")
-            block_nid, block = _find_enclosing_block(ir.tree, option.target_nid)
             if not any(iv.axis == option.target_axis for iv in block.iter_vars):
                 raise TransformLegalityError(
                     f"Split.target_axis={option.target_axis!r} not declared by enclosing block"
@@ -131,6 +145,11 @@ class Split(Transform[SplitOption]):
                 raise TransformLegalityError(
                     f"Split.target_axis={option.target_axis!r}: innermost tile {option.factors[-1]} "
                     f"< MIN_TILE_SIZE {floor}"
+                )
+            if not _partition_width_valid(target, block, option.target_axis, option.factors[-1], ir.all_buffers()):
+                raise TransformLegalityError(
+                    f"Split.target_axis={option.target_axis!r}: innermost tile {option.factors[-1]} "
+                    "does not preserve an on-chip partition-axis extent"
                 )
 
     def _do_outer_trip(self, ir: KernelIR, option: SplitOption) -> None:
@@ -387,21 +406,58 @@ def _current_tensorize_width(leaf: ISANode, block: BlockNode, concrete_axis: str
     return width
 
 
+def _is_static_axis(leaf: ISANode, block: BlockNode, concrete_axis: str) -> bool:
+    """Return whether ``concrete_axis`` is fixed, non-tileable, or statically sliced."""
+    abstract = next((axis for axis, concrete in block.axis_map.items() if concrete == concrete_axis), None)
+    sliced = any(
+        leaf.op_cls.OPERAND_AXES[slot][index] == abstract
+        for slot, specs in getattr(leaf.op_cls, "INPUT_SLICES", {}).items()
+        for index, _start, _width, *_alignment in specs
+    )
+    return (
+        abstract in leaf.op_cls.FIXED_AXIS_SIZES or abstract in getattr(leaf.op_cls, "NON_TILABLE_AXES", ()) or sliced
+    )
+
+
 def _min_tile_floor(leaf: ISANode, block: BlockNode, concrete_axis: str) -> int | None:
     """Minimum legal innermost tile for ``concrete_axis``, or ``None`` if unconstrained.
 
     Translates the block iter_var dim (e.g. ``d1``) to the abstract op-axis
     (e.g. ``M``) via ``block.axis_map`` and reads the op's
-    ``MIN_TILE_SIZE``. A tensorize-split whose innermost factor falls below
-    this floor would shrink the access tile past the operation's scheduling
-    minimum, so such a split is illegal.
+    ``MIN_TILE_SIZE``. Dimensions whose complete domain is already smaller
+    than that canonical minimum may still split when their operand layouts
+    permit it.
     """
     inverse = {concrete: abstract for abstract, concrete in block.axis_map.items()}
     abstract = inverse.get(concrete_axis)
     floor: int | None = None
     if abstract is not None:
         floor = leaf.op_cls.MIN_TILE_SIZE.get(abstract)
+        extent = next(iv.dom[1] - iv.dom[0] for iv in block.iter_vars if iv.axis == concrete_axis)
+        if floor is not None and extent < floor:
+            floor = 1
     return floor
+
+
+def _partition_width_valid(
+    leaf: ISANode, block: BlockNode, concrete_axis: str, width: int, buffers: dict[str, Buffer]
+) -> bool:
+    """Return whether one tile width preserves every on-chip partition axis."""
+    inverse = {concrete: abstract for abstract, concrete in block.axis_map.items()}
+    abstract = inverse.get(concrete_axis)
+    valid = True
+    if abstract is not None:
+        for slot, region in leaf.operand_bindings.items():
+            present = tuple(axis for axis in leaf.op_cls.OPERAND_AXES[slot] if axis in block.axis_map)
+            buffer = buffers.get(region.tensor)
+            if (
+                abstract in present
+                and present.index(abstract) == 0
+                and buffer is not None
+                and buffer.location in ("sbuf", "psum")
+            ):
+                valid = valid and width % buffer.partition_extent() == 0
+    return valid
 
 
 def _covers_exactly(factors: tuple[int, ...], extent: int) -> bool:
@@ -428,14 +484,22 @@ def _covers_exactly(factors: tuple[int, ...], extent: int) -> bool:
     return hi is not None and hi + 1 == extent
 
 
-def _factorizations(n: int) -> list[tuple[int, int]]:
+@cache
+def _factorizations(n: int) -> tuple[tuple[int, int], ...]:
     """Return every ordered binary factorization of ``n``.
 
     Each tuple contains factors ``>= 2`` whose product is exactly ``n``.
     Order is significant because ``(2, 4)`` and ``(4, 2)`` name distinct loop
     nests. Deeper factorizations are composed from separate binary Split actions.
     """
-    return [(outer, n // outer) for outer in range(2, n) if n % outer == 0 and n // outer >= 2]
+    factors: list[tuple[int, int]] = []
+    for outer in range(2, isqrt(n) + 1):
+        if n % outer == 0:
+            inner = n // outer
+            factors.append((outer, inner))
+            if inner != outer:
+                factors.append((inner, outer))
+    return tuple(sorted(factors))
 
 
 __all__ = ["Split", "SplitOption"]

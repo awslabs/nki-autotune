@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 
 from nkigym.ir import KernelIR
@@ -10,10 +9,16 @@ from nkigym.ir.arith.expr import Expr, Var, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, KernelTree, role_of
 from nkigym.ops.base import AxisRole
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.base import (
+    Transform,
+    TransformLegalityError,
+    TransformOption,
+    copy_for_rewrite,
+    intersects_software_pipeline,
+    software_pipeline_overlap_nodes,
+)
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
 from nkigym.transforms.helper.normalize import _substitute_block_regions, normalize_block
-from nkigym.transforms.helper.tree_ops import invalidate_stale_software_pipelines
 
 
 @dataclass(frozen=True)
@@ -29,6 +34,7 @@ class Reorder(Transform[ReorderOption]):
 
     def analyze(self, ir: KernelIR) -> list[ReorderOption]:
         options: list[ReorderOption] = []
+        overlap_nodes = software_pipeline_overlap_nodes(ir)
         for nid in ir.tree.preorder():
             data = ir.tree.data(nid)
             if not isinstance(data, ForNode):
@@ -40,23 +46,23 @@ class Reorder(Transform[ReorderOption]):
             if not isinstance(kid_data, ForNode):
                 continue
             opt = ReorderOption(outer_nid=nid, inner_nid=kids[0])
-            if self._is_legal(ir, opt):
+            if self._is_legal(ir, opt, overlap_nodes):
                 options.append(opt)
         return options
 
     def apply(self, ir: KernelIR, option: ReorderOption) -> KernelIR:
         self._check_legality(ir, option)
-        new_ir = copy.deepcopy(ir)
+        same_axis = _axis_of_loop(ir.tree, option.outer_nid) == _axis_of_loop(ir.tree, option.inner_nid)
+        new_ir = copy_for_rewrite(ir)
         outer_data = new_ir.tree.data(option.outer_nid)
         inner_data = new_ir.tree.data(option.inner_nid)
         new_ir.tree.graph.nodes[option.outer_nid]["data"] = inner_data
         new_ir.tree.graph.nodes[option.inner_nid]["data"] = outer_data
-        self._renormalize_same_dim_swap(new_ir, option)
-        invalidate_stale_software_pipelines(new_ir)
+        self._renormalize_same_axis_swap(new_ir, option, same_axis)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
-    def _renormalize_same_dim_swap(self, ir: KernelIR, option: ReorderOption) -> None:
+    def _renormalize_same_axis_swap(self, ir: KernelIR, option: ReorderOption, same_axis: bool) -> None:
         """Restore the dense-name / stride invariant when the swap interchanges two
         loops of the SAME dim.
 
@@ -73,7 +79,7 @@ class Reorder(Transform[ReorderOption]):
         name-order == physical-order, so this is a no-op — the byte-exact ladder
         (whose only Reorders are cross-dim) is unaffected.
         """
-        if _dim_of(ir.tree, option.outer_nid) != _dim_of(ir.tree, option.inner_nid):
+        if not same_axis:
             return
         outer = ir.tree.loop(option.outer_nid)
         inner = ir.tree.loop(option.inner_nid)
@@ -90,17 +96,19 @@ class Reorder(Transform[ReorderOption]):
         for nid in affected_blocks:
             normalize_block(ir.tree, nid)
 
-    def _is_legal(self, ir: KernelIR, option: ReorderOption) -> bool:
+    def _is_legal(self, ir: KernelIR, option: ReorderOption, overlap_nodes: frozenset[int] | None = None) -> bool:
         try:
-            self._check_legality(ir, option)
+            self._check_legality(ir, option, overlap_nodes)
         except TransformLegalityError:
             return False
         return True
 
-    def _check_legality(self, ir: KernelIR, option: ReorderOption) -> None:
+    def _check_legality(self, ir: KernelIR, option: ReorderOption, overlap_nodes: frozenset[int] | None = None) -> None:
         for nid in (option.outer_nid, option.inner_nid):
             if nid not in ir.tree.graph:
                 raise TransformLegalityError(f"Reorder: nid {nid} not in tree")
+        if intersects_software_pipeline(ir, (option.outer_nid, option.inner_nid), overlap_nodes):
+            raise TransformLegalityError("Reorder cannot alter an active software-pipeline scope")
         outer = ir.tree.data(option.outer_nid)
         inner = ir.tree.data(option.inner_nid)
         if not isinstance(outer, ForNode) or not isinstance(inner, ForNode):
@@ -176,11 +184,17 @@ def _regions_invariant(regions: tuple[BufferRegion, ...], loop_var: str) -> bool
     )
 
 
-def _dim_of(tree: KernelTree, loop_nid: int) -> str:
-    """Concrete dim a ForNode drives, parsed from its dense name ``i_d{dim}_{N}`` -> ``d{dim}``."""
+def _axis_of_loop(tree: KernelTree, loop_nid: int) -> str | None:
+    """Return the unique concrete block axis driven by one loop."""
     loop_var = tree.loop(loop_nid).loop_var
-    body = loop_var[2:] if loop_var.startswith("i_") else loop_var
-    return body.split("_")[0]
+    block_nids = {_enclosing_block_nid(tree, loop_nid), *tree.blocks(loop_nid)}
+    axes = {
+        iter_var.axis
+        for block_nid in block_nids
+        for iter_var, value in zip(tree.block(block_nid).iter_vars, tree.block(block_nid).iter_values)
+        if loop_var in to_affine(value)
+    }
+    return next(iter(axes)) if len(axes) == 1 else None
 
 
 def _enclosing_block_nid(tree: KernelTree, nid: int) -> int:

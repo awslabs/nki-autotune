@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import PointwiseContract
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
-from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, remove_buffers, single_leaf
-from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
+from nkigym.search.state_facts import operation_facts
+from nkigym.transforms.base import (
+    Transform,
+    TransformLegalityError,
+    TransformOption,
+    copy_for_rewrite,
+    intersects_software_pipeline,
+    software_pipeline_overlap_nodes,
+)
+from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, single_leaf
 from nkigym.transforms.helper.value_graph import contract_input_operands
 
 
@@ -38,39 +44,71 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
 
     def analyze(self, ir: KernelIR) -> list[CommonSubexpressionEliminationOption]:
         """Return repeated pure pointwise blocks within each direct child list."""
+        if not operation_facts(ir).pointwise_operators:
+            return []
         options: list[CommonSubexpressionEliminationOption] = []
+        overlap_nodes = software_pipeline_overlap_nodes(ir)
         for parent_nid in ir.tree.preorder():
             blocks = [nid for nid in ir.tree.children(parent_nid) if isinstance(ir.tree.data(nid), BlockNode)]
-            pointwise_blocks = [
-                nid
-                for nid in blocks
-                if (leaf_nid := single_leaf(ir.tree, nid)) is not None
-                and isinstance(
-                    ir.tree.isa(leaf_nid).op_cls.algebraic_contract(ir.tree.isa(leaf_nid).kwargs), PointwiseContract
-                )
-            ]
-            for index, canonical_nid in enumerate(pointwise_blocks):
-                for redundant_nid in pointwise_blocks[index + 1 :]:
-                    option = CommonSubexpressionEliminationOption(
-                        canonical_block_nid=canonical_nid, redundant_block_nid=redundant_nid
-                    )
-                    if self._resolve(ir, option) is not None:
-                        options.append(option)
+            groups: dict[str, list[int]] = {}
+            for block_nid in blocks:
+                key = self._candidate_key(ir, block_nid)
+                if key is not None:
+                    groups.setdefault(key, []).append(block_nid)
+            for pointwise_blocks in groups.values():
+                for index, canonical_nid in enumerate(pointwise_blocks):
+                    for redundant_nid in pointwise_blocks[index + 1 :]:
+                        option = CommonSubexpressionEliminationOption(
+                            canonical_block_nid=canonical_nid, redundant_block_nid=redundant_nid
+                        )
+                        if self._resolve(ir, option, overlap_nodes) is not None:
+                            options.append(option)
         return options
 
+    def _candidate_key(self, ir: KernelIR, block_nid: int) -> str | None:
+        """Return a cheap exact-match key for one pure pointwise block."""
+        leaf_nid = single_leaf(ir.tree, block_nid)
+        key: str | None = None
+        if leaf_nid is not None:
+            leaf = ir.tree.isa(leaf_nid)
+            contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
+            if isinstance(contract, PointwiseContract):
+                block = ir.tree.block(block_nid)
+                loops = tuple(
+                    (node.loop_var, node.extent)
+                    for nid in ir.tree.preorder(block_nid)
+                    if isinstance((node := ir.tree.data(nid)), ForNode)
+                )
+                inputs = tuple((slot, leaf.operand_bindings.get(slot)) for slot in contract_input_operands(contract))
+                key = repr(
+                    (
+                        leaf.op_cls,
+                        tuple(sorted((name, repr(value)) for name, value in leaf.kwargs.items())),
+                        contract,
+                        block.iter_vars,
+                        block.iter_values,
+                        tuple(sorted(block.axis_map.items())),
+                        loops,
+                        inputs,
+                    )
+                )
+        return key
+
     def apply(self, ir: KernelIR, option: CommonSubexpressionEliminationOption) -> KernelIR:
-        """Recheck, copy, redirect readers, and remove the redundant expression."""
+        """Recheck, copy, and redirect readers to the canonical expression."""
         match = self._resolve(ir, option)
         if match is None:
             raise TransformLegalityError(f"illegal CommonSubexpressionElimination option: {option}")
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         copied_match = self._resolve(new_ir, option)
         if copied_match is None:
             raise AssertionError(f"CommonSubexpressionElimination option disappeared after deepcopy: {option}")
         self._rewrite(new_ir, copied_match)
         return new_ir
 
-    def _resolve(self, ir: KernelIR, option: CommonSubexpressionEliminationOption) -> _CommonSubexpressionMatch | None:
+    def _resolve(
+        self, ir: KernelIR, option: CommonSubexpressionEliminationOption, overlap_nodes: frozenset[int] | None = None
+    ) -> _CommonSubexpressionMatch | None:
         """Resolve identical pointwise calls with compatible execution and storage."""
         result: _CommonSubexpressionMatch | None = None
         canonical_nid = option.canonical_block_nid
@@ -80,6 +118,8 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
         if not isinstance(ir.tree.data(canonical_nid), BlockNode) or not isinstance(
             ir.tree.data(redundant_nid), BlockNode
         ):
+            return result
+        if intersects_software_pipeline(ir, (canonical_nid, redundant_nid), overlap_nodes):
             return result
         parent = ir.tree.parent(canonical_nid)
         siblings = ir.tree.children(parent) if parent is not None else []
@@ -220,7 +260,7 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
         return False
 
     def _rewrite(self, ir: KernelIR, match: _CommonSubexpressionMatch) -> None:
-        """Redirect all redundant readers and delete its producer and buffer."""
+        """Redirect all redundant readers while retaining the now-dead producer."""
         redundant_descendants = {
             match.option.redundant_block_nid,
             *ir.tree.descendants(match.option.redundant_block_nid),
@@ -251,13 +291,6 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
                 )
                 if reads != node.reads:
                     ir.tree.graph.nodes[nid]["data"] = replace(node, reads=reads)
-
-        parent = ir.tree.parent(match.option.redundant_block_nid)
-        if parent is None:
-            raise AssertionError(f"redundant block {match.option.redundant_block_nid} has no parent")
-        _replace_in_parent_children(ir.tree, parent, [match.option.redundant_block_nid], [])
-        ir.tree.graph.remove_nodes_from(redundant_descendants)
-        remove_buffers(ir, {match.redundant_output.tensor})
         finalize_rewrite(ir)
 
 

@@ -1,8 +1,7 @@
-"""Materialize recurrence expressions and updates as nkigym operations."""
+"""Lower recurrence expressions and updates into nkigym operations."""
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
@@ -76,8 +75,7 @@ def _plan_buffers(
         else:
             state = match.external_outputs[0] if index == last else stage.state_tensor
             buffers[state] = replace(ir.buffer(state), location="sbuf", storage_dtype="float32")
-        contribution_leaf = _contribution_leaf(match, graph, index)
-        contribution = graph.outputs[contribution_leaf]
+        contribution = graph.outputs[stage.reducer_leaf]
         source = ir.buffer(contribution)
         raw_contribution: str | None = None
         if source.location == "psum":
@@ -86,9 +84,8 @@ def _plan_buffers(
             contribution = names.fresh(f"{stage.state_tensor}_online_chunk")
             dtype = source.storage_dtype if deferred and preserve_deferred_dtype else "float32"
             buffers[contribution] = replace(source, name=contribution, location="sbuf", storage_dtype=dtype)
-        elif index != last or contribution == state or contribution_leaf != stage.reducer_leaf:
+        elif index != last or contribution == state:
             contribution = names.fresh(f"{stage.state_tensor}_online_chunk")
-            source = ir.buffer(graph.outputs[contribution_leaf])
             dtype = source.storage_dtype if deferred and preserve_deferred_dtype else "float32"
             buffers[contribution] = replace(source, name=contribution, storage_dtype=dtype)
         current = state
@@ -101,16 +98,8 @@ def _plan_buffers(
     return (tuple(plans), buffers)
 
 
-def _contribution_leaf(match: _Match, graph: ValueGraph, index: int) -> int:
-    """Return the reducer leaf whose output contributes to one stage."""
-    del graph
-    return match.stages[index].reducer_leaf
-
-
-def _localized_buffers(
-    ir: KernelIR, match: _Match, graph: ValueGraph, buffers: Mapping[str, Buffer], chunk_size: int
-) -> dict[str, Buffer]:
-    """Shrink progress-carrying internal buffers to one chunk."""
+def _recurrence_buffers(ir: KernelIR, match: _Match, buffers: Mapping[str, Buffer]) -> dict[str, Buffer]:
+    """Preserve declarations while applying recurrence-required storage dtypes."""
     result = dict(buffers)
     internal = {
         region.tensor
@@ -120,13 +109,6 @@ def _localized_buffers(
         if region.tensor not in match.external_inputs and region.tensor not in match.external_outputs
     }
     for name in internal:
-        axes = graph.tensor_axes.get(name, ())
-        if name in result and match.progress_axis in axes:
-            shape = list(result[name].shape)
-            shape[axes.index(match.progress_axis)] = chunk_size
-            localized = replace(result[name], shape=tuple(shape))
-            list_len = math.gcd(localized.list_len, localized.logical_tile_count())
-            result[name] = replace(localized, list_len=list_len)
         if name in result and len(result[name].shape) == 1:
             result[name] = replace(result[name], storage_dtype="float32")
     return result
@@ -140,13 +122,12 @@ def _stage_region(ir: KernelIR, graph: ValueGraph, stage: _Stage) -> BufferRegio
 
 def _stage_regions(plans: tuple[_Plan, ...], regions: tuple[BufferRegion, ...]) -> dict[str, BufferRegion]:
     """Map every stage buffer to its reducer output region."""
-    result: dict[str, BufferRegion] = {}
-    for plan, region in zip(plans, regions):
-        for tensor in (plan.state, plan.contribution, plan.current):
-            result[tensor] = replace(region, tensor=tensor)
-        if plan.raw_contribution is not None:
-            result[plan.raw_contribution] = replace(region, tensor=plan.raw_contribution)
-    return result
+    return {
+        tensor: replace(region, tensor=tensor)
+        for plan, region in zip(plans, regions)
+        for tensor in (plan.state, plan.contribution, plan.current, plan.raw_contribution)
+        if tensor is not None
+    }
 
 
 def _clone_block(context: _Lowering, nid: int, remap: Mapping[str, str], output_override: str | None) -> None:
@@ -247,18 +228,10 @@ def _access_regions(
     op_cls: type[NKIOp], bindings: Mapping[str, BufferRegion], kwargs: Mapping[str, Any]
 ) -> tuple[tuple[BufferRegion, ...], tuple[BufferRegion, ...]]:
     """Derive reads and writes from operation metadata."""
-    reads: list[BufferRegion] = []
-    writes: list[BufferRegion] = []
     rmw = op_cls.rmw_operands(dict(kwargs))
-    for slot, region in bindings.items():
-        if slot in op_cls.INPUT_OPERANDS:
-            reads.append(region)
-        elif slot in rmw:
-            reads.append(region)
-            writes.append(region)
-        else:
-            writes.append(region)
-    return (tuple(reads), tuple(writes))
+    reads = tuple(region for slot, region in bindings.items() if slot in op_cls.INPUT_OPERANDS or slot in rmw)
+    writes = tuple(region for slot, region in bindings.items() if slot not in op_cls.INPUT_OPERANDS)
+    return (reads, writes)
 
 
 def _compile_factor(builder: OperationBuilder, factor: _Factor, states: Mapping[int, str], stem: str) -> str:
@@ -272,10 +245,10 @@ def _compile_factor(builder: OperationBuilder, factor: _Factor, states: Mapping[
 def _compile_value(builder: OperationBuilder, factor: _Factor, states: Mapping[int, str], stem: str) -> _Compiled:
     """Recursively compile a tensor/literal factor."""
     if factor.stage is not None:
-        result = (states[factor.stage], None)
-    elif factor.literal is not None:
-        result = (None, factor.literal)
-    elif len(factor.operands) == 1:
+        return (states[factor.stage], None)
+    if factor.literal is not None:
+        return (None, factor.literal)
+    if len(factor.operands) == 1:
         operand_factor, scale, bias = _flatten_affine(factor)
         operand = _compile_factor(builder, operand_factor, states, f"{stem}_arg")
         output = builder.temp(f"{stem}_{factor.operator}", operand)
@@ -285,14 +258,12 @@ def _compile_value(builder: OperationBuilder, factor: _Factor, states: Mapping[i
         if bias != 0.0:
             kwargs["bias"] = bias
         builder.append(NKIActivation, {"data": builder.region(operand), "dst": builder.region(output)}, kwargs)
-        result = (output, None)
-    elif len(factor.operands) == 2:
+        return (output, None)
+    if len(factor.operands) == 2:
         left = _compile_value(builder, factor.operands[0], states, f"{stem}_left")
         right = _compile_value(builder, factor.operands[1], states, f"{stem}_right")
-        result = _compile_binary(builder, factor.operator, left, right, stem)
-    else:
-        raise TypeError(f"unsupported factor {factor!r}")
-    return result
+        return _compile_binary(builder, factor.operator, left, right, stem)
+    raise TypeError(f"unsupported factor {factor!r}")
 
 
 def _flatten_affine(factor: _Factor) -> tuple[_Factor, float, float]:
@@ -316,26 +287,24 @@ def _compile_binary(
     if left_tensor is not None and right_tensor is not None:
         output = builder.temp(stem, left_tensor)
         _emit_tensor_tensor(builder, left_tensor, right_tensor, output, operator)
-        result = (output, None)
-    elif left_tensor is not None and right_literal is not None:
+        return (output, None)
+    if left_tensor is not None and right_literal is not None:
         output = builder.temp(stem, left_tensor)
         _emit_tensor_scalar(builder, left_tensor, right_literal, output, operator, False)
-        result = (output, None)
-    elif right_tensor is not None and left_literal is not None:
+        return (output, None)
+    if right_tensor is not None and left_literal is not None:
         output = builder.temp(stem, right_tensor)
         _emit_tensor_scalar(builder, right_tensor, left_literal, output, operator, True)
-        result = (output, None)
-    elif left_literal is not None and right_literal is not None:
+        return (output, None)
+    if left_literal is not None and right_literal is not None:
         functions = {
             "add": lambda a, b: a + b,
             "subtract": lambda a, b: a - b,
             "multiply": lambda a, b: a * b,
             "maximum": max,
         }
-        result = (None, float(functions[operator](left_literal, right_literal)))
-    else:
-        raise ValueError("binary factor has neither tensor nor literal operands")
-    return result
+        return (None, float(functions[operator](left_literal, right_literal)))
+    raise ValueError("binary factor has neither tensor nor literal operands")
 
 
 def _compile_correction(
@@ -430,7 +399,7 @@ def _derive(
 ) -> None:
     """Clone per-chunk work and append recurrence updates."""
     remap = dict(initial_remap or {})
-    contributions = [_contribution_leaf(context.match, context.graph, index) for index in range(len(plans))]
+    contributions = [stage.reducer_leaf for stage in context.match.stages]
     stage_by_leaf = {leaf: index for index, leaf in enumerate(contributions)}
     overrides = {
         context.graph.outputs[leaf]: plan.raw_contribution or plan.contribution

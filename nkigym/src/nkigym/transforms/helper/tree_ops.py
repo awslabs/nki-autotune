@@ -7,6 +7,7 @@ from dataclasses import replace
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Const
 from nkigym.ir.tree import BlockNode, Buffer, ISANode, KernelTree
+from nkigym.transforms.base import invalidate_software_pipeline_overlap
 
 
 def _replace_in_parent_children(
@@ -38,6 +39,7 @@ def _block_local_descendants(tree: KernelTree, block_nid: int) -> list[int]:
 
 def invalidate_stale_software_pipelines(ir: KernelIR, invalidated_loop_nids: frozenset[int] = frozenset()) -> None:
     """Drop pipeline metadata whose staged structure changed."""
+    invalidate_software_pipeline_overlap(ir.tree)
     active_versioned: set[str] = set()
     for block_nid in list(ir.tree.blocks()):
         block = ir.tree.block(block_nid)
@@ -68,9 +70,8 @@ def invalidate_stale_software_pipelines(ir: KernelIR, invalidated_loop_nids: fro
                 updated = replace(buffer, versions=1)
                 version_changes[buffer.name] = (buffer, updated)
             allocations.append(updated)
-        updated_allocations = tuple(allocations)
-        if updated_allocations != block.alloc_buffers:
-            ir.tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=updated_allocations)
+        if tuple(allocations) != block.alloc_buffers:
+            ir.tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=tuple(allocations))
     _rebase_access_pattern_strides(ir, version_changes)
 
 

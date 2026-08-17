@@ -23,8 +23,7 @@ def _parse_args() -> argparse.Namespace:
 def _main() -> None:
     """Read one request from stdin, profile its kernel, and write artifacts."""
     args = _parse_args()
-    kernel_path = Path(args.kernel).expanduser().resolve()
-    output_dir = Path(args.output).expanduser().resolve()
+    kernel_path, output_dir = (Path(value).expanduser().resolve() for value in (args.kernel, args.output))
     if not kernel_path.is_file():
         raise FileNotFoundError(f"kernel source not found: {kernel_path}")
     request = parse_request(json.load(sys.stdin))

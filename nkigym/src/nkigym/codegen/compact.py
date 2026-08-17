@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import replace
 
 from nkigym.ir.arith.expr import Const, Expr, substitute, to_affine
-from nkigym.ir.buffer_placement import _anchor_loop_nids_from_regions, _regions_by_tensor
+from nkigym.ir.graph_index import ordered_tree_topology
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
+from nkigym.search.buffer_placement import _anchor_loop_nids_from_regions, _regions_by_tensor
 
 
 def compact_buffer_shapes(tree: KernelTree, tensors: frozenset[str]) -> dict[str, Buffer]:
@@ -20,19 +21,18 @@ def compact_buffer_shapes(tree: KernelTree, tensors: frozenset[str]) -> dict[str
                 if buf.name in declared:
                     raise AssertionError(f"buffer {buf.name!r} is declared by multiple blocks")
                 declared[buf.name] = buf
-    missing = tensors - declared.keys()
-    if missing:
+    if missing := tensors - declared.keys():
         raise KeyError(f"buffers declared by no block: {sorted(missing)}")
     regions = _regions_by_tensor(tree, tensors)
+    ancestors = ordered_tree_topology(tree.graph, tree.root)[1]
     leaf_extents = {
         leaf_nid: _leaf_loop_extents(tree, leaf_nid) for pairs in regions.values() for leaf_nid, _region in pairs
     }
     compacted: dict[str, Buffer] = {}
     for tensor, buffer in declared.items():
-        pairs = regions.get(tensor, [])
-        anchor_nids = _anchor_loop_nids_from_regions(tree, pairs)
+        anchor_nids = _anchor_loop_nids_from_regions(tree, regions.get(tensor, []), ancestors)
         anchors = {tree.loop(nid).loop_var for nid in anchor_nids}
-        compacted[tensor] = _compact_one(buffer, anchors, pairs, leaf_extents)
+        compacted[tensor] = _compact_one(buffer, anchors, regions.get(tensor, []), leaf_extents)
     for block_nid in tree.blocks():
         block = tree.block(block_nid)
         updated = tuple(compacted.get(buffer.name, buffer) for buffer in block.alloc_buffers)

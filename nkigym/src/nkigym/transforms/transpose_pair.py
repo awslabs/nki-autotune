@@ -163,12 +163,7 @@ def _match_insert(
             facts.root_owners.get(option.consumer_nid) if facts is not None else _root_owner(ir, option.consumer_nid)
         )
         input_bound = option.operand in consumer.op_cls.INPUT_OPERANDS and option.operand in consumer.operand_bindings
-        canonical = (
-            facts.canonical_blocks.get(consumer_block, False)
-            if facts is not None and consumer_block is not None
-            else consumer_block is not None and is_canonical_block(ir, consumer_block)
-        )
-        if consumer_block is not None and input_bound and canonical:
+        if consumer_block is not None and input_bound:
             source = consumer.operand_bindings[option.operand].tensor
             axes = consumer.op_cls.OPERAND_AXES[option.operand]
             buffers = facts.buffers if facts is not None else ir.all_buffers()
@@ -187,6 +182,8 @@ def _match_insert(
                     and shape_matches
                     and tileable
                     and physical_dtype
+                    and NKITranspose.accepts_input_storage_dtypes({"data": source_buffer.physical_dtype()})
+                    and _canonical_block(ir, consumer_block, facts)
                 ):
                     result = _InsertMatch(
                         consumer_block=consumer_block,
@@ -244,8 +241,7 @@ def _match_dma_transpose_execution(
     """Return one canonical DMA transpose over complete SBUF/HBM buffers."""
     result: _TransposeExecution | None = None
     leaf_nid = single_leaf(ir.tree, block_nid)
-    canonical = facts.canonical_blocks.get(block_nid, False) if facts is not None else is_canonical_block(ir, block_nid)
-    if leaf_nid is not None and canonical:
+    if leaf_nid is not None:
         leaf = ir.tree.isa(leaf_nid)
         if leaf.op_cls is NKIDMATranspose:
             source = leaf.operand_bindings["src"].tensor
@@ -262,6 +258,7 @@ def _match_dma_transpose_execution(
                     and source_buffer.dtype == output_buffer.dtype
                     and source_buffer.physical_dtype() == source_buffer.dtype
                     and output_buffer.physical_dtype() == source_buffer.dtype
+                    and _canonical_block(ir, block_nid, facts)
                 )
                 if valid:
                     result = _TransposeExecution(
@@ -300,11 +297,23 @@ def _transpose_analysis_facts(ir: KernelIR) -> _TransposeAnalysisFacts:
         root_owners=root_owners,
         buffers=ir.all_buffers(),
         extents=axis_extents(ir),
-        canonical_blocks={nid: is_canonical_block(ir, nid) for nid in root_children},
+        canonical_blocks={},
         input_uses={tensor: tuple(uses) for tensor, uses in input_uses.items()},
         last_writer_positions=last_writers,
         preorder_positions=positions,
     )
+
+
+def _canonical_block(ir: KernelIR, block_nid: int, facts: _TransposeAnalysisFacts | None) -> bool:
+    """Return one lazily cached canonical-block result."""
+    if facts is None:
+        result = is_canonical_block(ir, block_nid)
+    else:
+        result = facts.canonical_blocks.get(block_nid)
+        if result is None:
+            result = is_canonical_block(ir, block_nid)
+            facts.canonical_blocks[block_nid] = result
+    return result
 
 
 def _transpose_executions(ir: KernelIR, facts: _TransposeAnalysisFacts) -> tuple[_TransposeExecution | None, ...]:
@@ -357,9 +366,55 @@ def _match_cancel_from_facts(
             source_stable = (
                 facts.last_writer_positions.get(first.source, -1) <= facts.preorder_positions[first.input_leaf]
             )
-            if consumers and exact_middle and exact_output and restored_shape and source_stable:
+            consumers_compatible = _consumers_accept_source(ir, consumers, first.source, facts.buffers)
+            if (
+                consumers
+                and exact_middle
+                and exact_output
+                and restored_shape
+                and source_stable
+                and consumers_compatible
+            ):
                 result = _CancelMatch(first=first, second=second, consumers=consumers)
     return result
+
+
+def _consumers_accept_source(
+    ir: KernelIR, consumers: tuple[tuple[int, str], ...], source: str, buffers: dict[str, Buffer]
+) -> bool:
+    """Return whether every consumer accepts ``source`` in the rebound slots."""
+    source_buffer = buffers[source]
+    rebound: dict[int, set[str]] = {}
+    for leaf_nid, operand in consumers:
+        rebound.setdefault(leaf_nid, set()).add(operand)
+    accepted = True
+    for leaf_nid, operands in rebound.items():
+        leaf = ir.tree.isa(leaf_nid)
+        inputs = {
+            operand: region
+            for operand, region in leaf.operand_bindings.items()
+            if operand in leaf.op_cls.INPUT_OPERANDS
+        }
+        locations = {
+            operand: source_buffer.location if operand in operands else buffers[region.tensor].location
+            for operand, region in inputs.items()
+        }
+        dtypes = {
+            operand: source_buffer.physical_dtype() if operand in operands else buffers[region.tensor].physical_dtype()
+            for operand, region in inputs.items()
+        }
+        required = all(
+            leaf.op_cls.REQUIRED_INPUT_STORAGE_DTYPES.get(operand) in {None, source_buffer.physical_dtype()}
+            for operand in operands
+        )
+        accepted = (
+            leaf.op_cls.accepts_input_locations(locations)
+            and leaf.op_cls.accepts_input_storage_dtypes(dtypes)
+            and required
+        )
+        if not accepted:
+            break
+    return accepted
 
 
 def _root_owner(ir: KernelIR, leaf_nid: int) -> int | None:
@@ -452,7 +507,15 @@ def _match_cancel(ir: KernelIR, option: CancelTransposePairOption) -> _CancelMat
                 }
                 restored_shape = ir.buffer(second.output).shape == ir.buffer(first.source).shape
                 source_stable = _source_is_stable(ir, first.source, first.input_leaf)
-                if consumers and exact_middle and exact_output and restored_shape and source_stable:
+                consumers_compatible = _consumers_accept_source(ir, consumers, first.source, ir.all_buffers())
+                if (
+                    consumers
+                    and exact_middle
+                    and exact_output
+                    and restored_shape
+                    and source_stable
+                    and consumers_compatible
+                ):
                     result = _CancelMatch(first=first, second=second, consumers=consumers)
     return result
 

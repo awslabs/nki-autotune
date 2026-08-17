@@ -19,12 +19,13 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, SupportsIndex
 
 from nkigym.ir.canonical_build import build_canonical_blocknode_tree
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.dimension_analysis import analyze_dimensions
-from nkigym.ir.tree import BlockNode, Buffer, KernelTree
+from nkigym.ir.tree import Buffer, KernelTree
+from nkigym.search.serialization import reduce_kernel_ir
 
 
 @dataclass
@@ -47,6 +48,10 @@ class KernelIR:
     dependency: Dependency
     param_buffers: dict[str, Buffer] = field(default_factory=dict)
 
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[Any, ...]:
+        """Return the cached compact process-transfer representation."""
+        return reduce_kernel_ir(self, protocol.__index__())
+
     @property
     def return_name(self) -> str:
         """Return the sole output name for transforms limited to one output."""
@@ -58,9 +63,7 @@ class KernelIR:
         """Walk every :class:`BlockNode` in pre-order; return ``name -> Buffer`` including parameters."""
         out: dict[str, Buffer] = dict(self.param_buffers)
         for nid in self.tree.blocks():
-            block = self.tree.data(nid)
-            assert isinstance(block, BlockNode)
-            for buf in block.alloc_buffers:
+            for buf in self.tree.block(nid).alloc_buffers:
                 if buf.name in out:
                     raise ValueError(f"buffer {buf.name!r} declared by two blocks")
                 out[buf.name] = buf
@@ -68,8 +71,7 @@ class KernelIR:
 
     def buffer(self, name: str) -> Buffer:
         """Resolve a buffer by name; raises :class:`KeyError` if absent."""
-        buffers = self.all_buffers()
-        if name not in buffers:
+        if name not in (buffers := self.all_buffers()):
             raise KeyError(f"buffer {name!r} not found in any block.alloc_buffers")
         return buffers[name]
 
@@ -81,9 +83,7 @@ class KernelIR:
         declared anywhere in the tree.
         """
         for nid in self.tree.blocks():
-            block = self.tree.data(nid)
-            assert isinstance(block, BlockNode)
-            for iv in block.iter_vars:
+            for iv in self.tree.block(nid).iter_vars:
                 if iv.axis == axis:
                     return iv.dom[1] - iv.dom[0]
         raise KeyError(f"no iter_var with axis {axis!r}")
@@ -133,7 +133,6 @@ def build_initial_ir(func: Callable[..., Any], input_specs: dict[str, tuple[tupl
     """
     analysis = analyze_dimensions(func, input_specs)
     tree = build_canonical_blocknode_tree(analysis)
-    dependency = Dependency(tree)
     param_buffers = {
         name: Buffer(
             name=name,
@@ -148,7 +147,7 @@ def build_initial_ir(func: Callable[..., Any], input_specs: dict[str, tuple[tupl
         param_names=analysis.param_names,
         return_names=analysis.return_names,
         tree=tree,
-        dependency=dependency,
+        dependency=Dependency(tree),
         param_buffers=param_buffers,
     )
 

@@ -12,7 +12,12 @@ import numpy as np
 
 from nkigym.ops.base import AxisRole, NKIOp, ReductionContract, _operand_role, reduction_combinator
 
-_OPS: dict[str, Any] = {"add": np.add, "multiply": np.multiply, "subtract": np.subtract}
+_OPS: dict[str, Any] = {
+    "abs": lambda data, _operand: np.abs(data),
+    "add": np.add,
+    "multiply": np.multiply,
+    "subtract": np.subtract,
+}
 _REDUCE_FNS: dict[str, Any] = {"add": np.sum, "max": np.max, "maximum": np.max}
 
 
@@ -38,6 +43,8 @@ class NKITensorScalarReduce(NKIOp):
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     PREFERRED_TILE_SIZE: ClassVar[dict[str, int]] = {"F": 512}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+    SUPPORTED_MAP_OPERATORS: ClassVar[frozenset[str]] = frozenset(_OPS)
+    SUPPORTED_REDUCERS: ClassVar[frozenset[str]] = frozenset(_REDUCE_FNS)
 
     @classmethod
     def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> ReductionContract:

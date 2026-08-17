@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 
 from nkigym.ir import KernelIR
@@ -11,17 +10,16 @@ from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, IterVar
 from nkigym.ops.base import AxisRole
 from nkigym.ops.dma_transpose import NKIDMATranspose
 from nkigym.ops.load import NKILoad
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
-from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, is_canonical_block, remove_buffers, single_leaf
-from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
+from nkigym.search.state_facts import operation_facts
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
+from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, is_canonical_block, single_leaf
 
 
 @dataclass(frozen=True)
 class TransposeThroughLoadOption(TransformOption):
-    """Commute a transpose through a load using one HBM source tile width."""
+    """Commute one transpose through its load."""
 
     target_nid: int
-    first_tile: int
 
 
 @dataclass(frozen=True)
@@ -44,14 +42,17 @@ class TransposeThroughLoad(Transform[TransposeThroughLoadOption]):
 
     def analyze(self, ir: KernelIR) -> list[TransposeThroughLoadOption]:
         """Return every eligible canonical load block."""
+        if not operation_facts(ir).has_ops(NKILoad, NKIDMATranspose):
+            return []
         options: list[TransposeThroughLoadOption] = []
-        for block_nid in ir.tree.children(ir.tree.root):
-            match = _match(ir, block_nid)
+        root_children = tuple(ir.tree.children(ir.tree.root))
+        for index, block_nid in enumerate(root_children):
+            leaf_nid = single_leaf(ir.tree, block_nid)
+            if leaf_nid is None or ir.tree.isa(leaf_nid).op_cls is not NKILoad:
+                continue
+            match = _match(ir, block_nid, root_children, index)
             if match is not None:
-                options.extend(
-                    TransposeThroughLoadOption(target_nid=block_nid, first_tile=first_tile)
-                    for first_tile in _first_tiles(ir, match)
-                )
+                options.append(TransposeThroughLoadOption(target_nid=block_nid))
         return options
 
     def apply(self, ir: KernelIR, option: TransposeThroughLoadOption) -> KernelIR:
@@ -61,27 +62,26 @@ class TransposeThroughLoad(Transform[TransposeThroughLoadOption]):
             raise TransformLegalityError(
                 f"TransposeThroughLoad target {option.target_nid} is not an eligible canonical load-transpose segment"
             )
-        if option.first_tile not in _first_tiles(ir, match):
-            raise TransformLegalityError(
-                f"TransposeThroughLoad first_tile {option.first_tile} is invalid for {match.source}"
-            )
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         copied_match = _match(new_ir, option.target_nid)
         if copied_match is None:
             raise AssertionError("TransposeThroughLoad match disappeared after deepcopy")
-        _apply_match(new_ir, copied_match, option.first_tile)
+        _apply_match(new_ir, copied_match)
         finalize_rewrite(new_ir)
         return new_ir
 
 
-def _match(ir: KernelIR, target_nid: int) -> _Match | None:
+def _match(
+    ir: KernelIR, target_nid: int, root_children: tuple[int, ...] | None = None, index: int | None = None
+) -> _Match | None:
     """Return a legal segment beginning at ``target_nid``."""
     result: _Match | None = None
-    root_children = ir.tree.children(ir.tree.root)
-    if target_nid in root_children:
-        index = root_children.index(target_nid)
-        if index + 1 < len(root_children):
-            transpose_block = root_children[index + 1]
+    children = tuple(ir.tree.children(ir.tree.root)) if root_children is None else root_children
+    if index is None and target_nid in children:
+        index = children.index(target_nid)
+    if index is not None:
+        if index + 1 < len(children):
+            transpose_block = children[index + 1]
             result = _validate(ir, target_nid, transpose_block)
     return result
 
@@ -117,6 +117,7 @@ def _validate(ir: KernelIR, load_block: int, transpose_block: int) -> _Match | N
                 )
                 storage = (
                     source_buffer.location == "shared_hbm"
+                    and source in ir.param_buffers
                     and loaded_buffer.location == "sbuf"
                     and output_buffer.location == "sbuf"
                 )
@@ -173,17 +174,10 @@ def _validate(ir: KernelIR, load_block: int, transpose_block: int) -> _Match | N
     return result
 
 
-def _first_tiles(ir: KernelIR, match: _Match) -> tuple[int, ...]:
-    """Return legal HBM source widths for one matched transpose."""
-    extent = ir.buffer(match.source).shape[0]
-    minimum = NKIDMATranspose.MIN_TILE_SIZE["P"]
-    maximum = min(extent, NKIDMATranspose.HBM_SOURCE_MAX_TILE_SIZE["P"])
-    return tuple(tile for tile in range(minimum, maximum + 1, minimum) if extent % tile == 0)
-
-
-def _apply_match(ir: KernelIR, match: _Match, first_tile: int) -> None:
+def _apply_match(ir: KernelIR, match: _Match) -> None:
     """Rewrite a validated segment in place."""
     source = ir.buffer(match.source)
+    first_tile = match.first_tile
     second_tile = match.second_tile
     first_trip = source.shape[0] // first_tile
     second_trip = source.shape[1] // second_tile
@@ -205,12 +199,7 @@ def _apply_match(ir: KernelIR, match: _Match, first_tile: int) -> None:
             (Mul(left=first_value, right=Const(value=first_tile)), Const(value=first_tile)),
         ),
     )
-    retained_allocations = {
-        buffer.name: buffer
-        for block_nid in (match.load_block, match.transpose_block)
-        for buffer in ir.tree.block(block_nid).alloc_buffers
-        if buffer.name != match.loaded
-    }
+    allocations = ir.tree.block(match.transpose_block).alloc_buffers
     block = BlockNode(
         iter_vars=(
             IterVar(axis=match.first_axis, dom=(0, source.shape[0]), role=AxisRole.PARALLEL),
@@ -219,13 +208,13 @@ def _apply_match(ir: KernelIR, match: _Match, first_tile: int) -> None:
         iter_values=(first_value, second_value),
         reads=(src_region,),
         writes=(dst_region,),
-        alloc_buffers=tuple(retained_allocations.values()),
+        alloc_buffers=allocations,
         axis_map={"P": match.first_axis, "F": match.second_axis},
     )
-    descendants = list(ir.tree.descendants(match.load_block))
+    descendants = list(ir.tree.descendants(match.transpose_block))
     ir.tree.graph.remove_nodes_from(descendants)
-    ir.tree.graph.nodes[match.load_block]["data"] = block
-    parent = match.load_block
+    ir.tree.graph.nodes[match.transpose_block]["data"] = block
+    parent = match.transpose_block
     if first_trip > 1:
         parent = ir.tree.add_node(ForNode(loop_var=first_loop, extent=first_trip), parent=parent)
     if second_trip > 1:
@@ -234,9 +223,6 @@ def _apply_match(ir: KernelIR, match: _Match, first_tile: int) -> None:
         ISANode(op_cls=NKIDMATranspose, operand_bindings={"src": src_region, "dst": dst_region}, kwargs={}),
         parent=parent,
     )
-    _replace_in_parent_children(ir.tree, ir.tree.root, [match.load_block, match.transpose_block], [match.load_block])
-    ir.tree.graph.remove_nodes_from([match.transpose_block, *ir.tree.descendants(match.transpose_block)])
-    remove_buffers(ir, {match.loaded})
 
 
 __all__ = ["TransposeThroughLoad", "TransposeThroughLoadOption"]

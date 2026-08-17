@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from numbers import Real
 from typing import cast
 
-from nkigym.ir.arith.expr import Expr, Var, substitute
+from nkigym.ir.arith.expr import Expr, Var, substitute, to_affine
 from nkigym.ir.ir import KernelIR
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import (
@@ -249,7 +249,7 @@ def _compatible_block(ir: KernelIR, block_nid: int, progress_axis: str) -> bool:
         return False
     substitutions = _iter_substitutions(spec.block, block)
     loops = tuple((item for item in chain[1:-1] if isinstance(item, ForNode)))
-    if substitutions is None or not _factored_loops_match(spec.loops, loops, progress_axis):
+    if substitutions is None or not _factored_loops_match(spec.block, spec.loops, block, loops, progress_axis):
         return False
     expected_block = replace(
         spec.block,
@@ -280,32 +280,41 @@ def _iter_substitutions(canonical: BlockNode, actual: BlockNode) -> dict[str, Ex
     return result if valid else None
 
 
-def _factored_loops_match(canonical: tuple[ForNode, ...], actual: tuple[ForNode, ...], progress_axis: str) -> bool:
+def _factored_loops_match(
+    canonical_block: BlockNode,
+    canonical: tuple[ForNode, ...],
+    actual_block: BlockNode,
+    actual: tuple[ForNode, ...],
+    progress_axis: str,
+) -> bool:
     """Check dense loop groups and forbid progress-axis factorization."""
     cursor = 0
     for expected in canonical:
-        axis = _loop_axis(expected.loop_var)
+        axis = _binding_axis(canonical_block, expected.loop_var)
+        if axis is None:
+            return False
         group: list[ForNode] = []
-        while cursor < len(actual) and _loop_axis(actual[cursor].loop_var) == axis:
+        while cursor < len(actual) and _binding_axis(actual_block, actual[cursor].loop_var) == axis:
             group.append(actual[cursor])
             cursor += 1
         product = 1
         for loop in group:
             product *= loop.extent
-        names = [loop.loop_var for loop in group]
         if (
             not group
             or product != expected.extent
-            or names != [f"i_{axis}_{index}" for index in range(len(group))]
-            or (axis == progress_axis and group != [expected])
+            or (axis == progress_axis and (len(group) != 1 or group[0].extent != expected.extent))
         ):
             return False
     return cursor == len(actual)
 
 
-def _loop_axis(loop_var: str) -> str:
-    """Return the concrete axis encoded in a normalized loop variable."""
-    return (loop_var[2:] if loop_var.startswith("i_") else loop_var).rsplit("_", 1)[0]
+def _binding_axis(block: BlockNode, loop_var: str) -> str | None:
+    """Return the unique block axis whose iter value uses ``loop_var``."""
+    axes = [
+        iter_var.axis for iter_var, value in zip(block.iter_vars, block.iter_values) if loop_var in to_affine(value)
+    ]
+    return axes[0] if len(axes) == 1 else None
 
 
 def _substitute_region(region: BufferRegion, substitutions: Mapping[str, Expr]) -> BufferRegion:

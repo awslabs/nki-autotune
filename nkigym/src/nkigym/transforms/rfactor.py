@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
@@ -14,12 +13,20 @@ from nkigym.ops.memset import NKIMemset
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.tensor_reduce import NKITensorReduce
 from nkigym.ops.tensor_tensor import NKITensorTensor
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.search.state_facts import operation_facts
+from nkigym.transforms.base import (
+    Transform,
+    TransformLegalityError,
+    TransformOption,
+    copy_for_rewrite,
+    intersects_software_pipeline,
+    software_pipeline_overlap_nodes,
+)
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
 from nkigym.transforms.helper.canonical_rewrite import append_root_buffers, fresh_name, owning_block, single_leaf
 from nkigym.transforms.helper.normalize import normalize_block
 from nkigym.transforms.helper.tile_region import retile_region
-from nkigym.transforms.helper.tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 from nkigym.transforms.split import (
     _build_for_chain,
     _covers_exactly,
@@ -30,7 +37,7 @@ from nkigym.transforms.split import (
 
 _RMW_STAGING_BUFFER = "sbuf_rfactor"
 _RMW_COMBINERS = frozenset({"add", "multiply"})
-_SUPPORTED_COMBINERS = frozenset({"add", "maximum", "multiply"})
+_SUPPORTED_COMBINERS = frozenset({"maximum"})
 
 
 def _role_of(block: BlockNode, axis: str) -> AxisRole:
@@ -57,6 +64,7 @@ class _SlotRFactor:
     def analyze(self, ir: KernelIR) -> list[tuple[int, str, tuple[int, int]]]:
         """Return legal ``(leaf, axis, factors)`` slot-factorization choices."""
         options: list[tuple[int, str, tuple[int, int]]] = []
+        buffers = ir.all_buffers()
         for leaf_nid in ir.tree.preorder():
             node = ir.tree.data(leaf_nid)
             if not isinstance(node, ISANode) or node.op_cls.RFACTOR_RECIPE != "slot":
@@ -72,17 +80,25 @@ class _SlotRFactor:
             if current is None:
                 continue
             for factors in _factorizations(current):
-                if self.rfactorable(ir, leaf_nid, target_axis, factors):
+                if self.rfactorable(ir, leaf_nid, target_axis, factors, buffers):
                     options.append((leaf_nid, target_axis, factors))
         return options
 
-    def rfactorable(self, ir: KernelIR, leaf_nid: int, target_axis: str, factors: tuple[int, int]) -> bool:
+    def rfactorable(
+        self,
+        ir: KernelIR,
+        leaf_nid: int,
+        target_axis: str,
+        factors: tuple[int, int],
+        buffers: dict[str, Buffer] | None = None,
+    ) -> bool:
         """Return whether one unsplit tensorized reduction satisfies the slot recipe."""
-        return self._resolve_source(ir, leaf_nid, target_axis, factors) is not None
+        resolved_buffers = ir.all_buffers() if buffers is None else buffers
+        return self._resolve_source(ir, leaf_nid, target_axis, factors, resolved_buffers) is not None
 
     def emit(self, ir: KernelIR, leaf_nid: int, target_axis: str, factors: tuple[int, int]) -> None:
         """Apply the complete slot RFactor recipe in place."""
-        match = self._resolve_source(ir, leaf_nid, target_axis, factors)
+        match = self._resolve_source(ir, leaf_nid, target_axis, factors, ir.all_buffers())
         if match is None:
             raise AssertionError(
                 f"slot RFactor match disappeared for leaf {leaf_nid}, axis {target_axis!r}, factors {factors}"
@@ -104,11 +120,10 @@ class _SlotRFactor:
 
         final_block, final_loops, final_leaf = self._make_final_fold(ir, match, partial_read, loop.extent)
         self._insert_after_source(ir, match.block_nid, final_block, final_loops, final_leaf)
-        invalidate_stale_software_pipelines(ir)
         ir.dependency = Dependency(ir.tree)
 
     def _resolve_source(
-        self, ir: KernelIR, leaf_nid: int, target_axis: str, factors: tuple[int, int]
+        self, ir: KernelIR, leaf_nid: int, target_axis: str, factors: tuple[int, int], buffers: dict[str, Buffer]
     ) -> _SlotMatch | None:
         """Resolve a reduction whose loop, slots, and fold can be factored together."""
         result: _SlotMatch | None = None
@@ -140,11 +155,7 @@ class _SlotRFactor:
                     else None
                 )
                 roles = [iter_var.role for iter_var in block.iter_vars if iter_var.axis == target_axis]
-                output_buffer = (
-                    ir.buffer(output_region.tensor)
-                    if output_region is not None and output_region.tensor in ir.all_buffers()
-                    else None
-                )
+                output_buffer = buffers.get(output_region.tensor) if output_region is not None else None
                 valid = (
                     isinstance(contract, ReductionContract)
                     and reduction_axis == target_axis
@@ -350,35 +361,54 @@ class RFactorOption(TransformOption):
     target_axis: str | None = None
 
 
+@dataclass(frozen=True)
+class _RMWAnalysis:
+    """Tree-order and buffer facts shared by RMW recipe candidates."""
+
+    buffers: dict[str, Buffer]
+    order: dict[int, int]
+
+
 class RFactor(Transform[RFactorOption]):
     """One-stage → two-stage accumulation: per-``ko`` PSUM partial + SBUF fold."""
 
     def analyze(self, ir: KernelIR) -> list[RFactorOption]:
         """Enumerate every fully legal ACCUMULATION loop of an rfactorable op."""
+        if not operation_facts(ir).has_rfactor:
+            return []
         options: list[RFactorOption] = []
+        overlap_nodes = software_pipeline_overlap_nodes(ir)
+        analysis = _RMWAnalysis(buffers=ir.all_buffers(), order={nid: i for i, nid in enumerate(ir.tree.preorder())})
         for nid in ir.tree.preorder():
             if not isinstance(ir.tree.data(nid), ForNode):
                 continue
-            if self._rfactorable(ir, nid):
+            if self._rfactorable(ir, nid, analysis) and not intersects_software_pipeline(
+                ir, self._rmw_rewrite_nodes(ir, nid), overlap_nodes
+            ):
                 options.append(RFactorOption(target_loop_nid=nid, factor_axis=0))
         for leaf_nid, target_axis, factors in _SlotRFactor().analyze(ir):
-            options.append(
-                RFactorOption(target_loop_nid=leaf_nid, factor_axis=0, factors=factors, target_axis=target_axis)
-            )
+            if not intersects_software_pipeline(ir, (leaf_nid,), overlap_nodes):
+                options.append(
+                    RFactorOption(target_loop_nid=leaf_nid, factor_axis=0, factors=factors, target_axis=target_axis)
+                )
         return options
 
     def apply(self, ir: KernelIR, option: RFactorOption) -> KernelIR:
         """Re-check legality, deep-copy, emit the two-stage accumulation, return."""
         self._check_legality(ir, option)
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         if option.factors is not None and option.target_axis is not None:
             _SlotRFactor().emit(new_ir, option.target_loop_nid, option.target_axis, option.factors)
         else:
             self._emit_rmw(new_ir, option)
         return new_ir
 
-    def _rfactorable(self, ir: KernelIR, loop_nid: int) -> bool:
+    def _rfactorable(self, ir: KernelIR, loop_nid: int, analysis: _RMWAnalysis | None = None) -> bool:
         """Return whether ``loop_nid`` supports the RMW recipe."""
+        if analysis is None:
+            analysis = _RMWAnalysis(
+                buffers=ir.all_buffers(), order={nid: i for i, nid in enumerate(ir.tree.preorder())}
+            )
         leaf = self._owning_matmul_leaf(ir, loop_nid)
         result = False
         if leaf is not None:
@@ -402,9 +432,9 @@ class RFactor(Transform[RFactorOption]):
                 and _role_of(block, axis) == AxisRole.ACCUMULATION
                 and len(axis_loops) == 2
                 and axis_loops[0] == loop_nid
-                and self._init_block_is_retargetable(ir, loop_nid, leaf)
-                and self._drain_block_is_removable(ir, loop_nid, leaf)
-                and self._gadget_region_fits_output(ir, loop_nid, leaf)
+                and self._init_block_is_retargetable(ir, loop_nid, leaf, analysis)
+                and self._drain_block_is_removable(ir, loop_nid, leaf, analysis)
+                and self._gadget_region_fits_output(ir, loop_nid, leaf, analysis)
             ):
                 result = True
         return result
@@ -425,7 +455,9 @@ class RFactor(Transform[RFactorOption]):
             and reduction_axes[0] not in output_axes
         )
 
-    def _init_block_is_retargetable(self, ir: KernelIR, loop_nid: int, matmul_leaf: int) -> bool:
+    def _init_block_is_retargetable(
+        self, ir: KernelIR, loop_nid: int, matmul_leaf: int, analysis: _RMWAnalysis
+    ) -> bool:
         """Whether one canonical identity memset initializes PSUM outside ``ko``."""
         matmul = ir.tree.data(matmul_leaf)
         assert isinstance(matmul, ISANode)
@@ -434,7 +466,7 @@ class RFactor(Transform[RFactorOption]):
         assert reducer is not None
         inits = [
             nid
-            for nid in ir.tree.preorder()
+            for nid in ir.dependency.touches_by_tensor.get(psum_name, ())
             if isinstance((node := ir.tree.data(nid)), ISANode)
             and node.op_cls.NAME == "memset"
             and node.operand_bindings["dst"].tensor == psum_name
@@ -443,30 +475,29 @@ class RFactor(Transform[RFactorOption]):
         if len(inits) == 1:
             init_nid = inits[0]
             init_block = self._enclosing_block_nid(ir.tree, init_nid)
-            preorder = list(ir.tree.preorder())
             init = ir.tree.isa(init_nid)
             result = (
                 single_leaf(ir.tree, init_block) == init_nid
                 and loop_nid not in ir.tree.ancestors(init_nid)
-                and preorder.index(init_nid) < preorder.index(matmul_leaf)
+                and analysis.order[init_nid] < analysis.order[matmul_leaf]
                 and init.kwargs.get("value") == float(reducer.identity)
             )
         return result
 
-    def _drain_block_is_removable(self, ir: KernelIR, loop_nid: int, matmul_leaf: int) -> bool:
+    def _drain_block_is_removable(self, ir: KernelIR, loop_nid: int, matmul_leaf: int, analysis: _RMWAnalysis) -> bool:
         """Whether the sole drain is an outside-``ko`` identity copy in its own block."""
         matmul = ir.tree.data(matmul_leaf)
         assert isinstance(matmul, ISANode)
         psum_name = matmul.operand_bindings["dst"].tensor
-        drains: list[int] = []
-        for nid in ir.tree.preorder():
-            node = ir.tree.data(nid)
+        drains = [
+            nid
+            for nid in ir.dependency.touches_by_tensor.get(psum_name, ())
             if (
-                isinstance(node, ISANode)
+                isinstance((node := ir.tree.data(nid)), ISANode)
                 and node.op_cls.NAME == "tensor_copy"
                 and node.operand_bindings["src"].tensor == psum_name
-            ):
-                drains.append(nid)
+            )
+        ]
         result = False
         if len(drains) == 1:
             drain_nid = drains[0]
@@ -474,23 +505,22 @@ class RFactor(Transform[RFactorOption]):
             leaves = [nid for nid in ir.tree.preorder(drain_block) if isinstance(ir.tree.data(nid), ISANode)]
             drain = ir.tree.isa(drain_nid)
             out_name = drain.operand_bindings["dst"].tensor
-            preorder = list(ir.tree.preorder())
             result = (
                 leaves == drains
                 and loop_nid not in ir.tree.ancestors(drain_nid)
-                and preorder.index(matmul_leaf) < preorder.index(drain_nid)
+                and analysis.order[matmul_leaf] < analysis.order[drain_nid]
                 and drain.operand_bindings["src"].ranges == drain.operand_bindings["dst"].ranges
-                and ir.buffer(out_name).location == "sbuf"
+                and analysis.buffers[out_name].location == "sbuf"
             )
         return result
 
-    def _gadget_region_fits_output(self, ir: KernelIR, loop_nid: int, matmul_leaf: int) -> bool:
+    def _gadget_region_fits_output(self, ir: KernelIR, loop_nid: int, matmul_leaf: int, analysis: _RMWAnalysis) -> bool:
         """Return whether the generated region fits PSUM and SBUF."""
         ki_nid = self._ki_loop_nid(ir, loop_nid)
         matmul = ir.tree.data(matmul_leaf)
         assert isinstance(matmul, ISANode)
         psum_name = matmul.operand_bindings["dst"].tensor
-        out_name = self._drain_out_tensor(ir.tree, psum_name)
+        out_name = self._drain_out_tensor(ir, psum_name)
         dst_region = matmul.operand_bindings["dst"]
         free_footprint = self._free_footprint(ir, ki_nid, matmul_leaf)
         loop_extents = {
@@ -504,7 +534,7 @@ class RFactor(Transform[RFactorOption]):
             region = self._partition_region(out_name, dst_region.ranges[0][0], free_lo, free_extent)
             result = all(
                 self._region_axis_fits(lo, width, axis, buf, loop_extents)
-                for buf in (ir.buffer(psum_name), ir.buffer(out_name))
+                for buf in (analysis.buffers[psum_name], analysis.buffers[out_name])
                 for axis, (lo, width) in enumerate(region.ranges)
             )
         return result
@@ -548,6 +578,8 @@ class RFactor(Transform[RFactorOption]):
         if has_factors != has_target_axis:
             raise TransformLegalityError("RFactor slot options must provide both factors and target_axis")
         if has_factors:
+            if intersects_software_pipeline(ir, (option.target_loop_nid,)):
+                raise TransformLegalityError("RFactor cannot rewrite an active software-pipeline scope")
             self._check_slot_legality(ir, option)
         else:
             self._check_rmw_legality(ir, option)
@@ -583,6 +615,18 @@ class RFactor(Transform[RFactorOption]):
                 f"use a supported combiner, and fit a contiguous gadget footprint "
                 f"within PSUM/output capacity"
             )
+        if intersects_software_pipeline(ir, self._rmw_rewrite_nodes(ir, nid)):
+            raise TransformLegalityError("RFactor cannot rewrite an active software-pipeline scope")
+
+    def _rmw_rewrite_nodes(self, ir: KernelIR, loop_nid: int) -> tuple[int, ...]:
+        """Return the existing tree sites changed by the RMW recipe."""
+        matmul_leaf = self._owning_matmul_leaf(ir, loop_nid)
+        if matmul_leaf is None:
+            raise TransformLegalityError(f"RFactor target loop {loop_nid} has no RMW operation")
+        psum_name = ir.tree.isa(matmul_leaf).operand_bindings["dst"].tensor
+        init_block = self._enclosing_block_nid(ir.tree, self._writer_leaf(ir.tree, psum_name, "memset"))
+        drain_block = self._enclosing_block_nid(ir.tree, self._reader_leaf(ir.tree, psum_name, "tensor_copy"))
+        return loop_nid, init_block, drain_block
 
     def _emit_rmw(self, ir: KernelIR, option: RFactorOption) -> None:
         """Emit the fused per-``ko`` PSUM partial and SBUF fold."""
@@ -601,7 +645,7 @@ class RFactor(Transform[RFactorOption]):
         assert reducer is not None
 
         psum_name = matmul_node.operand_bindings["dst"].tensor
-        out_name = self._drain_out_tensor(tree, psum_name)
+        out_name = self._drain_out_tensor(ir, psum_name)
         staging_name = self._staging_buffer_name(ir)
         identity = float(reducer.identity)
         combiner = reducer.combiner
@@ -638,7 +682,6 @@ class RFactor(Transform[RFactorOption]):
             combiner,
         )
 
-        invalidate_stale_software_pipelines(ir)
         ir.dependency = Dependency(tree)
 
     def _enclosing_block_nid(self, tree: KernelTree, nid: int) -> int:
@@ -740,10 +783,10 @@ class RFactor(Transform[RFactorOption]):
             )
         return tree.isa(rfactorable[0]).op_cls
 
-    def _drain_out_tensor(self, tree: KernelTree, psum_name: str) -> str:
+    def _drain_out_tensor(self, ir: KernelIR, psum_name: str) -> str:
         """Tensor the drain ``tensor_copy`` writes (reads ``psum_name``, writes SBUF out)."""
-        for nid in tree.preorder():
-            data = tree.data(nid)
+        for nid in ir.dependency.touches_by_tensor.get(psum_name, ()):
+            data = ir.tree.data(nid)
             if isinstance(data, ISANode) and data.op_cls.NAME == "tensor_copy":
                 if data.operand_bindings["src"].tensor == psum_name:
                     return data.operand_bindings["dst"].tensor

@@ -9,13 +9,13 @@ the sibling :attr:`Buffer.versions`.
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
-from nkigym.ir.dependency import Dependency
+from nkigym.ir.dependency_rebind import rebind_unchanged_dependency
 from nkigym.ir.tree import BlockNode
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.search.serialization import inherit_analysis_result
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.access_pattern import tensor_has_access_pattern
 
 
@@ -52,9 +52,10 @@ class BufferLayout(Transform[BufferLayoutOption]):
     def apply(self, ir: KernelIR, option: BufferLayoutOption) -> KernelIR:
         """Re-check legality, deep-copy, set ``list_len``, rebuild the dependency sidecar."""
         self._check_legality(ir, option)
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         self._set_list_len(new_ir, option.tensor, option.list_len)
-        new_ir.dependency = Dependency(new_ir.tree)
+        new_ir.dependency = rebind_unchanged_dependency(ir.dependency, new_ir.tree)
+        inherit_analysis_result(ir, new_ir, "code-motion")
         return new_ir
 
     def _check_legality(self, ir: KernelIR, option: BufferLayoutOption) -> None:

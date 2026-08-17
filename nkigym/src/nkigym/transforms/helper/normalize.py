@@ -10,13 +10,12 @@ from nkigym.transforms.helper.tree_ops import _block_local_descendants, _replace
 
 
 def _iter_value_loopvars(block: BlockNode) -> set[str]:
-    """Return loop variables that drive the block's dimensions."""
-    out: set[str] = set()
-    for value in block.iter_values:
-        for name in to_affine(value):
-            if name is not None:
-                out.add(name)
-    return out
+    """Return loop variables that drive the block's dimensions or regions."""
+    values = (
+        *block.iter_values,
+        *(lower for region in (*block.reads, *block.writes) for lower, _width in region.ranges),
+    )
+    return {name for value in values for name in to_affine(value) if name is not None}
 
 
 def normalize_block(tree: KernelTree, block_nid: int) -> None:
@@ -196,7 +195,7 @@ def _dim_loops(tree: KernelTree, block_nid: int, block: BlockNode) -> dict[str, 
     for loop_var, extent in _all_enclosing_loops(tree, block_nid):
         if loop_var not in bound:
             continue
-        out.setdefault(old_to_dim[loop_var], []).append((loop_var, extent))
+        out.setdefault(old_to_dim.get(loop_var, _dim_from_loopvar(loop_var)), []).append((loop_var, extent))
     for nid in _block_local_descendants(tree, block_nid):
         data = tree.data(nid)
         if not isinstance(data, ForNode):

@@ -16,14 +16,13 @@ blocks where the per-iteration overlap matters.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
-from functools import cached_property
 from weakref import WeakKeyDictionary
 
 import networkx as nx
 
 from nkigym.ir.arith.expr import to_affine
+from nkigym.ir.graph_index import DAGReachability, ordered_tree_topology
 from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 
@@ -60,16 +59,13 @@ class Dependency:
         self._owner_block: dict[int, int] = {}
         self._tree = tree
         self._build(tree)
-        self._preorder = tuple(tree.preorder())
-        self._order = {nid: index for index, nid in enumerate(self._preorder)}
-        self._ancestors = {nid: tuple(tree.ancestors(nid)) for nid in self._preorder}
-        self._descendants = {nid: frozenset(tree.descendants(nid)) for nid in self._preorder}
-        self._tree_edges = frozenset(tree.graph.edges)
+        self._order, self._ancestors, self._descendants = ordered_tree_topology(tree.graph, tree.root)
+        self._topology_valid = True
+        self._reachability = DAGReachability(self.graph)
 
-    @cached_property
-    def _closure(self) -> nx.DiGraph:
-        """Build transitive reachability on its first query."""
-        return nx.DiGraph(nx.transitive_closure_dag(self.graph))
+    def _reachable(self, nid: int, backward: bool) -> frozenset[int]:
+        """Return cached transitive predecessors or successors of one leaf."""
+        return self._reachability.nodes(nid, backward)
 
     def _resolve(self, nid: int) -> int:
         """Map a block nid to its owned ISA-leaf nid; a leaf/loop nid maps to itself."""
@@ -77,27 +73,27 @@ class Dependency:
 
     def info(self, nid: int) -> _BlockInfo:
         """Return the cached :class:`_BlockInfo` for ``nid``."""
-        return self.graph.nodes[self._resolve(nid)]["info"]
+        return getattr(self.graph, "_node")[self._resolve(nid)]["info"]
 
     def direct_producers(self, nid: int) -> list[int]:
         """Return leaf ids that ``nid`` directly depends on."""
-        return list(self.graph.predecessors(self._resolve(nid)))
+        return list(getattr(self.graph, "_pred")[self._resolve(nid)])
 
     def direct_consumers(self, nid: int) -> list[int]:
         """Return leaf ids that directly depend on ``nid``."""
-        return list(self.graph.successors(self._resolve(nid)))
+        return list(getattr(self.graph, "_succ")[self._resolve(nid)])
 
     def producers(self, nid: int) -> set[int]:
         """Return every transitive producer of ``nid``."""
-        return set(self._closure.predecessors(self._resolve(nid)))
+        return set(self._reachable(self._resolve(nid), True))
 
     def consumers(self, nid: int) -> set[int]:
         """Return every transitive consumer of ``nid``."""
-        return set(self._closure.successors(self._resolve(nid)))
+        return set(self._reachable(self._resolve(nid), False))
 
     def must_precede(self, producer: int, consumer: int) -> bool:
         """Return True if ``producer`` must execute before ``consumer``."""
-        return self._closure.has_edge(self._resolve(producer), self._resolve(consumer))
+        return self._reachability.precedes(self._resolve(producer), self._resolve(consumer))
 
     def first_backward_edge_for_insertion(
         self, moved_leaf_nid: int, target_loop_nid: int, index: int, topology: _Topology | None = None
@@ -136,113 +132,107 @@ class Dependency:
         analysis pass, avoiding repeated graph mutation checks for each slot.
         """
         order, ancestors, descendants = self._topology() if topology is None else topology
-        owner_block = self._owner_block.get(moved_leaf_nid, moved_leaf_nid)
-        moved_subtree = set(descendants[owner_block]) | {owner_block}
-        moved_pos = self._effective_insertion_position(order, descendants, target_loop_nid, index, moved_subtree)
-        enclosers = set(ancestors[target_loop_nid]) | {target_loop_nid}
-        target_loops = [
-            n for n in (target_loop_nid, *ancestors[target_loop_nid]) if isinstance(self._tree.data(n), ForNode)
+        owner = self._owner_block.get(moved_leaf_nid, moved_leaf_nid)
+        moved_descendants = descendants[owner]
+        children = [
+            child for child in self._tree.children(target_loop_nid) if child != owner and child not in moved_descendants
         ]
+        if index == -1:
+            position = len(children)
+        elif index == -2:
+            position = 0
+        elif index >= 0:
+            position = index
+        else:
+            raise ValueError(f"unsupported index {index} (use -1 append, -2 prepend, or >=0)")
+        if position <= 0 or not children:
+            anchor = order[target_loop_nid]
+        else:
+            preceding = children[min(position, len(children)) - 1]
+            anchor = order[preceding] + len(descendants[preceding])
+        moved_position = anchor + 0.5
+        target_loops = tuple(
+            nid for nid in (target_loop_nid, *ancestors[target_loop_nid]) if isinstance(self._tree.data(nid), ForNode)
+        )
+        moved_spans: dict[str, tuple[float, float]] = {}
+        static_spans = _PROMOTED_SPANS.setdefault(self, {})
 
-        def span(nid: int) -> tuple[float, float]:
-            if nid == moved_leaf_nid:
-                return (moved_pos, moved_pos)
-            positions: list[float] = [order[d] for d in (set(descendants[nid]) | {nid}) - moved_subtree]
-            if nid in enclosers:
-                positions.append(moved_pos)
-            if not positions:
-                raise KeyError(f"dependency endpoint {nid} absent from the tree")
-            return (min(positions), max(positions))
+        def promoted_moved(tensor: str) -> tuple[float, float]:
+            """Return the moved leaf's span under the proposed target loops."""
+            result = moved_spans.get(tensor)
+            if result is None:
+                lo = hi = moved_position
+                for loop_nid in target_loops:
+                    loop = self._tree.loop(loop_nid)
+                    if _access_invariant_across(
+                        self._tree, moved_leaf_nid, loop.loop_var, tensor
+                    ) and _tensor_carried_across(self._tree, loop_nid, tensor):
+                        loop_position = float(order[loop_nid])
+                        lo = min(lo, loop_position)
+                        hi = max(hi, loop_position)
+                result = (lo, hi)
+                moved_spans[tensor] = result
+            return result
 
-        def enclosing_loops(nid: int) -> list[int]:
-            if nid == moved_leaf_nid:
-                return target_loops
-            return [a for a in ancestors[nid] if a not in moved_subtree and isinstance(self._tree.data(a), ForNode)]
+        def promoted_static(nid: int, tensor: str) -> tuple[float, float]:
+            """Return one unchanged endpoint's cached carried-loop span."""
+            key = (nid, tensor)
+            result = static_spans.get(key)
+            if result is None:
+                lo = hi = float(order[nid])
+                for loop_nid in ancestors[nid]:
+                    loop = self._tree.data(loop_nid)
+                    if not isinstance(loop, ForNode):
+                        continue
+                    if _access_invariant_across(self._tree, nid, loop.loop_var, tensor) and _tensor_carried_across(
+                        self._tree, loop_nid, tensor
+                    ):
+                        loop_position = float(order[loop_nid])
+                        lo = min(lo, loop_position)
+                        hi = max(hi, loop_position)
+                result = (lo, hi)
+                static_spans[key] = result
+            return result
 
-        return self._first_backward(moved_leaf_nid, span, self._tree, enclosing_loops)
+        bounds = _INSERTION_BOUNDS.setdefault(self, {}).get(moved_leaf_nid)
+        if bounds is None:
+            incoming: dict[str, tuple[float, int]] = {}
+            outgoing: dict[str, tuple[float, int]] = {}
+            for first, attrs in getattr(self.graph, "_pred")[moved_leaf_nid].items():
+                tensor = attrs.get("tensor")
+                if isinstance(tensor, str):
+                    high = promoted_static(first, tensor)[1]
+                    if tensor not in incoming or high > incoming[tensor][0]:
+                        incoming[tensor] = (high, first)
+            for second, attrs in getattr(self.graph, "_succ")[moved_leaf_nid].items():
+                tensor = attrs.get("tensor")
+                if isinstance(tensor, str):
+                    low = promoted_static(second, tensor)[0]
+                    if tensor not in outgoing or low < outgoing[tensor][0]:
+                        outgoing[tensor] = (low, second)
+            bounds = (
+                tuple((tensor, high, first) for tensor, (high, first) in incoming.items()),
+                tuple((tensor, low, second) for tensor, (low, second) in outgoing.items()),
+            )
+            _INSERTION_BOUNDS.setdefault(self, {})[moved_leaf_nid] = bounds
+        result: tuple[int, int] | None = None
+        for tensor, high, first in bounds[0]:
+            if high >= promoted_moved(tensor)[0]:
+                result = (first, moved_leaf_nid)
+                break
+        if result is None:
+            for tensor, low, second in bounds[1]:
+                if promoted_moved(tensor)[1] >= low:
+                    result = (moved_leaf_nid, second)
+                    break
+        return result
 
     def _topology(self) -> _Topology:
         """Return cached topology or rebuild it when callers mutate the tree."""
-        current_nodes = frozenset(self._tree.graph.nodes)
-        current_edges = frozenset(self._tree.graph.edges)
-        if current_nodes == frozenset(self._preorder) and current_edges == self._tree_edges:
-            order = self._order
-            ancestors = self._ancestors
-            descendants = self._descendants
-        else:
-            preorder = tuple(self._tree.preorder())
-            order = {nid: index for index, nid in enumerate(preorder)}
-            ancestors = {nid: tuple(self._tree.ancestors(nid)) for nid in preorder}
-            descendants = {nid: frozenset(self._tree.descendants(nid)) for nid in preorder}
-        return order, ancestors, descendants
-
-    def _effective_insertion_position(
-        self,
-        order: dict[int, int],
-        descendants: dict[int, frozenset[int]],
-        target_loop_nid: int,
-        index: int,
-        moved_subtree: set[int],
-    ) -> float:
-        """Half-integer preorder position the moved leaf takes under the target.
-
-        The leaf lands among ``target_loop_nid``'s children at the splice slot.
-        Its position sits just after the node it follows: the target loop itself
-        when prepending (before child 0), else the subtree-max of the preceding
-        child. The ``+0.5`` keeps it strictly between adjacent integer indices so
-        the span comparison orders it correctly against every other node.
-
-        ``moved_subtree`` is excluded from the target's children first, matching
-        ``_splice_under_target`` which detaches the moved block before indexing.
-        Without this, re-moving a block that is already a child of the target
-        (a prior compute_at nested it there) would count the block itself as a
-        preceding sibling and place the leaf one slot too early.
-        """
-        children = [c for c in self._tree.children(target_loop_nid) if c not in moved_subtree]
-        if index == -1:
-            pos = len(children)
-        elif index == -2:
-            pos = 0
-        elif index >= 0:
-            pos = index
-        else:
-            raise ValueError(f"unsupported index {index} (use -1 append, -2 prepend, or >=0)")
-        if pos <= 0 or not children:
-            anchor = order[target_loop_nid]
-        else:
-            preceding = children[min(pos, len(children)) - 1]
-            anchor = max(order[d] for d in (*descendants[preceding], preceding))
-        return anchor + 0.5
-
-    def _first_backward(
-        self,
-        moved_leaf_nid: int,
-        span: Callable[[int], tuple[float, float]],
-        eval_tree: KernelTree,
-        enclosing_loops: Callable[[int], list[int]],
-    ) -> tuple[int, int] | None:
-        """Return the first edge incident to ``moved_leaf_nid`` that ``span`` ranks
-        backward after per-tensor span-promotion, else ``None``.
-
-        Each edge carries the ``tensor`` its two leaves conflict on. Before the
-        ``span(a).end < span(b).start`` test, each endpoint's span is promoted to
-        any enclosing loop across which its access to that tensor is invariant and
-        the tensor is carried (a live-across accumulator). ``enclosing_loops(nid)``
-        returns the ForNode ancestor nids of an endpoint at its evaluated position
-        — for the moved leaf under an insertion query, the TARGET's ancestors.
-        """
-        result: tuple[int, int] | None = None
-        edges = (*self.graph.in_edges(moved_leaf_nid, data=True), *self.graph.out_edges(moved_leaf_nid, data=True))
-        for a, b, attrs in edges:
-            tensor = attrs.get("tensor")
-            if tensor is None:
-                continue
-            span_a = _promoted_span(span(a), a, tensor, eval_tree, enclosing_loops(a), span)
-            span_b = _promoted_span(span(b), b, tensor, eval_tree, enclosing_loops(b), span)
-            if not (span_a[1] < span_b[0]):
-                result = (a, b)
-                break
-        return result
+        if not self._topology_valid:
+            self._order, self._ancestors, self._descendants = ordered_tree_topology(self._tree.graph, self._tree.root)
+            self._topology_valid = True
+        return self._order, self._ancestors, self._descendants
 
     def chains(self) -> dict[str, list[int]]:
         """Return a copy of :attr:`touches_by_tensor` for safe iteration."""
@@ -506,35 +496,10 @@ def _tensor_carried_across(tree: KernelTree, loop_nid: int, tensor: str) -> bool
     return carried
 
 
-def _promoted_span(
-    base: tuple[float, float],
-    endpoint_nid: int,
-    tensor: str,
-    eval_tree: KernelTree,
-    enclosing_loops: list[int],
-    span_of_loop: Callable[[int], tuple[float, float]],
-) -> tuple[float, float]:
-    """Widen ``base`` to any enclosing loop across which ``endpoint_nid``'s access
-    to ``tensor`` is invariant and ``tensor`` is carried.
-
-    A carried, loop-invariant access is live across the whole loop, so its
-    effective span is the loop's span, not the leaf point. Promoting BOTH
-    endpoints of a carried edge is what turns "memset lexically first inside K"
-    into a backward edge (memset.end == K.end is not < matmul.start inside K).
-    """
-    lo, hi = base
-    for loop_nid in enclosing_loops:
-        loop = eval_tree.data(loop_nid)
-        if not isinstance(loop, ForNode):
-            continue
-        if not _access_invariant_across(eval_tree, endpoint_nid, loop.loop_var, tensor):
-            continue
-        if not _tensor_carried_across(eval_tree, loop_nid, tensor):
-            continue
-        l_lo, l_hi = span_of_loop(loop_nid)
-        lo = min(lo, l_lo)
-        hi = max(hi, l_hi)
-    return (lo, hi)
+_PROMOTED_SPANS: WeakKeyDictionary[Dependency, dict[tuple[int, str], tuple[float, float]]] = WeakKeyDictionary()
+_INSERTION_BOUNDS: WeakKeyDictionary[
+    Dependency, dict[int, tuple[tuple[tuple[str, float, int], ...], tuple[tuple[str, float, int], ...]]]
+] = WeakKeyDictionary()
 
 
 __all__ = ["Dependency"]

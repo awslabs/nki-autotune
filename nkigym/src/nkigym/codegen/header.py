@@ -51,7 +51,7 @@ def _emit_shape_assertions(lines: list[str], ir: KernelIR) -> None:
     """Append ``assert <param>.shape == (...)`` for every kernel parameter."""
     for name in ir.param_names:
         buf = ir.buffer(name)
-        shape_tuple = "(" + ", ".join(str(s) for s in buf.shape) + ")"
+        shape_tuple = str(tuple(buf.shape))
         lines.append(f"    assert {name}.shape == {shape_tuple}")
 
 

@@ -8,7 +8,6 @@ import os
 import pickle
 import secrets
 import shlex
-import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -21,22 +20,10 @@ from typing import ParamSpec, TypeVar, cast
 
 import numpy as np
 
+from nkigym.profile.ssh import _SSH_OPTIONS, SSHTransportError, _CommandRunner, _require_command, _validate_host
+
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
-_SSH_OPTIONS = (
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ConnectTimeout=15",
-    "-o",
-    "StrictHostKeyChecking=no",
-    "-o",
-    "ControlMaster=auto",
-    "-o",
-    "ControlPersist=30",
-    "-o",
-    "ControlPath=~/.ssh/nkigym-%C",
-)
 _SSH_WORKER_OPTIONS = (*_SSH_OPTIONS, "-n", "-o", "ControlMaster=no", "-o", "ControlPath=none")
 _REMOTE_PYTHON = '"$HOME"/venvs/kernel-env/bin/python'
 _REMOTE_RUN_ROOT = ".cache/nkigym-simulate/runs"
@@ -92,19 +79,18 @@ def simulate_fp32(kernel: Callable[_P, _R]) -> Callable[_P, _R]:
     """
     import nki
 
-    from nkigym.profile.simulate_nki_worker import _fp32_source
+    from nkigym.profile.simulate_nki_worker import _fp32_source, _simulate_kernel_fp32
 
     func = getattr(kernel, "func", kernel)
     source = _fp32_source(textwrap.dedent(inspect.getsource(func)))
     namespace: dict = dict(func.__globals__)
     exec(source, namespace)  # noqa: S102
-    simulated = nki.simulate(namespace[func.__name__])
 
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
         """Cast numpy inputs to fp32 and forward to the simulated kernel."""
         cast_args = tuple(_fp32_value(argument) for argument in args)
         cast_kwargs = {name: _fp32_value(argument) for name, argument in kwargs.items()}
-        return cast(_R, simulated(*cast_args, **cast_kwargs))
+        return cast(_R, _simulate_kernel_fp32(namespace[func.__name__], (cast_args, cast_kwargs)))
 
     return wrapper
 
@@ -130,7 +116,7 @@ def batch_simulate_fp32(
         The number of successfully validated cases.
     """
     _validate_batch(hosts, cases, atol, rtol, timeout_s)
-    completed = 0
+    completed = len(cases)
     if cases:
         _require_command("ssh")
         _require_command("rsync")
@@ -149,17 +135,14 @@ def batch_simulate_fp32(
                 ]
                 results = [future.result() for future in futures]
         _raise_batch_failure(results)
-        unique_completed = sum(result.completed for result in results)
-        if unique_completed != len(unique_cases):
+        if (unique_completed := sum(result.completed for result in results)) != len(unique_cases):
             raise RuntimeError(f"remote simulation completed {unique_completed} of {len(unique_cases)} distinct cases")
-        completed = len(cases)
     return completed
 
 
 def _fp32_value(value: object) -> object:
     """Cast floating NumPy inputs to fp32 while preserving integer arrays."""
-    result = value.astype(np.float32) if isinstance(value, np.ndarray) and value.dtype.kind == "f" else value
-    return result
+    return value.astype(np.float32) if isinstance(value, np.ndarray) and value.dtype.kind == "f" else value
 
 
 def _validate_batch(
@@ -170,10 +153,9 @@ def _validate_batch(
         raise ValueError("at least one SSH host is required")
     for host in hosts:
         _validate_host(host)
-    if not np.isfinite(atol) or atol < 0:
-        raise ValueError("absolute tolerance must be finite and non-negative")
-    if not np.isfinite(rtol) or rtol < 0:
-        raise ValueError("relative tolerance must be finite and non-negative")
+    for name, tolerance in (("absolute", atol), ("relative", rtol)):
+        if not np.isfinite(tolerance) or tolerance < 0:
+            raise ValueError(f"{name} tolerance must be finite and non-negative")
     if timeout_s <= 0:
         raise ValueError("batch simulation timeout must be positive")
     for case in cases:
@@ -183,18 +165,6 @@ def _validate_batch(
             raise ValueError(f"{case.label}: kernel source must not be empty")
         if not case.func_name.isidentifier():
             raise ValueError(f"{case.label}: invalid kernel function name {case.func_name!r}")
-
-
-def _validate_host(host: str) -> None:
-    """Reject empty or option-shaped SSH destinations."""
-    if not host or host.startswith("-") or any(character.isspace() for character in host):
-        raise ValueError(f"invalid SSH host {host!r}")
-
-
-def _require_command(command: str) -> None:
-    """Fail before transport when one local executable is unavailable."""
-    if shutil.which(command) is None:
-        raise FileNotFoundError(f"{command} is not on PATH")
 
 
 def _detect_host_cpu_count(host: str, timeout_s: int) -> int:
@@ -227,9 +197,9 @@ def _deduplicate_cases(cases: list[FP32SimulationCase]) -> list[_IndexedCase]:
     unique: list[_IndexedCase] = []
     seen: set[tuple[str, str, int, int]] = set()
     for index, case in enumerate(cases):
-        key = (case.kernel, case.func_name, id(case.inputs), id(case.expected))
-        if key not in seen:
-            seen.add(key)
+        identity = (case.kernel, case.func_name, id(case.inputs), id(case.expected))
+        if identity not in seen:
+            seen.add(identity)
             unique.append((index, case))
     return unique
 
@@ -267,25 +237,21 @@ def _write_requests(
     for index, (host, worker_count, cases) in enumerate(partitions):
         host_directory = directory / f"host-{index}"
         host_directory.mkdir()
-        request_path = host_directory / "request.pkl"
-        result_path = host_directory / "result.json"
-        payload = (cases, atol, rtol, worker_count)
+        request_path, result_path = host_directory / "request.pkl", host_directory / "result.json"
         with request_path.open("wb") as request_file:
-            pickle.dump(payload, request_file, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle.dump((cases, atol, rtol, worker_count), request_file, protocol=pickle.HIGHEST_PROTOCOL)
         requests.append((host, request_path, result_path))
     return requests
 
 
 def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_s: int) -> _HostResult:
     """Upload and execute one host partition, then parse its result."""
-    run_id = f"{time.time_ns()}-{os.getpid()}-{secrets.token_hex(4)}"
-    remote_run = f"{_REMOTE_RUN_ROOT}/{run_id}"
+    remote_run = f"{_REMOTE_RUN_ROOT}/{time.time_ns()}-{os.getpid()}-{secrets.token_hex(4)}"
     rsync_shell = shlex.join(("ssh", *_SSH_OPTIONS))
-    deadline = time.monotonic() + timeout_s
-    log: list[str] = []
-    failure: RuntimeError | None = None
+    runner = _CommandRunner(timeout_s)
+    failure: SSHTransportError | None = None
     try:
-        _run_transport_command(
+        runner.run(
             "Checking remote simulation environment",
             [
                 "ssh",
@@ -297,10 +263,9 @@ def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_
                     f'mkdir -p "$HOME"/{remote_run}'
                 ),
             ],
-            deadline,
-            log,
+            None,
         )
-        _run_transport_command(
+        runner.run(
             "Uploading simulation batch",
             [
                 "rsync",
@@ -311,31 +276,29 @@ def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_
                 str(request_path),
                 f"{host}:{remote_run}/",
             ],
-            deadline,
-            log,
+            None,
         )
-        _start_remote_worker(host, remote_run, deadline, log)
-        _wait_for_remote_result(host, remote_run, deadline, log)
-        _run_transport_command(
+        _start_remote_worker(host, remote_run, runner)
+        _wait_for_remote_result(host, remote_run, runner)
+        runner.run(
             "Downloading simulation result",
             ["rsync", "-a", "-e", rsync_shell, f"{host}:{remote_run}/result.json", str(result_path)],
-            deadline,
-            log,
+            None,
         )
-    except RuntimeError as error:
+    except SSHTransportError as error:
         failure = error
     finally:
-        _cleanup_remote(host, remote_run, log)
+        runner.cleanup(host, remote_run, True)
     if failure is not None:
-        detail = "".join(log)[-5000:]
+        detail = runner.log[-5000:]
         raise RuntimeError(f"SSH batch simulation failed for {host}: {failure}\n{detail}") from failure
     return _read_host_result(host, result_path)
 
 
-def _start_remote_worker(host: str, remote_run: str, deadline: float, log: list[str]) -> None:
+def _start_remote_worker(host: str, remote_run: str, runner: _CommandRunner) -> None:
     """Start one detached worker and record its process group before returning."""
     worker = (
-        f"{_REMOTE_PYTHON} "
+        f"OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=1 MKL_NUM_THREADS=4 NUMEXPR_NUM_THREADS=1 {_REMOTE_PYTHON} "
         f'"$HOME"/{remote_run}/simulate_nki_worker.py '
         f'--worker "$HOME"/{remote_run}/request.pkl '
         f'"$HOME"/{remote_run}/result.json'
@@ -351,12 +314,10 @@ def _start_remote_worker(host: str, remote_run: str, deadline: float, log: list[
         f"test -s {process_group_path} && exit 0; "
         "attempts=$((attempts + 1)); sleep 0.1; done; exit 1"
     )
-    _run_transport_command(
-        "Starting remote simulation worker", ["ssh", *_SSH_WORKER_OPTIONS, host, command], deadline, log
-    )
+    runner.run("Starting remote simulation worker", ["ssh", *_SSH_WORKER_OPTIONS, host, command], None)
 
 
-def _wait_for_remote_result(host: str, remote_run: str, deadline: float, log: list[str]) -> None:
+def _wait_for_remote_result(host: str, remote_run: str, runner: _CommandRunner) -> None:
     """Poll atomic worker files without depending on SSH session teardown."""
     result = f'"$HOME"/{remote_run}/result.json'
     exit_status = f'"$HOME"/{remote_run}/worker.exit'
@@ -365,11 +326,11 @@ def _wait_for_remote_result(host: str, remote_run: str, deadline: float, log: li
         f"elif test -f {exit_status}; then printf failed:; cat {exit_status}; "
         "else printf pending; fi"
     )
-    log.append("==> Waiting for remote simulation result\n")
+    runner.lines.append("==> Waiting for remote simulation result\n")
     while True:
-        remaining_s = deadline - time.monotonic()
+        remaining_s = runner.remaining_s
         if remaining_s <= 0:
-            raise RuntimeError("Simulating kernel batch exceeded the batch simulation timeout")
+            raise SSHTransportError("Simulating kernel batch exceeded the batch simulation timeout", runner.log)
         try:
             completed = subprocess.run(
                 ["ssh", "-n", *_SSH_OPTIONS, host, probe],
@@ -379,76 +340,28 @@ def _wait_for_remote_result(host: str, remote_run: str, deadline: float, log: li
                 check=False,
             )
         except subprocess.TimeoutExpired as error:
-            _record_timeout_output(error, log)
-            raise RuntimeError("Checking remote simulation result timed out") from error
+            runner.record_timeout_output(error)
+            raise SSHTransportError("Checking remote simulation result timed out", runner.log) from error
         if completed.returncode != 0:
-            log.extend((completed.stdout, completed.stderr))
-            raise RuntimeError(f"Checking remote simulation result failed with exit {completed.returncode}")
+            runner.lines.extend((completed.stdout, completed.stderr))
+            raise SSHTransportError(
+                f"Checking remote simulation result failed with exit {completed.returncode}", runner.log
+            )
         state = completed.stdout.strip()
         if state == "ready":
             return
         if state.startswith("failed:"):
-            _run_transport_command(
+            runner.run(
                 "Reading remote simulation failure",
                 ["ssh", "-n", *_SSH_OPTIONS, host, f'cat "$HOME"/{remote_run}/worker.log'],
-                deadline,
-                log,
+                None,
             )
-            raise RuntimeError(f"remote simulation worker exited with status {state.removeprefix('failed:')}")
+            raise SSHTransportError(
+                f"remote simulation worker exited with status {state.removeprefix('failed:')}", runner.log
+            )
         if state != "pending":
-            raise RuntimeError(f"remote simulation worker returned malformed state {state!r}")
+            raise SSHTransportError(f"remote simulation worker returned malformed state {state!r}", runner.log)
         time.sleep(min(_REMOTE_RESULT_POLL_SECONDS, remaining_s))
-
-
-def _run_transport_command(stage: str, command: list[str], deadline: float, log: list[str]) -> None:
-    """Run one transport stage against a shared host deadline."""
-    remaining_s = deadline - time.monotonic()
-    if remaining_s <= 0:
-        raise RuntimeError(f"{stage} exceeded the batch simulation timeout")
-    log.append(f"==> {stage}\n")
-    try:
-        completed = subprocess.run(command, text=True, capture_output=True, timeout=remaining_s, check=False)
-    except subprocess.TimeoutExpired as error:
-        _record_timeout_output(error, log)
-        raise RuntimeError(f"{stage} exceeded the batch simulation timeout") from error
-    log.extend((completed.stdout, completed.stderr))
-    if completed.returncode != 0:
-        raise RuntimeError(f"{stage} failed with exit {completed.returncode}")
-
-
-def _record_timeout_output(error: subprocess.TimeoutExpired, log: list[str]) -> None:
-    """Preserve partial subprocess output attached to a timeout."""
-    stdout = error.stdout.decode() if isinstance(error.stdout, bytes) else error.stdout
-    stderr = error.stderr.decode() if isinstance(error.stderr, bytes) else error.stderr
-    if stdout:
-        log.append(stdout)
-    if stderr:
-        log.append(stderr)
-
-
-def _cleanup_remote(host: str, remote_run: str, log: list[str]) -> None:
-    """Best-effort termination and removal of one remote simulation run."""
-    remote_directory = f'"$HOME"/{remote_run}'
-    script = (
-        f"run={remote_directory}; "
-        'if test -s "$run/worker.pgid"; then '
-        'pgid=$(cat "$run/worker.pgid"); '
-        'case "$pgid" in ""|*[!0-9]*) exit 2 ;; esac; '
-        'if test "$pgid" -le 1; then exit 2; fi; '
-        'kill -TERM -- "-$pgid" 2>/dev/null || true; '
-        'attempts=0; while kill -0 -- "-$pgid" 2>/dev/null && test "$attempts" -lt 20; do '
-        "sleep 0.1; attempts=$((attempts + 1)); done; "
-        'if kill -0 -- "-$pgid" 2>/dev/null; then kill -KILL -- "-$pgid" 2>/dev/null || true; fi; '
-        'fi; rm -rf "$run"'
-    )
-    command = ["ssh", *_SSH_OPTIONS, host, script]
-    try:
-        completed = subprocess.run(command, text=True, capture_output=True, timeout=15, check=False)
-        if completed.returncode != 0:
-            log.append("==> Remote cleanup failed\n")
-            log.extend((completed.stdout, completed.stderr))
-    except subprocess.TimeoutExpired:
-        log.append("==> Remote cleanup timed out\n")
 
 
 def _read_host_result(host: str, result_path: Path) -> _HostResult:
@@ -458,9 +371,7 @@ def _read_host_result(host: str, result_path: Path) -> _HostResult:
     raw = json.loads(result_path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise RuntimeError(f"SSH batch simulation returned malformed result for {host}")
-    assigned = raw.get("assigned")
-    completed = raw.get("completed")
-    raw_failure = raw.get("failure")
+    assigned, completed, raw_failure = (raw.get(name) for name in ("assigned", "completed", "failure"))
     if not isinstance(assigned, int) or isinstance(assigned, bool) or assigned < 0:
         raise RuntimeError(f"SSH batch simulation returned invalid assigned count for {host}")
     if not isinstance(completed, int) or isinstance(completed, bool) or completed < 0 or completed > assigned:
@@ -473,35 +384,23 @@ def _read_host_result(host: str, result_path: Path) -> _HostResult:
 
 def _parse_failure(host: str, raw_failure: object) -> _SimulationFailure | None:
     """Parse optional failure metadata from one remote host."""
-    failure = None
-    if raw_failure is not None:
-        if not isinstance(raw_failure, dict):
-            raise RuntimeError(f"SSH batch simulation returned malformed failure for {host}")
-        case_index = raw_failure.get("case_index")
-        label = raw_failure.get("label")
-        exception_type = raw_failure.get("exception_type")
-        remote_traceback = raw_failure.get("traceback")
-        if (
-            not isinstance(case_index, int)
-            or isinstance(case_index, bool)
-            or case_index < 0
-            or not isinstance(label, str)
-            or not isinstance(exception_type, str)
-            or not isinstance(remote_traceback, str)
-        ):
+    if raw_failure is None:
+        return None
+    match raw_failure:
+        case {
+            "case_index": int(case_index),
+            "label": str(label),
+            "exception_type": str(exception_type),
+            "traceback": str(remote_traceback),
+        } if (not isinstance(case_index, bool) and case_index >= 0):
+            return _SimulationFailure(case_index, label, exception_type, remote_traceback)
+        case _:
             raise RuntimeError(f"SSH batch simulation returned invalid failure fields for {host}")
-        failure = _SimulationFailure(
-            case_index=case_index, label=label, exception_type=exception_type, traceback=remote_traceback
-        )
-    return failure
 
 
 def _raise_batch_failure(results: list[_HostResult]) -> None:
     """Raise the earliest simulation failure in original case order."""
-    failures: list[tuple[str, _SimulationFailure]] = []
-    for result in results:
-        if result.failure is not None:
-            failures.append((result.host, result.failure))
+    failures = [(result.host, result.failure) for result in results if result.failure is not None]
     if failures:
         host, failure = min(failures, key=lambda item: item[1].case_index)
         message = f"{failure.label}\nremote host: {host}\n{failure.traceback}"
