@@ -34,7 +34,6 @@ from nkigym.ir.tree import (
     IterVar,
     KernelTree,
     NodeData,
-    build_initial_tree,
 )
 
 __all__ = [
@@ -66,7 +65,6 @@ __all__ = [
     "Var",
     "affine_terms",
     "build_initial_ir",
-    "build_initial_tree",
     "format_expr",
     "from_affine",
     "substitute",

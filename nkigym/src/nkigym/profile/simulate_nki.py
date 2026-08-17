@@ -110,20 +110,14 @@ def simulate_fp32(kernel: Callable[_P, _R]) -> Callable[_P, _R]:
 
 
 def batch_simulate_fp32(
-    hosts: list[str],
-    cases: list[FP32SimulationCase],
-    atol: float,
-    rtol: float,
-    timeout_s: int = 7200,
-    workers_per_host: int = 4,
+    hosts: list[str], cases: list[FP32SimulationCase], atol: float, rtol: float, timeout_s: int = 7200
 ) -> int:
     """Validate rendered kernels in fp32 across a list of SSH hosts.
 
     Exact duplicate kernels sharing the same inputs and reference output are
-    simulated once. Workload groups are greedily balanced across hosts without
-    copying their shared arrays to multiple hosts. Each host receives one pickle
-    bundle, simulates with a local process pool, and compares outputs remotely.
-    Only compact result metadata returns.
+    simulated once. Cases are greedily balanced across every configured host.
+    Each host receives one pickle bundle, simulates with a local process pool,
+    and compares outputs remotely. Only compact result metadata returns.
 
     Args:
         hosts: SSH destinations provisioned with ``~/venvs/kernel-env``.
@@ -131,21 +125,23 @@ def batch_simulate_fp32(
         atol: Absolute tolerance passed to ``numpy.testing.assert_allclose``.
         rtol: Relative tolerance passed to ``numpy.testing.assert_allclose``.
         timeout_s: Total timeout for each remote host batch.
-        workers_per_host: Simulator processes to run on each physical host.
 
     Returns:
         The number of successfully validated cases.
     """
-    _validate_batch(hosts, cases, atol, rtol, timeout_s, workers_per_host)
+    _validate_batch(hosts, cases, atol, rtol, timeout_s)
     completed = 0
     if cases:
         _require_command("ssh")
         _require_command("rsync")
         unique_cases = _deduplicate_cases(cases)
-        partitions = _partition_cases(hosts, unique_cases)
+        with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
+            futures = [executor.submit(_detect_host_cpu_count, host, timeout_s) for host in hosts]
+            host_capacities = [(host, future.result()) for host, future in zip(hosts, futures, strict=True)]
+        partitions = _partition_cases(host_capacities, unique_cases)
         with tempfile.TemporaryDirectory(prefix="nkigym-simulate-") as raw_directory:
             directory = Path(raw_directory)
-            requests = _write_requests(directory, partitions, atol, rtol, workers_per_host)
+            requests = _write_requests(directory, partitions, atol, rtol)
             with ThreadPoolExecutor(max_workers=len(requests)) as executor:
                 futures = [
                     executor.submit(_run_remote_batch, host, request_path, result_path, timeout_s)
@@ -167,7 +163,7 @@ def _fp32_value(value: object) -> object:
 
 
 def _validate_batch(
-    hosts: list[str], cases: list[FP32SimulationCase], atol: float, rtol: float, timeout_s: int, workers_per_host: int
+    hosts: list[str], cases: list[FP32SimulationCase], atol: float, rtol: float, timeout_s: int
 ) -> None:
     """Reject malformed batch inputs before opening an SSH connection."""
     if not hosts:
@@ -180,8 +176,6 @@ def _validate_batch(
         raise ValueError("relative tolerance must be finite and non-negative")
     if timeout_s <= 0:
         raise ValueError("batch simulation timeout must be positive")
-    if not isinstance(workers_per_host, int) or isinstance(workers_per_host, bool) or workers_per_host <= 0:
-        raise ValueError("workers per host must be a positive integer")
     for case in cases:
         if not case.label:
             raise ValueError("simulation case label must not be empty")
@@ -203,6 +197,31 @@ def _require_command(command: str) -> None:
         raise FileNotFoundError(f"{command} is not on PATH")
 
 
+def _detect_host_cpu_count(host: str, timeout_s: int) -> int:
+    """Return the logical CPUs available to the remote simulation process."""
+    source = (
+        'import os; print(len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1)'
+    )
+    completed = subprocess.run(
+        ["ssh", *_SSH_WORKER_OPTIONS, host, f"{_REMOTE_PYTHON} -c {shlex.quote(source)}"],
+        text=True,
+        capture_output=True,
+        timeout=timeout_s,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"detecting CPU count on {host} failed with exit {completed.returncode}: {detail}")
+    raw_count = completed.stdout.strip()
+    try:
+        cpu_count = int(raw_count)
+    except ValueError as error:
+        raise RuntimeError(f"detecting CPU count on {host} returned {raw_count!r}") from error
+    if cpu_count <= 0:
+        raise RuntimeError(f"detecting CPU count on {host} returned {cpu_count}")
+    return cpu_count
+
+
 def _deduplicate_cases(cases: list[FP32SimulationCase]) -> list[_IndexedCase]:
     """Keep the earliest state for each exact kernel and shared input set."""
     unique: list[_IndexedCase] = []
@@ -215,45 +234,42 @@ def _deduplicate_cases(cases: list[FP32SimulationCase]) -> list[_IndexedCase]:
     return unique
 
 
-def _partition_cases(hosts: list[str], cases: list[_IndexedCase]) -> list[tuple[str, list[_SerializedCase]]]:
-    """Balance shared-input case groups across hosts without duplicating arrays."""
-    grouped: dict[tuple[int, int], list[_IndexedCase]] = {}
-    for indexed_case in cases:
-        case = indexed_case[1]
-        grouped.setdefault((id(case.inputs), id(case.expected)), []).append(indexed_case)
-    active_hosts = hosts[: min(len(hosts), len(grouped))]
+def _partition_cases(
+    host_capacities: list[tuple[str, int]], cases: list[_IndexedCase]
+) -> list[tuple[str, int, list[_SerializedCase]]]:
+    """Balance cases across remote CPU capacity by rendered source size."""
+    ranked_hosts = sorted(enumerate(host_capacities), key=lambda item: (-item[1][1], item[0]))
+    active_hosts = [capacity for _index, capacity in ranked_hosts[: min(len(host_capacities), len(cases))]]
     assigned: list[list[_IndexedCase]] = [[] for _host in active_hosts]
     weights = [0 for _host in active_hosts]
-    weighted_groups = [(sum(len(case.kernel) for _index, case in group), group) for group in grouped.values()]
-    for weight, group in sorted(weighted_groups, key=lambda item: (-item[0], item[1][0][0])):
-        host_index = min(range(len(active_hosts)), key=lambda index: (weights[index], index))
-        assigned[host_index].extend(group)
-        weights[host_index] += weight
+    weighted_cases = sorted(cases, key=lambda item: (-len(item[1].kernel), item[0]))
+    for indexed_case in weighted_cases:
+        host_index = min(
+            range(len(active_hosts)), key=lambda index: (weights[index] / active_hosts[index][1], weights[index], index)
+        )
+        assigned[host_index].append(indexed_case)
+        weights[host_index] += len(indexed_case[1].kernel)
     partitions = []
-    for host, host_cases in zip(active_hosts, assigned, strict=True):
+    for (host, cpu_count), host_cases in zip(active_hosts, assigned, strict=True):
         serialized = [
             (index, case.label, case.kernel, case.func_name, case.inputs, case.expected)
             for index, case in sorted(host_cases, key=lambda item: item[0])
         ]
-        partitions.append((host, serialized))
+        partitions.append((host, min(cpu_count, len(serialized)), serialized))
     return partitions
 
 
 def _write_requests(
-    directory: Path,
-    partitions: list[tuple[str, list[_SerializedCase]]],
-    atol: float,
-    rtol: float,
-    workers_per_host: int,
+    directory: Path, partitions: list[tuple[str, int, list[_SerializedCase]]], atol: float, rtol: float
 ) -> list[tuple[str, Path, Path]]:
     """Write one request bundle and result path per host."""
     requests: list[tuple[str, Path, Path]] = []
-    for index, (host, cases) in enumerate(partitions):
+    for index, (host, worker_count, cases) in enumerate(partitions):
         host_directory = directory / f"host-{index}"
         host_directory.mkdir()
         request_path = host_directory / "request.pkl"
         result_path = host_directory / "result.json"
-        payload = (cases, atol, rtol, workers_per_host)
+        payload = (cases, atol, rtol, worker_count)
         with request_path.open("wb") as request_file:
             pickle.dump(payload, request_file, protocol=pickle.HIGHEST_PROTOCOL)
         requests.append((host, request_path, result_path))

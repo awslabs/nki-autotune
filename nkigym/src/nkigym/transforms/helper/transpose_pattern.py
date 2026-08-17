@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from nkigym.ir import KernelIR
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.transpose import NKITranspose
-from nkigym.transforms.helper.canonical_rewrite import is_canonical_block, single_leaf
+from nkigym.transforms.helper.canonical_rewrite import _canonical_context, is_canonical_block, single_leaf
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,7 @@ def match_transpose_chain(ir: KernelIR, transpose_block: int, drain_block: int) 
                 psum = transpose.operand_bindings["dst"].tensor
                 output = drain.operand_bindings["dst"].tensor
                 connected = drain.operand_bindings["src"].tensor == psum
-                buffers = ir.all_buffers()
+                buffers = _canonical_context(ir).buffers
                 names_exist = all(name in buffers for name in (source, psum, output))
                 if connected and names_exist:
                     source_buffer = buffers[source]

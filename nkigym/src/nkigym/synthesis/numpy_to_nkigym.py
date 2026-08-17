@@ -32,34 +32,6 @@ class SynthesizedKernel:
     adapt_output: OutputAdapter
 
 
-def compile_numpy_to_nkigym(f_numpy: Callable[..., ArrayResult], input_specs: InputSpecs, seed: int = 0) -> str:
-    """Translate a supported workload pattern into deterministic nkigym source.
-
-    The structured lowerer recognizes registered forms whose generated source
-    preserves the reference ABI, then checks the graph numerically at fp32.
-    Lowerings that require input or output adapters must use
-    :func:`synthesize_numpy_to_nkigym`.
-
-    Args:
-        f_numpy: NumPy reference with parameters matching ``input_specs``.
-        input_specs: Input names mapped to ``(shape, dtype)``.
-        seed: Seed for deterministic fp32 validation inputs.
-
-    Returns:
-        Complete Python source defining a decorated ``f_nkigym``.
-
-    Raises:
-        ValueError: The function contract or NumPy program is unsupported.
-        RuntimeError: The deterministic lowering fails numerical validation.
-    """
-    specialized = lower_specialized_reference(f_numpy, input_specs)
-    if specialized is None:
-        raise ValueError("NumPy reference does not match a supported structured workload")
-    if specialized.input_specs != input_specs:
-        raise ValueError("compile_numpy_to_nkigym rejects ABI adapters; use synthesize_numpy_to_nkigym")
-    return synthesize_numpy_to_nkigym(f_numpy, input_specs, seed).source
-
-
 def synthesize_numpy_to_nkigym(
     f_numpy: Callable[..., ArrayResult], input_specs: InputSpecs, seed: int = 0
 ) -> SynthesizedKernel:
@@ -156,4 +128,4 @@ def _compare_results(actual: ArrayResult, expected: ArrayResult) -> dict[str, bo
     }
 
 
-__all__ = ["SynthesizedKernel", "compile_numpy_to_nkigym", "synthesize_numpy_to_nkigym"]
+__all__ = ["SynthesizedKernel", "synthesize_numpy_to_nkigym"]

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
-from nkigym.environment import Action
 from nkigym.ir import KernelIR
 from nkigym.profile.types import ProfileMetrics
+from nkigym.transforms import Transform, TransformOption
+
+Action = tuple[Transform[Any], TransformOption]
 
 
 @dataclass(frozen=True)
@@ -37,4 +40,4 @@ class SearchResult:
     finish_reason: str
 
 
-__all__ = ["Policy", "PolicyContext", "SearchResult"]
+__all__ = ["Action", "Policy", "PolicyContext", "SearchResult"]

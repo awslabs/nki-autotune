@@ -4,7 +4,6 @@ nkigym/src/nkigym/
 |-- __init__.py
 |-- ir/**/*.py                       at most 3,000 code lines total
 |-- codegen/**/*.py                  at most 2,000 code lines total
-|-- environment/**/*.py              at most 2,000 code lines total
 |-- profile/**/*.py                  at most 2,000 code lines total
 |-- search/**/*.py                   at most 2,000 code lines total
 |-- synthesis/**/*.py                at most 1,000 code lines total
@@ -28,8 +27,8 @@ documentation strings do not count. Public transforms must directly define
 typed, synchronous analyze and apply methods. Formatter-control comments are
 forbidden because they permit multiple statements to be hidden on one line.
 
-Required package initializers: nkigym, codegen, environment, ir, ir/arith, ops,
-profile, search, synthesis, transforms, and transforms/helper.
+Required package initializers: nkigym, codegen, ir, ir/arith, ops, profile,
+search, synthesis, transforms, and transforms/helper.
 
 Allowed repository imports:
 
@@ -62,7 +61,6 @@ TRANSFORM_FILE_LINE_LIMIT = 1000
 TRANSFORM_HELPER_LINE_LIMIT = 1000
 MAX_IR_IMPLEMENTATION_LINES = 3000
 MAX_CODEGEN_IMPLEMENTATION_LINES = 2000
-MAX_ENVIRONMENT_IMPLEMENTATION_LINES = 2000
 MAX_PROFILE_IMPLEMENTATION_LINES = 2000
 MAX_SEARCH_IMPLEMENTATION_LINES = 2000
 MAX_SYNTHESIS_IMPLEMENTATION_LINES = 1000
@@ -75,7 +73,6 @@ REQUIRED_PACKAGE_INITIALIZERS = frozenset(
     {
         "nkigym/src/nkigym/__init__.py",
         "nkigym/src/nkigym/codegen/__init__.py",
-        "nkigym/src/nkigym/environment/__init__.py",
         "nkigym/src/nkigym/ir/__init__.py",
         "nkigym/src/nkigym/ir/arith/__init__.py",
         "nkigym/src/nkigym/ops/__init__.py",
@@ -394,10 +391,10 @@ def _search_schedule_violations() -> list[str]:
         for node in ast.walk(module):
             if isinstance(node, ast.ImportFrom) and node.module is not None:
                 if node.module.startswith("nkigym.transforms"):
-                    imports_public_catalog = node.module == "nkigym.transforms" and all(
-                        alias.name == "public_transforms" for alias in node.names
+                    imports_generic_api = node.module == "nkigym.transforms" and all(
+                        alias.name in {"Transform", "TransformOption", "public_transforms"} for alias in node.names
                     )
-                    if not imports_public_catalog:
+                    if not imports_generic_api:
                         violations.append(
                             f"{relative}:{node.lineno} imports concrete transform APIs from {node.module}"
                         )
@@ -428,9 +425,6 @@ def test_repository_structure() -> None:
     codegen_violation, codegen_lines = _source_size_violation(
         source_root / "codegen", "codegen implementation", MAX_CODEGEN_IMPLEMENTATION_LINES
     )
-    environment_violation, environment_lines = _source_size_violation(
-        source_root / "environment", "environment implementation", MAX_ENVIRONMENT_IMPLEMENTATION_LINES
-    )
     profile_violation, profile_lines = _source_size_violation(
         source_root / "profile", "profile implementation", MAX_PROFILE_IMPLEMENTATION_LINES
     )
@@ -453,8 +447,6 @@ def test_repository_structure() -> None:
         violations.append(ir_violation)
     if codegen_violation is not None:
         violations.append(codegen_violation)
-    if environment_violation is not None:
-        violations.append(environment_violation)
     if profile_violation is not None:
         violations.append(profile_violation)
     if search_violation is not None:
@@ -463,7 +455,7 @@ def test_repository_structure() -> None:
         violations.append(synthesis_violation)
     print(
         f"public_transforms={transform_count} largest_transform_file={largest_transform_file} " f"ir_lines={ir_lines}",
-        f"codegen_lines={codegen_lines} environment_lines={environment_lines} profile_lines={profile_lines}",
+        f"codegen_lines={codegen_lines} profile_lines={profile_lines}",
         f"search_lines={search_lines} synthesis_lines={synthesis_lines} public_ops={operation_count}",
         f"largest_op_file={largest_operation_file} op_base_lines={operation_base_lines}",
         f"transform_helper_lines={helper_lines}",

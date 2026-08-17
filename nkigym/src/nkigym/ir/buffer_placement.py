@@ -29,20 +29,11 @@ def place_buffers(tree: KernelTree, anchor_loop_nids_by_tensor: Mapping[str, fro
     remain in first-seen order so each ``alloc_buffers`` list is deterministic.
     """
     buffers = _gather_buffers(tree)
+    targets = buffer_placement_targets(tree, tuple(buffers), anchor_loop_nids_by_tensor)
     _clear_alloc_buffers(tree)
-    touchers = _touchers_by_tensor(tree)
     placement: dict[int, list[Buffer]] = {}
     for name, buf in buffers.items():
-        touch = touchers.get(name)
-        if buf.location == "shared_hbm":
-            block_nid = tree.root
-        else:
-            lca = tree.root if not touch else _lca(tree, touch)
-            anchor_loop_nids = anchor_loop_nids_by_tensor.get(name) if anchor_loop_nids_by_tensor is not None else None
-            if anchor_loop_nids is None:
-                anchor_loop_nids = _anchor_loop_nids(tree, name)
-            block_nid = _safe_enclosing_block(tree, lca, anchor_loop_nids)
-        placement.setdefault(block_nid, []).append(buf)
+        placement.setdefault(targets[name], []).append(buf)
     for block_nid, bufs in placement.items():
         blk = tree.data(block_nid)
         assert isinstance(blk, BlockNode)
@@ -62,13 +53,8 @@ def place_buffer(tree: KernelTree, tensor: str, anchor_loop_nids: frozenset[int]
         raise KeyError(f"buffer {tensor!r} is declared by no block")
     buf = buffers[tensor]
     source_nid = _declaring_block(tree, tensor)
-    touch = _touchers_by_tensor(tree).get(tensor)
-    if buf.location == "shared_hbm":
-        target_nid = tree.root
-    else:
-        lca = tree.root if not touch else _lca(tree, touch)
-        resolved_anchors = anchor_loop_nids if anchor_loop_nids is not None else _anchor_loop_nids(tree, tensor)
-        target_nid = _safe_enclosing_block(tree, lca, resolved_anchors)
+    anchors = {tensor: anchor_loop_nids} if anchor_loop_nids is not None else None
+    target_nid = buffer_placement_targets(tree, (tensor,), anchors)[tensor]
     if source_nid != target_nid:
         source = tree.block(source_nid)
         remaining = tuple(candidate for candidate in source.alloc_buffers if candidate.name != tensor)
@@ -78,6 +64,32 @@ def place_buffer(tree: KernelTree, tensor: str, anchor_loop_nids: frozenset[int]
         target = tree.block(target_nid)
         placed = tuple(sorted((*target.alloc_buffers, buf), key=lambda candidate: order[candidate.name]))
         tree.graph.nodes[target_nid]["data"] = replace(target, alloc_buffers=placed)
+
+
+def buffer_placement_targets(
+    tree: KernelTree, tensors: tuple[str, ...], anchor_loop_nids_by_tensor: Mapping[str, frozenset[int]] | None = None
+) -> dict[str, int]:
+    """Return lifetime-safe declaration blocks for selected tensors."""
+    buffers = _gather_buffers(tree)
+    missing = set(tensors) - buffers.keys()
+    if missing:
+        raise KeyError(f"buffers declared by no block: {sorted(missing)}")
+    touchers = _touchers_by_tensor(tree)
+    regions = _regions_by_tensor(tree, frozenset(tensors))
+    targets: dict[str, int] = {}
+    for tensor in tensors:
+        buffer = buffers[tensor]
+        if buffer.location == "shared_hbm":
+            target = tree.root
+        else:
+            touch = touchers.get(tensor)
+            lca = tree.root if not touch else _lca(tree, touch)
+            anchors = anchor_loop_nids_by_tensor.get(tensor) if anchor_loop_nids_by_tensor is not None else None
+            if anchors is None:
+                anchors = _anchor_loop_nids_from_regions(tree, regions.get(tensor, []))
+            target = _safe_enclosing_block(tree, lca, anchors)
+        targets[tensor] = target
+    return targets
 
 
 def _safe_enclosing_block(tree: KernelTree, lca_nid: int, anchor_loop_nids: frozenset[int]) -> int:
@@ -146,15 +158,8 @@ def _touchers_by_tensor(tree: KernelTree) -> dict[str, set[int]]:
     return touchers
 
 
-def _anchor_loop_nids(tree: KernelTree, tensor: str) -> frozenset[int]:
-    """Return common outer loops that select one reusable buffer instance.
-
-    An anchor encloses every ISA access and has the same coefficient on every
-    region axis across all touchers. Anchors form an outer prefix of the common
-    loop chain; once one loop is inconsistent, values can remain live across it
-    and every inner loop must share that wider lifetime.
-    """
-    pairs = _regions_touching(tree, tensor)
+def _anchor_loop_nids_from_regions(tree: KernelTree, pairs: list[tuple[int, BufferRegion]]) -> frozenset[int]:
+    """Return common outer loops that select one reusable buffer instance."""
     anchors: set[int] = set()
     if pairs:
         per_leaf = [
@@ -187,16 +192,15 @@ def _axis_coeff(region: BufferRegion, axis: int, loop_var: str) -> int:
     return coeff
 
 
-def _regions_touching(tree: KernelTree, tensor: str) -> list[tuple[int, BufferRegion]]:
-    """Return every ISA leaf and operand region naming ``tensor``."""
-    regions: list[tuple[int, BufferRegion]] = []
+def _regions_by_tensor(tree: KernelTree, tensors: frozenset[str]) -> dict[str, list[tuple[int, BufferRegion]]]:
+    """Index selected ISA operand regions by tensor in one traversal."""
+    regions: dict[str, list[tuple[int, BufferRegion]]] = {}
     for nid in tree.preorder():
         data = tree.data(nid)
-        if not isinstance(data, ISANode):
-            continue
-        for region in data.operand_bindings.values():
-            if region.tensor == tensor:
-                regions.append((nid, region))
+        if isinstance(data, ISANode):
+            for region in data.operand_bindings.values():
+                if region.tensor in tensors:
+                    regions.setdefault(region.tensor, []).append((nid, region))
     return regions
 
 
@@ -223,4 +227,4 @@ def _lca(tree: KernelTree, nids: set[int]) -> int:
     return lca_nid
 
 
-__all__ = ["place_buffer", "place_buffers"]
+__all__ = ["buffer_placement_targets", "place_buffer", "place_buffers"]

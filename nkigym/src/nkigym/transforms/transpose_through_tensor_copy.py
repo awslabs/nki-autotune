@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
 from nkigym.ir.tree import ISANode
 from nkigym.ops.dma_transpose import NKIDMATranspose
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, remove_buffers
 from nkigym.transforms.helper.transpose_pattern import TransposeChain, match_transpose_chain
 from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
@@ -40,11 +39,8 @@ class TransposeThroughTensorCopy(Transform[TransposeThroughTensorCopyOption]):
             raise TransformLegalityError(
                 f"TransposeThroughTensorCopy target {option.transpose_nid} is not an eligible logical transpose"
             )
-        new_ir = copy.deepcopy(ir)
-        copied_match = _match(new_ir, option)
-        if copied_match is None:
-            raise AssertionError("TransposeThroughTensorCopy match disappeared after deepcopy")
-        _apply_match(new_ir, copied_match)
+        new_ir = copy_for_rewrite(ir)
+        _apply_match(new_ir, match)
         finalize_rewrite(new_ir)
         return new_ir
 

@@ -25,44 +25,6 @@ _COMPILER_LOG_FILE = "log-neuron-cc.txt"
 _TRANSPORT_LOG_FILE = "transport.log"
 
 
-def profile(
-    host: str,
-    kernel: str,
-    func_name: str,
-    input_specs: dict[str, tuple[tuple[int, ...], str]],
-    cache_dir: str | Path,
-    neuronx_cc_args: tuple[str, ...] = (),
-    lnc: int = 1,
-    timeout_s: int = 1800,
-) -> tuple[float, float]:
-    """Profile one NKI kernel over SSH.
-
-    Args:
-        host: SSH destination for an installed profile host.
-        kernel: Complete standalone ``kernel.py`` source.
-        func_name: NKI function to load from the source.
-        input_specs: Input names mapped to ``(shape, dtype)``.
-        cache_dir: Local destination for the kernel and profiler artifacts.
-        neuronx_cc_args: Optional Neuron compiler pipeline arguments.
-        lnc: Logical NeuronCore count, either 1 or 2.
-        timeout_s: Total SSH operation timeout in seconds.
-
-    Returns:
-        A ``(mfu_percent, latency_ms)`` tuple.
-    """
-    metrics = profile_metrics(
-        host=host,
-        kernel=kernel,
-        func_name=func_name,
-        input_specs=input_specs,
-        cache_dir=cache_dir,
-        neuronx_cc_args=neuronx_cc_args,
-        lnc=lnc,
-        timeout_s=timeout_s,
-    )
-    return metrics.mfu_percent, metrics.latency_ms
-
-
 def profile_metrics(
     host: str,
     kernel: str,
@@ -234,4 +196,4 @@ def _profile_failure_message(error: str, compiler_log: str) -> str:
     return diagnostic[-1000:]
 
 
-__all__ = ["profile", "profile_many", "profile_metrics"]
+__all__ = ["profile_many", "profile_metrics"]

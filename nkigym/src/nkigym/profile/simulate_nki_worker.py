@@ -29,7 +29,6 @@ _FP_DTYPES_NON_FP32 = (
 ArrayResult = np.ndarray | tuple[np.ndarray, ...]
 _SerializedCase = tuple[int, str, str, str, dict[str, np.ndarray], ArrayResult]
 _FailurePayload = dict[str, int | str]
-_MIN_CASES_PER_PROCESS = 128
 _WORKER_CASES: list[_SerializedCase] = []
 _WORKER_ATOL = 0.0
 _WORKER_RTOL = 0.0
@@ -94,7 +93,7 @@ def _read_worker_request(request_path: Path) -> tuple[list[_SerializedCase], flo
     if not isinstance(payload, tuple) or len(payload) != 4:
         raise ValueError("malformed batch simulation request")
     cases, atol, rtol, worker_count = payload
-    if worker_count <= 0:
+    if not isinstance(worker_count, int) or isinstance(worker_count, bool) or worker_count <= 0:
         raise ValueError("batch simulation worker count must be positive")
     return cases, atol, rtol, worker_count
 
@@ -109,8 +108,7 @@ def _worker_result(
     _WORKER_RTOL = rtol
     failures: list[_FailurePayload | None] = []
     if cases:
-        useful_workers = max(1, (len(cases) + _MIN_CASES_PER_PROCESS - 1) // _MIN_CASES_PER_PROCESS)
-        active_workers = min(worker_count, useful_workers)
+        active_workers = min(len(cases), worker_count, multiprocessing.cpu_count())
         if active_workers == 1:
             failures = [_simulate_case(position) for position in range(len(cases))]
         else:

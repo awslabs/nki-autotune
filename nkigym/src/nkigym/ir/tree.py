@@ -15,8 +15,7 @@ sub-payloads carried on :class:`BlockNode` and :class:`ISANode`.
 :class:`KernelTree` wraps the graph with a small traversal surface
 (``children``, ``parent``, ``ancestors``, ``descendants``, ``leaves``,
 ``preorder``, ``blocks``) so downstream atoms don't have to touch
-``networkx`` directly. :func:`build_initial_tree` walks an
-``@nkigym_kernel`` callable via :func:`nkigym.ir.dimension_analysis.analyze_dimensions`.
+``networkx`` directly.
 """
 
 from __future__ import annotations
@@ -28,7 +27,6 @@ from typing import Any, TypeVar
 import networkx as nx
 
 from nkigym.ir.arith.expr import Expr
-from nkigym.ir.dimension_analysis import _AnalysisResult
 from nkigym.ops.base import AxisRole, NKIOp
 
 PARTITION_DIM = 128
@@ -402,20 +400,6 @@ class KernelTree:
                 yield m
 
 
-def build_initial_tree(analysis: "_AnalysisResult") -> "KernelTree":
-    """Build the canonical schedule tree from an :class:`_AnalysisResult`.
-
-    The returned tree's root is a :class:`BlockNode` (empty iter_vars/reads/writes,
-    holds kernel-lifetime buffers). Per-op leaf blocks are children of the root
-    block, in source order. Allocs become ``Buffer`` entries on the smallest
-    enclosing block whose subtree contains every leaf that touches the buffer
-    (canonical: nearly always the root block).
-    """
-    from nkigym.ir.canonical_build import build_canonical_blocknode_tree
-
-    return build_canonical_blocknode_tree(analysis)
-
-
 def role_of(block: BlockNode, axis: str) -> AxisRole:
     """Return the role this block assigns to ``axis``.
 
@@ -438,6 +422,5 @@ __all__ = [
     "KernelTree",
     "NodeData",
     "PARTITION_DIM",
-    "build_initial_tree",
     "role_of",
 ]

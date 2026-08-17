@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from math import prod
@@ -20,7 +19,7 @@ from nkigym.ir.dependency import (
 from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.ops.base import AxisRole
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
 from nkigym.transforms.helper.normalize import _dim_from_loopvar, normalize_block
 from nkigym.transforms.helper.tree_ops import (
@@ -1013,7 +1012,7 @@ class CodeMotion(Transform[CodeMotionOption]):
         anonymous tail (see the 2026-07-14 BufferCompaction design).
         """
         invalidated_pipeline_loops = self._check_legality(ir, option)
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         _move(new_ir, block_nid=option.block_nid, target_loop_nid=option.target_loop_nid, index=option.index)
         invalidate_stale_software_pipelines(new_ir, invalidated_pipeline_loops)
         new_ir.dependency = Dependency(new_ir.tree)
@@ -1039,19 +1038,29 @@ class CodeMotion(Transform[CodeMotionOption]):
                 try:
                     self._check_static_legality(ir, block_nid, target_nid, context)
                     plan = _prefix_plan(ir.tree, block_nid, target_nid)
+                except TransformLegalityError:
+                    continue
+                legal_indices: list[int] = []
+                moved_leaf = _dependency_leaf(ir, block_nid)
+                for index in indices:
+                    offending = ir.dependency.first_backward_edge_for_insertion(
+                        moved_leaf, target_nid, index, topology=context.topology
+                    )
+                    if offending is None:
+                        legal_indices.append(index)
+                    elif offending[0] == moved_leaf:
+                        break
+                if not legal_indices:
+                    continue
+                try:
                     _check_same_loop_prefix(ir, block_nid, target_nid, plan)
                     _check_move_scope_changes(ir, block_nid, target_nid, plan)
                 except TransformLegalityError:
                     continue
-                for index in indices:
-                    moved_leaf = _dependency_leaf(ir, block_nid)
-                    if (
-                        ir.dependency.first_backward_edge_for_insertion(
-                            moved_leaf, target_nid, index, topology=context.topology
-                        )
-                        is None
-                    ):
-                        options.append(CodeMotionOption(block_nid=block_nid, target_loop_nid=target_nid, index=index))
+                options.extend(
+                    CodeMotionOption(block_nid=block_nid, target_loop_nid=target_nid, index=index)
+                    for index in legal_indices
+                )
         return options
 
     def _legal_indices(self, ir: KernelIR, block_nid: int, target_nid: int) -> list[int]:

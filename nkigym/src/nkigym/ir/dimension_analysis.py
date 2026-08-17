@@ -44,7 +44,7 @@ class TensorDims:
 
 @dataclass
 class _OpRecord:
-    """Per-op tracer record. Private — consumed by ``build_initial_tree``.
+    """Per-op tracer record consumed by canonical tree construction.
 
     Attributes:
         op_cls: The NKIOp subclass.

@@ -21,9 +21,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nkigym.ir.canonical_build import build_canonical_blocknode_tree
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.dimension_analysis import analyze_dimensions
-from nkigym.ir.tree import BlockNode, Buffer, KernelTree, build_initial_tree
+from nkigym.ir.tree import BlockNode, Buffer, KernelTree
 
 
 @dataclass
@@ -131,7 +132,7 @@ def build_initial_ir(func: Callable[..., Any], input_specs: dict[str, tuple[tupl
         A populated :class:`KernelIR` envelope.
     """
     analysis = analyze_dimensions(func, input_specs)
-    tree = build_initial_tree(analysis)
+    tree = build_canonical_blocknode_tree(analysis)
     dependency = Dependency(tree)
     param_buffers = {
         name: Buffer(

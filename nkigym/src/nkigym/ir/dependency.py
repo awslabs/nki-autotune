@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cached_property
 from weakref import WeakKeyDictionary
 
 import networkx as nx
@@ -64,10 +65,11 @@ class Dependency:
         self._ancestors = {nid: tuple(tree.ancestors(nid)) for nid in self._preorder}
         self._descendants = {nid: frozenset(tree.descendants(nid)) for nid in self._preorder}
         self._tree_edges = frozenset(tree.graph.edges)
-        closure = nx.transitive_closure(self.graph, reflexive=False)
-        self._closure: nx.DiGraph = nx.DiGraph()
-        self._closure.add_nodes_from(closure.nodes(data=True))
-        self._closure.add_edges_from(closure.edges(data=True))
+
+    @cached_property
+    def _closure(self) -> nx.DiGraph:
+        """Build transitive reachability on its first query."""
+        return nx.DiGraph(nx.transitive_closure_dag(self.graph))
 
     def _resolve(self, nid: int) -> int:
         """Map a block nid to its owned ISA-leaf nid; a leaf/loop nid maps to itself."""
@@ -97,53 +99,16 @@ class Dependency:
         """Return True if ``producer`` must execute before ``consumer``."""
         return self._closure.has_edge(self._resolve(producer), self._resolve(consumer))
 
-    def first_backward_edge(self, moved_leaf_nid: int, tree: KernelTree | None = None) -> tuple[int, int] | None:
-        """Return the first dependency edge incident to ``moved_leaf_nid`` that
-        points backward in the execution order of ``tree``, else ``None``.
-
-        One rule, no edge-kind. Each node has a preorder span ``[start, end]``
-        over the tree (a leaf is a point; a loop spans its whole subtree). An
-        edge ``a -> b`` ("a before b") is satisfied iff ``span(a).end <
-        span(b).start`` and backward otherwise. A carry edge to a loop and a
-        flow edge to a leaf are checked identically; the loop's wider span
-        encodes "outside-and-before the whole loop".
-
-        Edge *directions* always come from ``self.graph`` — this graph's
-        producer->consumer orientation, frozen at construction. To test a
-        *proposed* move, build this ``Dependency`` on the **original** program
-        (correct directions) and pass the **moved** tree as ``tree`` so spans
-        are read from the new positions. Rebuilding ``Dependency`` on the moved
-        tree instead would be wrong: ``_build`` re-derives every flow edge from
-        execution order, so a producer sunk past its consumer silently flips
-        from RAW ``producer->consumer`` to WAR ``consumer->producer`` and the
-        violation disappears. ``tree`` defaults to ``self._tree`` for the
-        pure same-tree check.
-        """
-        eval_tree = tree if tree is not None else self._tree
-        order = {n: i for i, n in enumerate(eval_tree.preorder())}
-
-        def span(nid: int) -> tuple[float, float]:
-            idxs = [order[d] for d in (eval_tree.descendants(nid) | {nid}) if d in order]
-            if not idxs:
-                raise KeyError(f"dependency endpoint {nid} absent from the evaluated tree")
-            return (min(idxs), max(idxs))
-
-        def enclosing_loops(nid: int) -> list[int]:
-            return [a for a in eval_tree.ancestors(nid) if isinstance(eval_tree.data(a), ForNode)]
-
-        return self._first_backward(moved_leaf_nid, span, eval_tree, enclosing_loops)
-
     def first_backward_edge_for_insertion(
         self, moved_leaf_nid: int, target_loop_nid: int, index: int, topology: _Topology | None = None
     ) -> tuple[int, int] | None:
         """Pure ordering check for splicing ``moved_leaf_nid`` under
         ``target_loop_nid`` at child slot ``index`` — no tree mutation.
 
-        Equivalent to deep-copying, running ``_move``, rebuilding ``Dependency``
-        on the moved tree and calling :meth:`first_backward_edge`, but O(edges)
-        with no copy. Directions come from ``self.graph`` (build this
-        ``Dependency`` on the original program); positions come from
-        ``self._tree`` with the moved leaf relocated to its effective slot.
+        Computes the proposed execution spans in O(edges) without copying or
+        mutating the tree. Directions come from ``self.graph`` (build this
+        ``Dependency`` on the original program); positions come from ``self._tree``
+        with the moved leaf relocated to its effective slot.
         ``index`` follows the ``_splice_under_target`` convention: ``-1``
         append, ``-2`` prepend, ``>=0`` explicit slot.
 
@@ -267,9 +232,8 @@ class Dependency:
         — for the moved leaf under an insertion query, the TARGET's ancestors.
         """
         result: tuple[int, int] | None = None
-        for a, b, attrs in self.graph.edges(data=True):
-            if a != moved_leaf_nid and b != moved_leaf_nid:
-                continue
+        edges = (*self.graph.in_edges(moved_leaf_nid, data=True), *self.graph.out_edges(moved_leaf_nid, data=True))
+        for a, b, attrs in edges:
             tensor = attrs.get("tensor")
             if tensor is None:
                 continue
