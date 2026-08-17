@@ -1,39 +1,16 @@
 # Kernel Library
 
-Reproducible transform ladders for the best retained kernel schedules. Each
-flat module owns one exact `(workload, shape)` tuple and exposes a singular
-`WORKLOAD` containing its input specifications, NumPy reference, nkigym graph,
-seeded FP32 input generator, validation tolerances, best retained action ladder,
-historical best MFU, and the best manually achieved Kaena MFU for reference.
-Modules also own CPU verification, artifact dump, and hardware profiling.
+Each workload module exposes one `WORKLOAD` dictionary with exactly:
+
+- `numpy_ref`
+- `input_specs`
+- `input_generator`
+- `atol`
+- `rtol`
+- `best_historical_mfu`
+
+`kernel_library.WORKLOADS` discovers every module automatically. Tests synthesize
+the kernel from `numpy_ref`, generate inputs through `input_generator`, and use
+the historical MFU directly from the dictionary.
+
 Rendered NKI kernels are generated artifacts and are not checked in.
-
-`registry.py` maps each tuple to its module. Ladders and MFU values are never
-inherited across shapes.
-
-Matmul and RMSNorm+matmul measurements use 2048³ BF16 inputs on `gym-1`.
-Attention uses a 16K sequence length and head dimension 128.
-
-Validation follows the corresponding Kaena tests: matmul uses uniform `[0, 1]`
-inputs with `atol=rtol=1e-3`; RMSNorm+matmul uses uniform `[-0.1, 0.1]`
-inputs with `atol=1e-3`, `rtol=2e-2`; attention uses uniform `[0, 1]` inputs
-with `atol=1e-5`, `rtol=2e-2`.
-
-| workload | shape | module | states | historical best MFU | reference MFU |
-| --- | --- | --- | ---: | ---: | ---: |
-| matmul-lhs-t | `m2048_k2048_n2048` | `matmul_lhs_t_rhs_m2048_k2048_n2048.py` | 41 | **90.92%** | **90.92%** |
-| matmul-lhs | `m2048_k2048_n2048` | `matmul_lhs_rhs_m2048_k2048_n2048.py` | 37 | **87.46%** | **89.26%** |
-| rmsnorm-matmul | `m2048_k2048_n2048` | `rmsnorm_matmul_m2048_k2048_n2048.py` | 54 | **86.99%** | **79.09%** |
-| attention | `q16384_kv16384_d128` | `attention_q16384_kv16384_d128.py` | 85 | **46.43%** | **51.25%** |
-
-The measured endpoints use
-`("enable-linear-scan-allocation=false", "enable-instruction-scheduling=false")`.
-
-The lhs-transposed endpoint uses N-outer scheduling, two-stage accumulation,
-list-backed input tiles, and per-output-tile PSUM allocation.
-
-The RMSNorm+matmul endpoint uses full-reduction online fusion, fused and
-software-pipelined row blocks, batched transpose, and a four-way RHS buffer
-layout.
-
-The attention ladder targets pretransposed single-head attention.

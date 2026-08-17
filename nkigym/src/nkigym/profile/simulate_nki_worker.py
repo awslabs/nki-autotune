@@ -26,7 +26,8 @@ _FP_DTYPES_NON_FP32 = (
     "float4_e2m1fn_x4",
     "tfloat32",
 )
-_SerializedCase = tuple[int, str, str, str, dict[str, np.ndarray], np.ndarray]
+ArrayResult = np.ndarray | tuple[np.ndarray, ...]
+_SerializedCase = tuple[int, str, str, str, dict[str, np.ndarray], ArrayResult]
 _FailurePayload = dict[str, int | str]
 _MIN_CASES_PER_PROCESS = 128
 _WORKER_CASES: list[_SerializedCase] = []
@@ -42,7 +43,7 @@ def _fp32_source(source: str) -> str:
     return rewritten
 
 
-def _simulate_source_fp32(source: str, func_name: str, inputs: dict[str, np.ndarray], source_name: str) -> np.ndarray:
+def _simulate_source_fp32(source: str, func_name: str, inputs: dict[str, np.ndarray], source_name: str) -> ArrayResult:
     """Execute one standalone rendered kernel through the fp32 simulator."""
     namespace: dict = {}
     code = compile(_fp32_source(source), source_name, "exec")
@@ -51,8 +52,15 @@ def _simulate_source_fp32(source: str, func_name: str, inputs: dict[str, np.ndar
     if kernel is None:
         raise AttributeError(f"rendered kernel has no function {func_name!r}")
     simulated = nki.simulate(kernel)
-    cast_inputs = {name: value.astype(np.float32) for name, value in inputs.items()}
-    return np.asarray(simulated(**cast_inputs))
+    cast_inputs = {
+        name: value.astype(np.float32) if value.dtype.kind == "f" else value for name, value in inputs.items()
+    }
+    result = simulated(**cast_inputs)
+    if isinstance(result, tuple):
+        output: ArrayResult = tuple(np.asarray(value) for value in result)
+    else:
+        output = np.asarray(result)
+    return output
 
 
 def _simulate_case(position: int) -> _FailurePayload | None:
@@ -61,7 +69,14 @@ def _simulate_case(position: int) -> _FailurePayload | None:
     failure = None
     try:
         actual = _simulate_source_fp32(source, func_name, inputs, f"<batch-case-{case_index}>")
-        np.testing.assert_allclose(actual, expected, atol=_WORKER_ATOL, rtol=_WORKER_RTOL, err_msg=label)
+        actual_outputs = actual if isinstance(actual, tuple) else (actual,)
+        expected_outputs = expected if isinstance(expected, tuple) else (expected,)
+        if len(actual_outputs) != len(expected_outputs):
+            raise AssertionError(f"{label}: returned {len(actual_outputs)} outputs, expected {len(expected_outputs)}")
+        for actual_output, expected_output in zip(actual_outputs, expected_outputs, strict=True):
+            np.testing.assert_allclose(
+                actual_output, expected_output, atol=_WORKER_ATOL, rtol=_WORKER_RTOL, err_msg=label
+            )
     except Exception as error:
         failure = {
             "case_index": case_index,

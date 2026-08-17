@@ -18,9 +18,10 @@ from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
 @dataclass(frozen=True)
 class TransposeThroughLoadOption(TransformOption):
-    """Commute the transpose following the load block at ``target_nid``."""
+    """Commute a transpose through a load using one HBM source tile width."""
 
     target_nid: int
+    first_tile: int
 
 
 @dataclass(frozen=True)
@@ -45,8 +46,12 @@ class TransposeThroughLoad(Transform[TransposeThroughLoadOption]):
         """Return every eligible canonical load block."""
         options: list[TransposeThroughLoadOption] = []
         for block_nid in ir.tree.children(ir.tree.root):
-            if _match(ir, block_nid) is not None:
-                options.append(TransposeThroughLoadOption(target_nid=block_nid))
+            match = _match(ir, block_nid)
+            if match is not None:
+                options.extend(
+                    TransposeThroughLoadOption(target_nid=block_nid, first_tile=first_tile)
+                    for first_tile in _first_tiles(ir, match)
+                )
         return options
 
     def apply(self, ir: KernelIR, option: TransposeThroughLoadOption) -> KernelIR:
@@ -56,11 +61,15 @@ class TransposeThroughLoad(Transform[TransposeThroughLoadOption]):
             raise TransformLegalityError(
                 f"TransposeThroughLoad target {option.target_nid} is not an eligible canonical load-transpose segment"
             )
+        if option.first_tile not in _first_tiles(ir, match):
+            raise TransformLegalityError(
+                f"TransposeThroughLoad first_tile {option.first_tile} is invalid for {match.source}"
+            )
         new_ir = copy.deepcopy(ir)
         copied_match = _match(new_ir, option.target_nid)
         if copied_match is None:
             raise AssertionError("TransposeThroughLoad match disappeared after deepcopy")
-        _apply_match(new_ir, copied_match)
+        _apply_match(new_ir, copied_match, option.first_tile)
         finalize_rewrite(new_ir)
         return new_ir
 
@@ -164,10 +173,17 @@ def _validate(ir: KernelIR, load_block: int, transpose_block: int) -> _Match | N
     return result
 
 
-def _apply_match(ir: KernelIR, match: _Match) -> None:
+def _first_tiles(ir: KernelIR, match: _Match) -> tuple[int, ...]:
+    """Return legal HBM source widths for one matched transpose."""
+    extent = ir.buffer(match.source).shape[0]
+    minimum = NKIDMATranspose.MIN_TILE_SIZE["P"]
+    maximum = min(extent, NKIDMATranspose.HBM_SOURCE_MAX_TILE_SIZE["P"])
+    return tuple(tile for tile in range(minimum, maximum + 1, minimum) if extent % tile == 0)
+
+
+def _apply_match(ir: KernelIR, match: _Match, first_tile: int) -> None:
     """Rewrite a validated segment in place."""
     source = ir.buffer(match.source)
-    first_tile = match.first_tile
     second_tile = match.second_tile
     first_trip = source.shape[0] // first_tile
     second_trip = source.shape[1] // second_tile

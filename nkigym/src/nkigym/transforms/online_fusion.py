@@ -993,8 +993,9 @@ class OnlineFusionOption(TransformOption):
 class OnlineFusion(Transform[OnlineFusionOption]):
     """Rewrite one algebraically separable reduction chain into online form."""
     def analyze(self, ir: KernelIR) -> list[OnlineFusionOption]:
-        """Enumerate contract-proven and lowering-supported options."""; state = _incremental_state(ir)
-        if state is not None: options = [OnlineFusionOption(state.remaining[0].match_id, state.chunk_size)] if state.remaining and _incremental_intact(ir, state) else []
+        """Enumerate contract-proven and lowering-supported options."""; state = _incremental_state(ir) if len(ir.return_names) == 1 else None
+        if len(ir.return_names) != 1 or any(ir.tree.isa(nid).op_cls.algebraic_contract(ir.tree.isa(nid).kwargs) is None for nid in ir.tree.preorder() if isinstance(ir.tree.data(nid), ISANode)): options = []
+        elif state is not None: options = [OnlineFusionOption(state.remaining[0].match_id, state.chunk_size)] if state.remaining and _incremental_intact(ir, state) else []
         else:
             options = [OnlineFusionOption(match.match_id, chunk_size) for match in _detect_matches(ir, complete=False) for chunk_size in match.chunk_sizes if _can_lower(ir, match, chunk_size, prefix=match.incremental_prefix)]
         return options

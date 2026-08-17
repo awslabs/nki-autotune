@@ -6,7 +6,7 @@ import copy
 from dataclasses import dataclass
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Var, to_affine
+from nkigym.ir.arith.expr import Expr, Var, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, KernelTree, role_of
 from nkigym.ops.base import AxisRole
@@ -77,7 +77,10 @@ class Reorder(Transform[ReorderOption]):
             return
         outer = ir.tree.loop(option.outer_nid)
         inner = ir.tree.loop(option.inner_nid)
-        substitutions = {outer.loop_var: Var(name=inner.loop_var), inner.loop_var: Var(name=outer.loop_var)}
+        substitutions: dict[str, Expr] = {
+            outer.loop_var: Var(name=inner.loop_var),
+            inner.loop_var: Var(name=outer.loop_var),
+        }
         ir.tree.graph.nodes[option.outer_nid]["data"] = ForNode(loop_var=inner.loop_var, extent=outer.extent)
         ir.tree.graph.nodes[option.inner_nid]["data"] = ForNode(loop_var=outer.loop_var, extent=inner.extent)
         block_nid = _enclosing_block_nid(ir.tree, option.outer_nid)

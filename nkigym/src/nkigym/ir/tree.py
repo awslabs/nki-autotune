@@ -151,14 +151,20 @@ class Buffer:
             leading, free = self.shape
         else:
             raise AssertionError(f"{self.name}: SBUF/PSUM buffer expects a 1D or 2D logical shape; got {self.shape}")
-        if leading % PARTITION_DIM != 0:
-            raise AssertionError(f"{self.name}: leading extent {leading} must be a multiple of {PARTITION_DIM}")
+        partition = min(leading, PARTITION_DIM)
+        if leading % partition != 0:
+            raise AssertionError(f"{self.name}: leading extent {leading} cannot use partition extent {partition}")
         return leading, free
+
+    def partition_extent(self) -> int:
+        """Return the physical partition width of one on-chip tile."""
+        leading, _free = self._on_chip_shape()
+        return min(leading, PARTITION_DIM)
 
     def logical_tile_count(self) -> int:
         """Return the number of logical partition tiles before versioning."""
         leading, _free = self._on_chip_shape()
-        return leading // PARTITION_DIM
+        return leading // self.partition_extent()
 
     def tiles_per_list(self) -> int:
         """Return logical partition tiles stored in each list entry."""
@@ -183,7 +189,7 @@ class Buffer:
         if self.location == "shared_hbm":
             return self.shape
         _leading, free = self._on_chip_shape()
-        return (PARTITION_DIM, self.logical_tile_count() * self.versions, free)
+        return (self.partition_extent(), self.logical_tile_count() * self.versions, free)
 
     def per_tile_physical_shape(self) -> tuple[int, ...]:
         """Return the ndarray shape of one entry in this buffer's allocation list.

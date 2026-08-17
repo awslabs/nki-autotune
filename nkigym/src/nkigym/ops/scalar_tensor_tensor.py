@@ -63,7 +63,11 @@ class NKIScalarTensorTensor(NKIOp):
         data = kwargs["data"]
         operand0 = kwargs["operand0"]
         operand1 = kwargs["operand1"]
-        broadcast0 = operand0[..., np.newaxis] if isinstance(operand0, np.ndarray) else operand0
+        broadcast0 = (
+            operand0[..., np.newaxis]
+            if isinstance(operand0, np.ndarray) and operand0.ndim + 1 == data.ndim
+            else operand0
+        )
         first_args = (broadcast0, data) if kwargs.get("reverse0", False) else (data, broadcast0)
         intermediate = _OPS[str(kwargs["op0"])](*first_args)
         second_args = (operand1, intermediate) if kwargs.get("reverse1", False) else (intermediate, operand1)

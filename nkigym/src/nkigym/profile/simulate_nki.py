@@ -40,10 +40,13 @@ _SSH_OPTIONS = (
     "-o",
     "ControlPath=~/.ssh/nkigym-%C",
 )
+_SSH_WORKER_OPTIONS = (*_SSH_OPTIONS, "-n", "-o", "ControlMaster=no", "-o", "ControlPath=none")
 _REMOTE_PYTHON = '"$HOME"/venvs/kernel-env/bin/python'
 _REMOTE_RUN_ROOT = ".cache/nkigym-simulate/runs"
+_REMOTE_RESULT_POLL_SECONDS = 5.0
 _WORKER_SOURCE = Path(__file__).with_name("simulate_nki_worker.py")
-_SerializedCase = tuple[int, str, str, str, dict[str, np.ndarray], np.ndarray]
+ArrayResult = np.ndarray | tuple[np.ndarray, ...]
+_SerializedCase = tuple[int, str, str, str, dict[str, np.ndarray], ArrayResult]
 
 
 @dataclass(frozen=True)
@@ -54,7 +57,7 @@ class FP32SimulationCase:
     kernel: str
     func_name: str
     inputs: dict[str, np.ndarray]
-    expected: np.ndarray
+    expected: ArrayResult
 
 
 _IndexedCase = tuple[int, FP32SimulationCase]
@@ -157,8 +160,8 @@ def batch_simulate_fp32(
 
 
 def _fp32_value(value: object) -> object:
-    """Cast a NumPy input to fp32 while preserving non-array arguments."""
-    result = value.astype(np.float32) if isinstance(value, np.ndarray) else value
+    """Cast floating NumPy inputs to fp32 while preserving integer arrays."""
+    result = value.astype(np.float32) if isinstance(value, np.ndarray) and value.dtype.kind == "f" else value
     return result
 
 
@@ -269,7 +272,7 @@ def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_
             "Checking remote simulation environment",
             [
                 "ssh",
-                *_SSH_OPTIONS,
+                *_SSH_WORKER_OPTIONS,
                 host,
                 (
                     f"test -x {_REMOTE_PYTHON} && "
@@ -294,22 +297,8 @@ def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_
             deadline,
             log,
         )
-        _run_transport_command(
-            "Simulating kernel batch",
-            [
-                "ssh",
-                *_SSH_OPTIONS,
-                host,
-                (
-                    f"{_REMOTE_PYTHON} "
-                    f'"$HOME"/{remote_run}/simulate_nki_worker.py '
-                    f'--worker "$HOME"/{remote_run}/request.pkl '
-                    f'"$HOME"/{remote_run}/result.json'
-                ),
-            ],
-            deadline,
-            log,
-        )
+        _start_remote_worker(host, remote_run, deadline, log)
+        _wait_for_remote_result(host, remote_run, deadline, log)
         _run_transport_command(
             "Downloading simulation result",
             ["rsync", "-a", "-e", rsync_shell, f"{host}:{remote_run}/result.json", str(result_path)],
@@ -324,6 +313,65 @@ def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_
         detail = "".join(log)[-5000:]
         raise RuntimeError(f"SSH batch simulation failed for {host}: {failure}\n{detail}") from failure
     return _read_host_result(host, result_path)
+
+
+def _start_remote_worker(host: str, remote_run: str, deadline: float, log: list[str]) -> None:
+    """Start one detached worker whose result and exit status are atomic files."""
+    worker = (
+        f"{_REMOTE_PYTHON} "
+        f'"$HOME"/{remote_run}/simulate_nki_worker.py '
+        f'--worker "$HOME"/{remote_run}/request.pkl '
+        f'"$HOME"/{remote_run}/result.json'
+    )
+    script = f'{worker}; status=$?; printf "%s\\n" "$status" > "$HOME"/{remote_run}/worker.exit'
+    command = f"setsid -f sh -c {shlex.quote(script)} " f'>"$HOME"/{remote_run}/worker.log 2>&1 < /dev/null'
+    _run_transport_command(
+        "Starting remote simulation worker", ["ssh", *_SSH_WORKER_OPTIONS, host, command], deadline, log
+    )
+
+
+def _wait_for_remote_result(host: str, remote_run: str, deadline: float, log: list[str]) -> None:
+    """Poll atomic worker files without depending on SSH session teardown."""
+    result = f'"$HOME"/{remote_run}/result.json'
+    exit_status = f'"$HOME"/{remote_run}/worker.exit'
+    probe = (
+        f"if test -f {result}; then printf ready; "
+        f"elif test -f {exit_status}; then printf failed:; cat {exit_status}; "
+        "else printf pending; fi"
+    )
+    log.append("==> Waiting for remote simulation result\n")
+    while True:
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            raise RuntimeError("Simulating kernel batch exceeded the batch simulation timeout")
+        try:
+            completed = subprocess.run(
+                ["ssh", "-n", *_SSH_OPTIONS, host, probe],
+                text=True,
+                capture_output=True,
+                timeout=min(30.0, remaining_s),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            _record_timeout_output(error, log)
+            raise RuntimeError("Checking remote simulation result timed out") from error
+        if completed.returncode != 0:
+            log.extend((completed.stdout, completed.stderr))
+            raise RuntimeError(f"Checking remote simulation result failed with exit {completed.returncode}")
+        state = completed.stdout.strip()
+        if state == "ready":
+            return
+        if state.startswith("failed:"):
+            _run_transport_command(
+                "Reading remote simulation failure",
+                ["ssh", "-n", *_SSH_OPTIONS, host, f'cat "$HOME"/{remote_run}/worker.log'],
+                deadline,
+                log,
+            )
+            raise RuntimeError(f"remote simulation worker exited with status {state.removeprefix('failed:')}")
+        if state != "pending":
+            raise RuntimeError(f"remote simulation worker returned malformed state {state!r}")
+        time.sleep(min(_REMOTE_RESULT_POLL_SECONDS, remaining_s))
 
 
 def _run_transport_command(stage: str, command: list[str], deadline: float, log: list[str]) -> None:

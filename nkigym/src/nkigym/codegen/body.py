@@ -20,7 +20,7 @@ from typing import Any
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Add, Const, Expr, Mod, Mul, Var, _format_raw, format_expr, substitute, to_affine
-from nkigym.ir.tree import PARTITION_DIM, AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
+from nkigym.ir.tree import AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 
 _INDENT = "    "
 
@@ -479,6 +479,8 @@ def _emit_isa_call(node: ISANode, ir: KernelIR, rotations: dict[str, Expr], subs
     ``None`` for every single-version tensor, so the slice renders unchanged.
     """
     op_cls = node.op_cls
+    if op_cls.INDIRECT_DMA_MODE is not None:
+        return _emit_indirect_dma(node, ir, rotations, substitutions)
     parts: list[str] = []
     for slot in op_cls.OPERAND_AXES:
         if slot in node.operand_bindings:
@@ -510,6 +512,51 @@ def _emit_isa_call(node: ISANode, ir: KernelIR, rotations: dict[str, Expr], subs
     for k, v in node.kwargs.items():
         parts.append(f"{k}={_render_kwarg(k, v)}")
     return f"nisa.{op_cls.NAME}({', '.join(parts)})"
+
+
+def _emit_indirect_dma(node: ISANode, ir: KernelIR, rotations: dict[str, Expr], substitutions: dict[str, Expr]) -> str:
+    """Render one row gather or scatter with an SBUF vector offset."""
+    regions = {slot: _substituted_region(region, substitutions) for slot, region in node.operand_bindings.items()}
+    source = regions["src"]
+    indices = regions["indices"]
+    destination = regions["dst"]
+    data_region = destination if node.op_cls.INDIRECT_DMA_MODE == "gather" else source
+    hbm_region = source if node.op_cls.INDIRECT_DMA_MODE == "gather" else destination
+    partition = _constant_width(data_region, 0)
+    free = _constant_width(data_region, 1)
+    free_lower = format_expr(hbm_region.ranges[1][0])
+    hbm_buffer = ir.buffer(hbm_region.tensor)
+    index_text = render_buffer_region(indices, ir.buffer(indices.tensor), rotations.get(indices.tensor))
+    data_text = render_buffer_region(data_region, ir.buffer(data_region.tensor), rotations.get(data_region.tensor))
+    indirect = (
+        f"{hbm_region.tensor}.ap(pattern=[[{hbm_buffer.shape[1]}, {partition}], [1, {free}]], "
+        f"offset={free_lower}, vector_offset={index_text}, indirect_dim=0)"
+    )
+    if node.op_cls.INDIRECT_DMA_MODE == "gather":
+        operands = f"src={indirect}, dst={data_text}"
+    else:
+        operands = f"src={data_text}, dst={indirect}"
+    return f"nisa.dma_copy({operands}, oob_mode=oob_mode.skip, dge_mode=nisa.dge_mode.swdge)"
+
+
+def _substituted_region(region: BufferRegion, substitutions: dict[str, Expr]) -> BufferRegion:
+    """Apply loop substitutions to one operand region."""
+    if not substitutions:
+        return region
+    return BufferRegion(
+        tensor=region.tensor,
+        ranges=tuple(
+            (substitute(lower, substitutions), substitute(width, substitutions)) for lower, width in region.ranges
+        ),
+    )
+
+
+def _constant_width(region: BufferRegion, axis: int) -> int:
+    """Return one statically known region width."""
+    width = region.ranges[axis][1]
+    if not isinstance(width, Const):
+        raise AssertionError(f"{region.tensor}: indirect DMA requires a constant tile width")
+    return width.value
 
 
 _NL_OP_KWARGS = frozenset({"op", "op0", "op1", "reduce_op"})
@@ -608,21 +655,22 @@ def render_buffer_region(region: BufferRegion, buf: Buffer, rotation: Expr | Non
     parts: list[str] = []
     for axis_index, (lo, hi) in enumerate(region.ranges):
         if axis_index == 0 and buf.location != "shared_hbm":
-            if not isinstance(hi, Const) or hi.value != PARTITION_DIM:
+            partition_extent = buf.partition_extent()
+            if not isinstance(hi, Const) or hi.value != partition_extent:
                 raise AssertionError(f"{buf.name}: SBUF/PSUM partition axis must use a partition-sized tile; got {hi}")
             a = buf.tiles_per_list()
             if buf.list_len == 1:
                 list_subscript = "[0]"
-                parts.append(f"0:{PARTITION_DIM}")
+                parts.append(f"0:{partition_extent}")
                 parts.append(_format_tile_index(lo, rotation))
             elif a == 1:
                 list_subscript = f"[{_format_tile_index(lo, None)}]"
-                parts.append(f"0:{PARTITION_DIM}")
+                parts.append(f"0:{partition_extent}")
                 parts.append(_format_local_tile_index("0", rotation))
             else:
                 tile = f"({_format_raw(lo)})"
                 list_subscript = f"[{tile} // {a}]"
-                parts.append(f"0:{PARTITION_DIM}")
+                parts.append(f"0:{partition_extent}")
                 parts.append(_format_local_tile_index(f"{tile} % {a}", rotation))
         else:
             lo_str = format_expr(lo)

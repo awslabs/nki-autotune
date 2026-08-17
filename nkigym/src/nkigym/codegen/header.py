@@ -4,7 +4,7 @@
 body — imports, the ``@nki.jit`` decorator, the ``def`` line, and one
 ``assert <param>.shape == (...)`` line per kernel parameter.
 
-:func:`emit_return` produces the trailing ``return <return_name>``
+:func:`emit_return` produces the trailing ``return <return_names>``
 line. The HBM allocation for the return tensor is emitted by
 :func:`nkigym.codegen.body.emit_body` — every tensor (HBM, SBUF,
 PSUM), including the return tensor, is declared from a
@@ -44,7 +44,7 @@ def emit_header(ir: KernelIR) -> str:
 
 
 def emit_return(ir: KernelIR) -> str:
-    """Render the trailing ``return <return_name>`` statement.
+    """Render the trailing return statement.
 
     The return tensor's HBM allocation is now emitted by
     :func:`nkigym.codegen.body.emit_body` (it walks the schedule tree's
@@ -54,12 +54,12 @@ def emit_return(ir: KernelIR) -> str:
 
     Args:
         ir: Fully-built :class:`KernelIR` envelope. The renderer reads
-            ``return_name`` only.
+            ``return_names`` only.
 
     Returns:
         Single source line ending with a trailing newline.
     """
-    return f"    return {ir.return_name}\n"
+    return f"    return {', '.join(ir.return_names)}\n"
 
 
 def _emit_imports(lines: list[str]) -> None:
@@ -67,6 +67,7 @@ def _emit_imports(lines: list[str]) -> None:
     lines.append("import nki")
     lines.append("import nki.isa as nisa")
     lines.append("import nki.language as nl")
+    lines.append("from nki.isa.constants import oob_mode")
 
 
 def _emit_signature(lines: list[str], ir: KernelIR) -> None:

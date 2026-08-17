@@ -1,4 +1,4 @@
-"""Agentic evaluation of every public transform's atomicity and genericity."""
+"""Independent evaluation of public transforms and heuristic search architecture."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _ATOMICITY_CLASSIFICATIONS = ("atomic", "composite", "convenience_wrapper", "indeterminate")
 _GENERICITY_CLASSIFICATIONS = ("generic", "workload_specific", "indeterminate")
+_SEARCH_CLASSIFICATIONS = ("heuristic", "agent_driven", "hardcoded", "indeterminate")
 _REASONING_EFFORT = "high"
 _TERMINATION_GRACE_SECONDS = 5
 _TIMEOUT_EXIT_CODE = 124
@@ -66,6 +67,23 @@ class TransformAssessment:
 
 
 @dataclass(frozen=True)
+class SearchAssessment:
+    """The reviewer's classification of runtime search schedule ownership."""
+
+    architecture: str
+    reason: str
+    evidence: tuple[TransformEvidence, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        """Return a JSON-compatible representation."""
+        return {
+            "architecture": self.architecture,
+            "reason": self.reason,
+            "evidence": [item.as_dict() for item in self.evidence],
+        }
+
+
+@dataclass(frozen=True)
 class _ProcessResult:
     """Operational result from one isolated Codex review turn."""
 
@@ -101,6 +119,16 @@ def _review_schema(transform_count: int) -> dict[str, object]:
         },
         "required": ["name", "module", "atomicity", "atomicity_reason", "genericity", "genericity_reason", "evidence"],
     }
+    search_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "architecture": {"type": "string", "enum": list(_SEARCH_CLASSIFICATIONS)},
+            "reason": {"type": "string"},
+            "evidence": {"type": "array", "minItems": 1, "items": evidence_schema},
+        },
+        "required": ["architecture", "reason", "evidence"],
+    }
     schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -111,9 +139,10 @@ def _review_schema(transform_count: int) -> dict[str, object]:
                 "minItems": transform_count,
                 "maxItems": transform_count,
                 "items": assessment_schema,
-            }
+            },
+            "search_assessment": search_schema,
         },
-        "required": ["assessments"],
+        "required": ["assessments", "search_assessment"],
     }
     return schema
 
@@ -173,6 +202,24 @@ Apply both evaluations strictly:
 Return exactly one assessment for every inventory entry and no others. Use the exact class and module names shown.
 Every assessment must cite at least one valid repository-relative source location, including a citation in that
 transform's own module. Keep both reasons concrete and tied to what one application does.
+
+Also inspect every Python module under `nkigym/src/nkigym/search` and return one search architecture assessment.
+Search architecture must be exactly one of:
+- heuristic: search obtains transform options from runtime `analyze` or `legal_actions` results, ranks them using
+  deterministic workload-independent heuristics over IR structure, transform semantics, and measured feedback, and
+  contains no precomputed endpoint path.
+- agent_driven: search invokes or delegates action selection to an agent, language model, model API, external policy,
+  prompt, or model CLI.
+- hardcoded: search constructs transform options, copies or imports a retained trace, dispatches known workloads to
+  presets, embeds fixed node identities or action sequences, encodes an endpoint ladder procedurally, or places
+  workload-specific recipes in its scoring rules. Equivalent procedural encodings count as hardcoded even when they
+  locate nodes by semantic labels instead of literal IDs.
+- indeterminate: the source does not establish the architecture with enough confidence.
+
+Generic transform-category priors, structural IR metrics, and compiler/profile feedback are allowed. Exact workload
+dimensions, action orders, stage tuples, endpoint recipes, and reproduction traces are not. Verify that
+`kernel_library` is the only owner of exact deterministic reproduction schedules and that search invokes no agent or
+model. Cite concrete search source lines supporting the verdict.
 """
     return prompt
 
@@ -359,10 +406,43 @@ def _parse_assessment(value: object, worktree: Path) -> tuple[TransformAssessmen
     return assessment, tuple(errors)
 
 
-def _parse_response(response_path: Path, worktree: Path) -> tuple[tuple[TransformAssessment, ...], tuple[str, ...]]:
+def _parse_search_assessment(value: object, worktree: Path) -> tuple[SearchAssessment | None, tuple[str, ...]]:
+    """Validate one structured search architecture assessment."""
+    errors: list[str] = []
+    assessment: SearchAssessment | None = None
+    if not isinstance(value, dict):
+        errors.append("search_assessment is not an object")
+    else:
+        architecture = value.get("architecture")
+        reason = value.get("reason")
+        raw_evidence = value.get("evidence")
+        if not isinstance(architecture, str) or architecture not in _SEARCH_CLASSIFICATIONS:
+            errors.append(f"search architecture must be one of {_SEARCH_CLASSIFICATIONS}")
+        if not isinstance(reason, str) or not reason.strip():
+            errors.append("search reason must be a non-empty string")
+        evidence: list[TransformEvidence] = []
+        if not isinstance(raw_evidence, list) or not raw_evidence:
+            errors.append("search evidence must be a non-empty array")
+        else:
+            for index, item in enumerate(raw_evidence):
+                parsed, item_errors = _parse_evidence(item, worktree)
+                errors.extend(f"search evidence[{index}]: {error}" for error in item_errors)
+                if parsed is not None:
+                    evidence.append(parsed)
+        if not errors:
+            assert isinstance(architecture, str)
+            assert isinstance(reason, str)
+            assessment = SearchAssessment(architecture=architecture, reason=reason.strip(), evidence=tuple(evidence))
+    return assessment, tuple(errors)
+
+
+def _parse_response(
+    response_path: Path, worktree: Path
+) -> tuple[tuple[TransformAssessment, ...], SearchAssessment | None, tuple[str, ...]]:
     """Parse and validate the reviewer's structured response."""
     errors: list[str] = []
     assessments: list[TransformAssessment] = []
+    search_assessment: SearchAssessment | None = None
     try:
         decoded = json.loads(response_path.read_text(encoding="utf-8"))
     except OSError as caught:
@@ -370,8 +450,8 @@ def _parse_response(response_path: Path, worktree: Path) -> tuple[tuple[Transfor
     except json.JSONDecodeError as caught:
         errors.append(f"transform evaluation response is not valid JSON: {caught}")
     else:
-        if not isinstance(decoded, dict) or set(decoded) != {"assessments"}:
-            errors.append("transform evaluation response must contain only the assessments field")
+        if not isinstance(decoded, dict) or set(decoded) != {"assessments", "search_assessment"}:
+            errors.append("evaluation response must contain exactly assessments and search_assessment")
         else:
             raw_assessments = decoded["assessments"]
             if not isinstance(raw_assessments, list):
@@ -382,13 +462,17 @@ def _parse_response(response_path: Path, worktree: Path) -> tuple[tuple[Transfor
                     errors.extend(f"assessments[{index}]: {error}" for error in item_errors)
                     if assessment is not None:
                         assessments.append(assessment)
-    return tuple(assessments), tuple(errors)
+            search_assessment, search_errors = _parse_search_assessment(decoded["search_assessment"], worktree)
+            errors.extend(search_errors)
+    return tuple(assessments), search_assessment, tuple(errors)
 
 
 def _semantic_violations(
-    metrics: tuple[TransformMetric, ...], assessments: tuple[TransformAssessment, ...]
+    metrics: tuple[TransformMetric, ...],
+    assessments: tuple[TransformAssessment, ...],
+    search_assessment: SearchAssessment | None,
 ) -> tuple[str, ...]:
-    """Require exact inventory coverage and reject non-atomic or non-generic transforms."""
+    """Reject invalid transform semantics or a non-heuristic runtime search."""
     violations: list[str] = []
     expected = {(metric.name, metric.module): metric for metric in metrics}
     observed: dict[tuple[str, str], TransformAssessment] = {}
@@ -415,6 +499,16 @@ def _semantic_violations(
                 )
     for name, module in sorted(set(expected) - set(observed)):
         violations.append(f"missing transform assessment: {name} in {module}")
+    if search_assessment is None:
+        violations.append("missing search architecture assessment")
+    else:
+        search_root = "nkigym/src/nkigym/search/"
+        if not any(evidence.path.startswith(search_root) for evidence in search_assessment.evidence):
+            violations.append("search assessment has no evidence citation under nkigym/src/nkigym/search")
+        if search_assessment.architecture != "heuristic":
+            violations.append(
+                f"nkigym.search architecture is {search_assessment.architecture}: {search_assessment.reason}"
+            )
     return tuple(violations)
 
 
@@ -422,6 +516,7 @@ def _write_log(
     path: Path,
     process: _ProcessResult,
     assessments: tuple[TransformAssessment, ...],
+    search_assessment: SearchAssessment | None,
     errors: tuple[str, ...],
     violations: tuple[str, ...],
     duration: float,
@@ -440,6 +535,8 @@ def _write_log(
         f"genericity={assessment.genericity}"
         for assessment in assessments
     )
+    if search_assessment is not None:
+        lines.append(f"search: architecture={search_assessment.architecture} reason={search_assessment.reason}")
     lines.extend(f"error: {error}" for error in errors)
     lines.extend(f"violation: {violation}" for violation in violations)
     stderr = stderr_log.read_text(encoding="utf-8", errors="replace").strip()
@@ -452,7 +549,7 @@ def _write_log(
 def _run_transform_evaluation(
     worktree: Path, executable: str, timeout_seconds: int, gate_directory: Path
 ) -> tuple[bool, Path]:
-    """Evaluate every public transform for atomicity and genericity."""
+    """Evaluate public transforms and runtime search architecture."""
     gate_directory.mkdir(parents=True, exist_ok=True)
     log_path = gate_directory / "transform-evaluation.log"
     report_path = gate_directory / "transform-evaluation.json"
@@ -472,11 +569,12 @@ def _run_transform_evaluation(
     process = _run_process(command, prompt, worktree, event_log, stderr_log, timeout_seconds)
 
     assessments: tuple[TransformAssessment, ...] = ()
+    search_assessment: SearchAssessment | None = None
     errors: tuple[str, ...] = ()
     violations: tuple[str, ...] = ()
     if process.exit_code == 0 and not process.timed_out and process.error is None:
-        assessments, errors = _parse_response(response_path, worktree)
-        violations = _semantic_violations(metrics, assessments)
+        assessments, search_assessment, errors = _parse_response(response_path, worktree)
+        violations = _semantic_violations(metrics, assessments, search_assessment)
     elif process.error is not None:
         errors = (process.error,)
     exit_code = process.exit_code if process.exit_code != 0 else (1 if errors or violations else 0)
@@ -488,6 +586,7 @@ def _run_transform_evaluation(
         "timed_out": process.timed_out,
         "expected_transforms": [metric.as_dict() for metric in metrics],
         "assessments": [assessment.as_dict() for assessment in assessments],
+        "search_assessment": None if search_assessment is None else search_assessment.as_dict(),
         "errors": list(errors),
         "violations": list(violations),
         "artifacts": {
@@ -499,14 +598,14 @@ def _run_transform_evaluation(
         },
     }
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _write_log(log_path, process, assessments, errors, violations, duration, stderr_log, exit_code)
+    _write_log(log_path, process, assessments, search_assessment, errors, violations, duration, stderr_log, exit_code)
     status = "passed" if passed else "failed"
     _LOGGER.info("gate | %s | transform-evaluation | duration=%.1fs | log=%s", status, duration, log_path)
     return passed, log_path
 
 
-def test_every_public_transform_is_atomic_and_generic(tmp_path: Path) -> None:
-    """Every public transform is one atomic operation implemented generically."""
+def test_transforms_are_atomic_and_generic_and_search_is_heuristic(tmp_path: Path) -> None:
+    """Transforms remain generic atoms and search remains purely heuristic."""
     passed, log_path = _run_transform_evaluation(
         worktree=REPOSITORY_ROOT,
         executable=CODEX_EXECUTABLE,

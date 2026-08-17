@@ -67,7 +67,7 @@ class _AnalysisResult:
     Attributes:
         func_name: Source ``f_nkigym`` name.
         param_names: Signature order.
-        return_name: Identifier in the kernel's ``return`` statement.
+        return_names: Identifiers in the kernel's ``return`` statement.
         dim_sizes: ``dim_name → extent``.
         tensors: All named tensors, keyed by name.
         ops: Compute ops in source order.
@@ -75,7 +75,7 @@ class _AnalysisResult:
 
     func_name: str
     param_names: list[str]
-    return_name: str
+    return_names: tuple[str, ...]
     dim_sizes: dict[str, int]
     tensors: dict[str, TensorDims]
     ops: list[_OpRecord]
@@ -126,7 +126,7 @@ def analyze_dimensions(
     return _AnalysisResult(
         func_name=unwrapped.__name__,
         param_names=param_names,
-        return_name=_parse_return_name(unwrapped),
+        return_names=_parse_return_names(unwrapped),
         dim_sizes=state.dim_sizes,
         tensors=tensors,
         ops=state.op_records,
@@ -353,11 +353,11 @@ def _is_op_call(node: ast.expr) -> bool:
     )
 
 
-def _parse_return_name(func: Callable[..., Any]) -> str:
-    """Return the identifier named in the kernel's single top-level ``return`` statement.
+def _parse_return_names(func: Callable[..., Any]) -> tuple[str, ...]:
+    """Return identifiers named in the kernel's single top-level ``return`` statement.
 
     Raises ``ValueError`` if the function has no ``return`` statement, has
-    more than one, or returns an expression that is not a single ``Name``.
+    more than one, or returns something other than names or a tuple of names.
     """
     source = textwrap.dedent(inspect.getsource(func))
     tree = ast.parse(source)
@@ -370,6 +370,10 @@ def _parse_return_name(func: Callable[..., Any]) -> str:
     if len(returns) > 1:
         raise ValueError(f"{func.__name__}: expected a single top-level return, found {len(returns)}")
     value = returns[0].value
-    if not isinstance(value, ast.Name):
-        raise ValueError(f"{func.__name__}: return value must be a bare Name, got {type(value).__name__}")
-    return value.id
+    if isinstance(value, ast.Name):
+        names = (value.id,)
+    elif isinstance(value, ast.Tuple) and value.elts and all(isinstance(item, ast.Name) for item in value.elts):
+        names = tuple(item.id for item in value.elts if isinstance(item, ast.Name))
+    else:
+        raise ValueError(f"{func.__name__}: return value must be a Name or tuple of Names")
+    return names

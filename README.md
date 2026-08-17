@@ -96,36 +96,10 @@ reductions. Unsupported operations raise `ValueError`.
 
 ## Kernel Library
 
-Each flat kernel-library module owns one exact `(workload, shape)` tuple,
-including its NumPy reference, input specifications, seeded random input
-generator, validation tolerances, `f_nkigym` graph, and transform ladder. The
-module dumps, CPU-verifies, and profiles every intermediate kernel:
-
-```bash
-PYTHONPATH=.:nkigym/src \
-  python kernel_library/matmul_lhs_t_rhs_m2048_k2048_n2048.py \
-  --host gym-1 \
-  --cache /tmp/matmul-lhsT-rhs
-
-PYTHONPATH=.:nkigym/src \
-  python kernel_library/matmul_lhs_rhs_m2048_k2048_n2048.py \
-  --host gym-1 \
-  --cache /tmp/matmul-lhs-rhs
-
-PYTHONPATH=.:nkigym/src \
-  python kernel_library/rmsnorm_matmul_m2048_k2048_n2048.py \
-  --host gym-1 \
-  --cache /tmp/rmsnorm-matmul
-
-PYTHONPATH=.:nkigym/src \
-  python kernel_library/attention_q16384_kv16384_d128.py \
-  --host gym-1 \
-  --cache /tmp/online-fusion-attention
-```
-
-Kernels and accuracy results are stored under `kernels/`; remote MFU results
-are stored under `mfu/`. All four drivers submit their ladder once; the
-profiling backend manages compiler processes and NeuronCore assignment.
+Each module exposes one dictionary containing the NumPy reference, fixed input
+specifications, seeded input generator, correctness tolerances, historical MFU,
+and retained transform trace. `kernel_library.WORKLOADS` discovers modules
+automatically. Tests synthesize kernels directly from these dictionaries.
 
 ## Security
 

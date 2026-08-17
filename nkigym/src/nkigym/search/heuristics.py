@@ -47,6 +47,7 @@ from nkigym.transforms import (
     Transform,
     TransformOption,
     TransposeThroughLoad,
+    TransposeThroughLoadOption,
     TransposeThroughTensorCopy,
 )
 
@@ -451,7 +452,14 @@ def _plan_matmul(ir: KernelIR) -> SchedulePlan:
     builder = _PlanBuilder(ir)
     if TransposeThroughTensorCopy().analyze(builder.state):
         builder.apply_first(TransposeThroughTensorCopy(), "commute the input transpose through its copy")
-        builder.apply_first(TransposeThroughLoad(), "fold the input transpose into the load")
+        transpose_through_load = TransposeThroughLoad()
+        transpose_options = transpose_through_load.analyze(builder.state)
+        first_tile = max(option.first_tile for option in transpose_options)
+        builder.apply(
+            transpose_through_load,
+            lambda option: isinstance(option, TransposeThroughLoadOption) and option.first_tile == first_tile,
+            "fold the input transpose into the load",
+        )
 
     matmul_block, operands = _matmul_blocks(builder.state)
     matmul_node = builder.state.tree.block(matmul_block)
@@ -767,6 +775,8 @@ def _rms_buffer_order(
     ir: KernelIR, moving: str, stationary: str, partial: str
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Derive placement and compaction order from the online RMSNorm body."""
+    if len(ir.return_names) != 1:
+        raise RuntimeError("RMS heuristic requires a single-output kernel")
     transpose_block = _unique_block(ir, "dma_transpose", {"dst": stationary})
     source = _operands(ir, transpose_block)["src"]
     reduction_block = _unique_block(ir, "activation_reduce", {"data": source})
@@ -786,7 +796,7 @@ def _rms_buffer_order(
     store_blocks = [
         block_nid
         for block_nid in _matching_blocks(ir, "dma_copy", {})
-        if _operands(ir, block_nid).get("dst") == ir.return_name
+        if _operands(ir, block_nid).get("dst") == ir.return_names[0]
     ]
     if len(store_blocks) != 1:
         raise RuntimeError(f"expected one final RMS store, found {store_blocks}")

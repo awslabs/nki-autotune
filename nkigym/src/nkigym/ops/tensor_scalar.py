@@ -66,7 +66,11 @@ class NKITensorScalar(NKIOp):
         """CPU simulation: broadcast ``operand0`` across F, apply ``op``, return the result."""
         data = kwargs["data"]
         operand0 = kwargs["operand0"]
-        broadcast = operand0[..., np.newaxis] if isinstance(operand0, np.ndarray) else operand0
+        broadcast = (
+            operand0[..., np.newaxis]
+            if isinstance(operand0, np.ndarray) and operand0.ndim + 1 == data.ndim
+            else operand0
+        )
         operands = (broadcast, data) if kwargs.get("reverse0", False) else (data, broadcast)
         return _OPS[kwargs["op0"]](*operands)
 

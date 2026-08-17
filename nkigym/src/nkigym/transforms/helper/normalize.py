@@ -255,11 +255,12 @@ def _recompute_region(
         loops = _fit_loops(loops, _axis_capacity(buf, axis_index, location, width.value))
         affine = _tile_space_affine(loops)
         is_partition = axis_index == 0 and location in ("sbuf", "psum")
-        if is_partition and width.value % PARTITION_DIM != 0:
+        partition_extent = buf.partition_extent() if is_partition and buf is not None else PARTITION_DIM
+        if is_partition and width.value % partition_extent != 0:
             raise ValueError(
-                f"{region.tensor}: partition-axis width {width.value} must be a multiple of {PARTITION_DIM}"
+                f"{region.tensor}: partition-axis width {width.value} must be a multiple of {partition_extent}"
             )
-        partition_tiles = width.value // PARTITION_DIM
+        partition_tiles = width.value // partition_extent
         if _is_zero(affine):
             lo = affine
         elif is_partition and partition_tiles == 1:

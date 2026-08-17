@@ -260,6 +260,7 @@ class NKIOp:
     """
 
     NAME: ClassVar[str] = ""
+    INDIRECT_DMA_MODE: ClassVar[str | None] = None
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
     AXIS_ROLES: ClassVar[dict[str, "AxisRole"]] = {}
 
@@ -459,11 +460,14 @@ def nkigym_kernel(func: Callable[..., Any]) -> Callable[..., Any]:
         tagged_args = tuple(_tag_as_param(a) for a in args)
         tagged_kwargs = {k: _tag_as_param(v) for k, v in kwargs.items()}
         result = func(*tagged_args, **tagged_kwargs)
-        role = _operand_role(result)
-        if role not in _VALID_RETURN_ROLES:
+        outputs = result if isinstance(result, tuple) else (result,)
+        if not outputs:
+            raise TypeError(f"{func.__name__} returned an empty tuple")
+        invalid_roles = tuple(_operand_role(output) for output in outputs)
+        if any(role not in _VALID_RETURN_ROLES for role in invalid_roles):
             raise TypeError(
-                f"{func.__name__} returned role={role!r}; expected one of {sorted(_VALID_RETURN_ROLES)} "
-                f"(the HBM buffer an NKIStore wrote into, or the stored-role return of NKIStore itself)"
+                f"{func.__name__} returned roles={invalid_roles!r}; expected each role in "
+                f"{sorted(_VALID_RETURN_ROLES)}"
             )
         return result
 
