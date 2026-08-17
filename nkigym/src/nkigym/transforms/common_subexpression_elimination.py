@@ -120,7 +120,7 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
             or canonical_buffer.versions != redundant_buffer.versions
             or canonical_buffer.list_len != redundant_buffer.list_len
             or redundant_output.tensor in ir.param_buffers
-            or redundant_output.tensor == ir.return_name
+            or redundant_output.tensor in ir.return_names
             or redundant_buffer.location == "shared_hbm"
         ):
             return result

@@ -1,4 +1,4 @@
-"""Combinatorial random-rollout correctness coverage."""
+"""Random-rollout correctness coverage for every discovered workload."""
 
 from __future__ import annotations
 
@@ -10,205 +10,36 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import cast
 
-import numpy as np
 from config import SIMULATION_HOSTS
 
-from kernel_library import Workload
-from kernel_library.attention_q16384_kv16384_d128 import HEAD_DIM
-from kernel_library.attention_q16384_kv16384_d128 import WORKLOAD as ATTENTION_WORKLOAD
-from kernel_library.attention_q16384_kv16384_d128 import make_input_specs as make_attention_input_specs
-from kernel_library.matmul_lhs_rhs_m2048_k2048_n2048 import WORKLOAD as MATMUL_LHS_WORKLOAD
-from kernel_library.matmul_lhs_t_rhs_m2048_k2048_n2048 import WORKLOAD as MATMUL_LHS_T_WORKLOAD
-from kernel_library.rmsnorm_matmul_m2048_k2048_n2048 import WORKLOAD as RMSNORM_MATMUL_WORKLOAD
-from kernel_library.rmsnorm_matmul_m2048_k2048_n2048 import make_f_nkigym as make_rmsnorm_matmul_f_nkigym
+from kernel_library import WORKLOADS
 from nkigym.codegen import render
 from nkigym.environment import KernelMDP
 from nkigym.ir import KernelIR
-from nkigym.ops.matmul import NKIMatmul
 from nkigym.profile import FP32SimulationCase, batch_simulate_fp32
+from nkigym.synthesis import SynthesizedKernel, synthesize_numpy_to_nkigym
 from nkigym.transforms import TransformOption, public_transforms
 
 ROLLOUT_STEPS = 500
-SHAPES_PER_WORKLOAD = 5
+TRANSFORMS_PER_SIMULATION = 10
 ANALYZER_WORKERS = 4
 SIMULATION_WORKERS_PER_HOST = 32
 BATCH_SIMULATION_TIMEOUT_SECONDS = 7200
-TILE_SIZE = NKIMatmul.MIN_TILE_SIZE["K"]
-MAX_EXTENT_TILES = 8
-MAX_MATMUL_TILE_VOLUME = 60
-MAX_ATTENTION_TILE_AREA = 20
 TRANSFORMS = public_transforms()
 AnalysisResult = tuple[int, tuple[TransformOption, ...], float]
 
 
 @dataclass(frozen=True)
-class RolloutWorkload:
-    """Randomized shape metadata paired with one library workload."""
-
-    family: str
-    dimensions: tuple[int, ...]
-    name: str
-    definition: Workload
-
-
-@dataclass(frozen=True)
 class RolloutTask:
-    """Serializable description of one independently generated rollout."""
+    """Pair one discovered workload with its rollout seed."""
 
-    family: str
-    dimensions: tuple[int, ...]
+    name: str
     seed: int
-
-
-def _lhs_t_workload(k: int, m: int, n: int) -> RolloutWorkload:
-    """Build one pretransposed matmul workload."""
-    definition = Workload(
-        input_specs={"lhs_T": ((k, m), "bfloat16"), "rhs": ((k, n), "bfloat16")},
-        f_numpy=MATMUL_LHS_T_WORKLOAD.f_numpy,
-        f_nkigym=MATMUL_LHS_T_WORKLOAD.f_nkigym,
-        input_generator=MATMUL_LHS_T_WORKLOAD.input_generator,
-        atol=MATMUL_LHS_T_WORKLOAD.atol,
-        rtol=MATMUL_LHS_T_WORKLOAD.rtol,
-    )
-    return RolloutWorkload(
-        family="matmul_lhs_t",
-        dimensions=(k, m, n),
-        name=f"random_matmul_lhsT_rhs_k{k}_m{m}_n{n}",
-        definition=definition,
-    )
-
-
-def _lhs_workload(k: int, m: int, n: int) -> RolloutWorkload:
-    """Build one row-major matmul workload."""
-    definition = Workload(
-        input_specs={"lhs": ((m, k), "bfloat16"), "rhs": ((k, n), "bfloat16")},
-        f_numpy=MATMUL_LHS_WORKLOAD.f_numpy,
-        f_nkigym=MATMUL_LHS_WORKLOAD.f_nkigym,
-        input_generator=MATMUL_LHS_WORKLOAD.input_generator,
-        atol=MATMUL_LHS_WORKLOAD.atol,
-        rtol=MATMUL_LHS_WORKLOAD.rtol,
-    )
-    return RolloutWorkload(
-        family="matmul_lhs", dimensions=(k, m, n), name=f"random_matmul_lhs_rhs_k{k}_m{m}_n{n}", definition=definition
-    )
-
-
-def _attention_workload(query_length: int, sequence_length: int) -> RolloutWorkload:
-    """Build one attention workload."""
-    definition = Workload(
-        input_specs=make_attention_input_specs(query_length, sequence_length, HEAD_DIM),
-        f_numpy=ATTENTION_WORKLOAD.f_numpy,
-        f_nkigym=ATTENTION_WORKLOAD.f_nkigym,
-        input_generator=ATTENTION_WORKLOAD.input_generator,
-        atol=ATTENTION_WORKLOAD.atol,
-        rtol=ATTENTION_WORKLOAD.rtol,
-    )
-    return RolloutWorkload(
-        family="attention",
-        dimensions=(query_length, sequence_length),
-        name=f"random_attention_q{query_length}_s{sequence_length}",
-        definition=definition,
-    )
-
-
-def _rmsnorm_matmul_workload(k: int, m: int, n: int) -> RolloutWorkload:
-    """Build one RMSNorm+matmul workload."""
-    definition = Workload(
-        input_specs={"lhs": ((m, k), "bfloat16"), "rhs": ((k, n), "bfloat16")},
-        f_numpy=RMSNORM_MATMUL_WORKLOAD.f_numpy,
-        f_nkigym=make_rmsnorm_matmul_f_nkigym(k),
-        input_generator=RMSNORM_MATMUL_WORKLOAD.input_generator,
-        atol=RMSNORM_MATMUL_WORKLOAD.atol,
-        rtol=RMSNORM_MATMUL_WORKLOAD.rtol,
-    )
-    return RolloutWorkload(
-        family="rmsnorm_matmul",
-        dimensions=(k, m, n),
-        name=f"random_rmsnorm_matmul_k{k}_m{m}_n{n}",
-        definition=definition,
-    )
 
 
 def _run_seed() -> int:
     """Return a fresh run seed."""
-    seed = random.SystemRandom().randrange(1 << 63)
-    return seed
-
-
-def _matmul_n_tile_factors() -> tuple[int, ...]:
-    """Return N factors accepted by the canonical matmul tile contract."""
-    maximum = NKIMatmul.MAX_TILE_SIZE["N"]
-    if maximum is None:
-        factors = tuple(range(1, MAX_EXTENT_TILES + 1))
-    else:
-        factors = tuple(
-            factor
-            for factor in range(1, MAX_EXTENT_TILES + 1)
-            if (factor * TILE_SIZE) % min(factor * TILE_SIZE, maximum) == 0
-        )
-    return factors
-
-
-def _random_matmul_shapes(rng: random.Random, count: int) -> tuple[tuple[int, int, int], ...]:
-    """Sample unique aligned K, M, N shapes within the existing cost envelope."""
-    shapes: list[tuple[int, int, int]] = []
-    n_factors = _matmul_n_tile_factors()
-    while len(shapes) < count:
-        factors = (rng.randint(1, MAX_EXTENT_TILES), rng.randint(1, MAX_EXTENT_TILES), rng.choice(n_factors))
-        shape = (factors[0] * TILE_SIZE, factors[1] * TILE_SIZE, factors[2] * TILE_SIZE)
-        if factors[0] * factors[1] * factors[2] <= MAX_MATMUL_TILE_VOLUME and shape not in shapes:
-            shapes.append(shape)
-    return tuple(shapes)
-
-
-def _random_attention_shapes(rng: random.Random, count: int) -> tuple[tuple[int, int], ...]:
-    """Sample unique aligned query and sequence lengths within the cost envelope."""
-    shapes: list[tuple[int, int]] = []
-    sequence_factors = _matmul_n_tile_factors()
-    while len(shapes) < count:
-        factors = (rng.randint(1, MAX_EXTENT_TILES), rng.choice(sequence_factors))
-        shape = (factors[0] * TILE_SIZE, factors[1] * TILE_SIZE)
-        if factors[0] * factors[1] <= MAX_ATTENTION_TILE_AREA and shape not in shapes:
-            shapes.append(shape)
-    return tuple(shapes)
-
-
-def _random_workloads(rng: random.Random) -> tuple[RolloutWorkload, ...]:
-    """Build five randomized shapes for each of the four workload families."""
-    lhs_t_shapes = _random_matmul_shapes(rng, SHAPES_PER_WORKLOAD)
-    lhs_shapes = _random_matmul_shapes(rng, SHAPES_PER_WORKLOAD)
-    attention_shapes = _random_attention_shapes(rng, SHAPES_PER_WORKLOAD)
-    rmsnorm_shapes = _random_matmul_shapes(rng, SHAPES_PER_WORKLOAD)
-    workloads = (
-        *(_lhs_t_workload(k, m, n) for k, m, n in lhs_t_shapes),
-        *(_lhs_workload(k, m, n) for k, m, n in lhs_shapes),
-        *(_attention_workload(query_length, sequence_length) for query_length, sequence_length in attention_shapes),
-        *(_rmsnorm_matmul_workload(k, m, n) for k, m, n in rmsnorm_shapes),
-    )
-    return workloads
-
-
-def _simulation_hosts() -> list[str]:
-    """Return the configured CPU simulation host pool."""
-    return list(SIMULATION_HOSTS)
-
-
-def _rollout(workload: RolloutWorkload, seed: int) -> Iterator[tuple[str, KernelIR]]:
-    """Yield the initial state and every action selected by ``seed``."""
-    definition = workload.definition
-    environment = KernelMDP(definition.f_nkigym, definition.input_specs, transforms=TRANSFORMS)
-    rng = random.Random(seed)
-    prefix = f"{workload.name} seed {seed}"
-    state = environment.reset()
-    yield (f"{prefix} step 0", state)
-    for step in range(1, ROLLOUT_STEPS + 1):
-        actions = environment.legal_actions(state)
-        if not actions:
-            raise AssertionError(f"{prefix} terminated after {step - 1} steps")
-        action = rng.choice(actions)
-        state = environment.step(state, action)
-        label = f"{prefix} step {step}: {type(action[0]).__name__} {action[1]!r}"
-        yield (label, state)
+    return random.SystemRandom().randrange(1 << 63)
 
 
 def _analyze_transform_group(state: KernelIR, indices: tuple[int, ...]) -> tuple[AnalysisResult, ...]:
@@ -237,13 +68,12 @@ def _analysis_groups(weights: list[float], worker_count: int) -> tuple[tuple[int
 
 
 def _parallel_rollout(
-    workload: RolloutWorkload, seed: int, executor: ProcessPoolExecutor
+    name: str, kernel: SynthesizedKernel, seed: int, executor: ProcessPoolExecutor
 ) -> Iterator[tuple[str, KernelIR]]:
-    """Yield the exact seeded rollout while analyzing transforms in parallel."""
-    definition = workload.definition
-    environment = KernelMDP(definition.f_nkigym, definition.input_specs, transforms=TRANSFORMS)
+    """Yield one seeded rollout while analyzing registered transforms in parallel."""
+    environment = KernelMDP(kernel.function, kernel.input_specs, transforms=TRANSFORMS)
     rng = random.Random(seed)
-    prefix = f"{workload.name} seed {seed}"
+    prefix = f"{name} seed {seed}"
     state = environment.reset()
     weights = [1.0 for _transform in TRANSFORMS]
     yield (f"{prefix} step 0", state)
@@ -266,96 +96,72 @@ def _parallel_rollout(
         yield (label, state)
 
 
-def _simulation_cases(
-    workload: RolloutWorkload, seed: int, states: Iterator[tuple[str, KernelIR]]
-) -> list[FP32SimulationCase]:
-    """Render every rollout state into a remotely executable validation case."""
-    definition = workload.definition
-    inputs = definition.generate_inputs(seed)
-    expected = np.asarray(definition.f_numpy(**inputs))
-    generated_name = f"nki_{definition.f_nkigym.__name__}"
-    cases = [
-        FP32SimulationCase(
-            label=label, kernel=render(state), func_name=generated_name, inputs=inputs, expected=expected
-        )
-        for label, state in states
-    ]
-    return cases
-
-
-def _workload_for_task(task: RolloutTask) -> RolloutWorkload:
-    """Rebuild one workload from its process-safe descriptor."""
-    if task.family == "matmul_lhs_t":
-        k, m, n = task.dimensions
-        workload = _lhs_t_workload(k, m, n)
-    elif task.family == "matmul_lhs":
-        k, m, n = task.dimensions
-        workload = _lhs_workload(k, m, n)
-    elif task.family == "attention":
-        query_length, sequence_length = task.dimensions
-        workload = _attention_workload(query_length, sequence_length)
-    elif task.family == "rmsnorm_matmul":
-        k, m, n = task.dimensions
-        workload = _rmsnorm_matmul_workload(k, m, n)
-    else:
-        raise ValueError(f"unknown rollout workload family {task.family!r}")
-    return workload
-
-
 def _generate_rollout_cases(task: RolloutTask) -> list[FP32SimulationCase]:
-    """Generate and render every state for one process-isolated rollout."""
-    workload = _workload_for_task(task)
-    definition = workload.definition
-    inputs = definition.generate_inputs(task.seed)
-    expected = np.asarray(definition.f_numpy(**inputs))
-    generated_name = f"nki_{definition.f_nkigym.__name__}"
+    """Render every tenth state in one complete rollout."""
+    workload = WORKLOADS[task.name]
+    kernel = synthesize_numpy_to_nkigym(workload["numpy_ref"], workload["input_specs"])
+    reference_inputs = workload["input_generator"](workload["input_specs"], task.seed)
+    inputs = kernel.adapt_inputs({name: value.copy() for name, value in reference_inputs.items()})
+    expected = kernel.adapt_output(
+        workload["numpy_ref"](**{name: value.copy() for name, value in reference_inputs.items()})
+    )
+    generated_name = f"nki_{kernel.function.__name__}"
     worker_count = min(ANALYZER_WORKERS, len(TRANSFORMS))
     with ProcessPoolExecutor(max_workers=worker_count) as analyzer:
         analyzer.submit(_analyzer_ready).result()
-        with ThreadPoolExecutor(max_workers=1) as renderer:
-            pending = [
-                (label, renderer.submit(render, state))
-                for label, state in _parallel_rollout(workload, task.seed, analyzer)
-            ]
-            cases = [
-                FP32SimulationCase(
-                    label=label, kernel=source.result(), func_name=generated_name, inputs=inputs, expected=expected
-                )
-                for label, source in pending
-            ]
+        cases = [
+            FP32SimulationCase(
+                label=label, kernel=render(state), func_name=generated_name, inputs=inputs, expected=expected
+            )
+            for step, (label, state) in enumerate(_parallel_rollout(task.name, kernel, task.seed, analyzer))
+            if step > 0 and step % TRANSFORMS_PER_SIMULATION == 0
+        ]
     return cases
 
 
-def test_one_random_rollout_per_randomized_shape_preserves_every_generated_kernel() -> None:
-    """One 500-step rollout per newly sampled shape preserves every generated kernel."""
+def _simulate_cases(hosts: list[str], cases: list[FP32SimulationCase], atol: float, rtol: float) -> int:
+    """Shard one tolerance group across hosts and validate every case."""
+    shards = [cases[index :: len(hosts)] for index in range(len(hosts))]
+    assignments = [(host, shard) for host, shard in zip(hosts, shards, strict=True) if shard]
+    with ThreadPoolExecutor(max_workers=len(assignments)) as executor:
+        futures = [
+            executor.submit(
+                batch_simulate_fp32,
+                hosts=[host],
+                cases=shard,
+                atol=atol,
+                rtol=rtol,
+                timeout_s=BATCH_SIMULATION_TIMEOUT_SECONDS,
+                workers_per_host=SIMULATION_WORKERS_PER_HOST,
+            )
+            for host, shard in assignments
+        ]
+        completed = sum(future.result() for future in futures)
+    return completed
+
+
+def test_one_random_rollout_per_workload_preserves_every_tenth_kernel() -> None:
+    """Apply 500 random transforms and CPU-simulate every tenth state."""
     run_seed = _run_seed()
     rng = random.Random(run_seed)
     print(f"random_rollout_seed={run_seed}", flush=True)
-    workloads = _random_workloads(rng)
     tasks: list[RolloutTask] = []
-    for workload in workloads:
+    for name in WORKLOADS:
         seed = rng.randrange(1 << 63)
-        print(f"{workload.name} seed {seed}", flush=True)
-        tasks.append(RolloutTask(family=workload.family, dimensions=workload.dimensions, seed=seed))
+        print(f"{name} seed {seed}", flush=True)
+        tasks.append(RolloutTask(name=name, seed=seed))
     worker_count = min(len(tasks), os.cpu_count() or 1)
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
         case_groups = list(executor.map(_generate_rollout_cases, tasks, chunksize=1))
     cases_by_tolerance: dict[tuple[float, float], list[FP32SimulationCase]] = {}
-    for task, workload_cases in zip(tasks, case_groups, strict=True):
-        assert len(workload_cases) == ROLLOUT_STEPS + 1
-        definition = _workload_for_task(task).definition
-        cases_by_tolerance.setdefault((definition.atol, definition.rtol), []).extend(workload_cases)
-    hosts = _simulation_hosts()
+    for task, cases in zip(tasks, case_groups, strict=True):
+        assert len(cases) == ROLLOUT_STEPS // TRANSFORMS_PER_SIMULATION
+        workload = WORKLOADS[task.name]
+        cases_by_tolerance.setdefault((workload["atol"], workload["rtol"]), []).extend(cases)
+    hosts: list[str] = list(SIMULATION_HOSTS)
     print(f"simulation_hosts={','.join(hosts)}", flush=True)
     completed = 0
     for (atol, rtol), cases in cases_by_tolerance.items():
         print(f"validating {len(cases)} cases with atol={atol:g}, rtol={rtol:g}", flush=True)
-        completed += batch_simulate_fp32(
-            hosts=hosts,
-            cases=cases,
-            atol=atol,
-            rtol=rtol,
-            timeout_s=BATCH_SIMULATION_TIMEOUT_SECONDS,
-            workers_per_host=SIMULATION_WORKERS_PER_HOST,
-        )
-    assert completed == len(workloads) * (ROLLOUT_STEPS + 1)
+        completed += _simulate_cases(hosts, cases, atol, rtol)
+    assert completed == len(tasks) * (ROLLOUT_STEPS // TRANSFORMS_PER_SIMULATION)

@@ -181,9 +181,9 @@ class FusePointwise(Transform[FusePointwiseOption]):
                         required_dtype = pointwise_leaf.op_cls.OUTPUT_STORAGE_DTYPE
                         legal = (
                             intermediate.tensor not in ir.param_buffers
-                            and intermediate.tensor != ir.return_name
+                            and intermediate.tensor not in ir.return_names
                             and destination.tensor not in ir.param_buffers
-                            and destination.tensor != ir.return_name
+                            and destination.tensor not in ir.return_names
                             and source_buffer.dtype == destination_buffer.dtype
                             and destination_buffer.location == pointwise_leaf.op_cls.OUTPUT_LOCATION
                             and (required_dtype is None or destination_buffer.physical_dtype() == required_dtype)
@@ -296,7 +296,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
                                 and buffers[bias.tensor].location in NKIActivation.INPUT_LOCATIONS["bias"]
                                 and buffers[intermediate.tensor].location != "shared_hbm"
                                 and intermediate.tensor not in ir.param_buffers
-                                and intermediate.tensor != ir.return_name
+                                and intermediate.tensor not in ir.return_names
                                 and self._has_unique_consumer(
                                     ir, intermediate.tensor, pointwise_leaf_nid, activation_leaf_nid
                                 )

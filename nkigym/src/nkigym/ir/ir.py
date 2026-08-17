@@ -33,7 +33,7 @@ class KernelIR:
     Attributes:
         func_name: Source ``f_nkigym`` name.
         param_names: Signature order.
-        return_name: Identifier in the kernel's ``return`` statement.
+        return_names: Identifiers in the kernel's ``return`` statement.
         tree: Canonical schedule tree.
         dependency: Producer-consumer graph derived from ``tree``.
         param_buffers: Parameter buffer metadata (shape/dtype/location).
@@ -41,10 +41,17 @@ class KernelIR:
 
     func_name: str
     param_names: list[str]
-    return_name: str
+    return_names: tuple[str, ...]
     tree: KernelTree
     dependency: Dependency
     param_buffers: dict[str, Buffer] = field(default_factory=dict)
+
+    @property
+    def return_name(self) -> str:
+        """Return the sole output name for transforms limited to one output."""
+        if len(self.return_names) != 1:
+            raise ValueError(f"{self.func_name} has {len(self.return_names)} outputs; one output is required")
+        return self.return_names[0]
 
     def all_buffers(self) -> dict[str, Buffer]:
         """Walk every :class:`BlockNode` in pre-order; return ``name -> Buffer`` including parameters."""
@@ -99,7 +106,7 @@ class KernelIR:
             "## Signature",
             "",
             f"- **Params**: {', '.join(f'`{p}`' for p in self.param_names) or '_(none)_'}",
-            f"- **Returns**: `{self.return_name}`",
+            f"- **Returns**: {', '.join(f'`{name}`' for name in self.return_names)}",
             "",
             "## Buffers",
             "",
@@ -138,7 +145,7 @@ def build_initial_ir(func: Callable[..., Any], input_specs: dict[str, tuple[tupl
     return KernelIR(
         func_name=analysis.func_name,
         param_names=analysis.param_names,
-        return_name=analysis.return_name,
+        return_names=analysis.return_names,
         tree=tree,
         dependency=dependency,
         param_buffers=param_buffers,

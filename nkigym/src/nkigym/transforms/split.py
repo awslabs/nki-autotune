@@ -368,8 +368,8 @@ def _min_tile_floor(leaf: ISANode, block: BlockNode, concrete_axis: str) -> int 
     Translates the block iter_var dim (e.g. ``d1``) to the abstract op-axis
     (e.g. ``M``) via ``block.axis_map`` and reads the op's
     ``MIN_TILE_SIZE``. A tensorize-split whose innermost factor falls below
-    this floor would shrink the access tile past the hardware minimum (the
-    partition axis must stay at 128); such a split is illegal.
+    this floor would shrink the access tile past the operation's scheduling
+    minimum, so such a split is illegal.
     """
     inverse = {concrete: abstract for abstract, concrete in block.axis_map.items()}
     abstract = inverse.get(concrete_axis)

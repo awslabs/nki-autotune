@@ -27,6 +27,7 @@ _ACT_FNS: dict[str, Any] = {
     "tanh": np.tanh,
     "rsqrt": lambda x: 1.0 / np.sqrt(x),
     "sqrt": np.sqrt,
+    "gelu_apprx_sigmoid": lambda x: x / (1.0 + np.exp(-1.702 * x)),
 }
 
 

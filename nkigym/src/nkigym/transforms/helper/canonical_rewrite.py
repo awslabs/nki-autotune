@@ -163,10 +163,10 @@ def canonical_spec(
     if valid:
         for abstract, concrete in axis_map.items():
             extent = extents[concrete]
-            minimum = op_cls.MIN_TILE_SIZE.get(abstract, 1)
+            minimum = min(op_cls.MIN_TILE_SIZE.get(abstract, 1), extent)
             maximum = op_cls.MAX_TILE_SIZE.get(abstract)
             tile = extent if maximum is None else min(extent, maximum)
-            if tile <= 0 or extent < minimum or extent % tile != 0:
+            if tile <= 0 or tile < minimum or extent % tile != 0:
                 valid = False
                 break
             tiles[abstract] = tile
@@ -360,7 +360,7 @@ def _canonical_region(
         trip = extents[concrete] // tile
         if trip == 1:
             lo: Const | Var | Mul = Const(value=0)
-        elif axis_index == 0 and buffer.location in {"sbuf", "psum"} and tile == PARTITION_DIM:
+        elif axis_index == 0 and buffer.location in {"sbuf", "psum"} and tile == buffer.partition_extent():
             lo = Var(name=loop_vars[abstract])
         else:
             lo = Mul(left=Var(name=loop_vars[abstract]), right=Const(value=tile))

@@ -125,17 +125,19 @@ def _compact_one(tree: KernelTree, buf: Buffer, anchors: set[str]) -> Buffer:
                 continue
             lo, width = region.ranges[axis]
             extents = _leaf_loop_extents(tree, leaf_nid)
-            span = _axis_span(lo, width, axis, buf.location, anchors, extents)
+            span = _axis_span(lo, width, axis, buf.location, anchors, extents, buf.partition_extent())
             widest = max(widest, span)
         new_shape[axis] = widest
     return replace(buf, shape=tuple(new_shape))
 
 
-def _axis_span(lo: Expr, width: Expr, axis: int, location: str, anchors: set[str], extents: dict[str, int]) -> int:
+def _axis_span(
+    lo: Expr, width: Expr, axis: int, location: str, anchors: set[str], extents: dict[str, int], partition: int
+) -> int:
     """Max value of ``lo + width`` over the interior-loop box, anchors zeroed.
 
-    Axis 0 of sbuf/psum carries a bare partition-tile index with width 128;
-    its compacted extent is reported in element space (list_len * 128).
+    Axis 0 of sbuf/psum carries a bare partition-tile index; its compacted
+    extent is reported in element space.
     """
     assert isinstance(width, Const), f"region width must be Const; got {width!r}"
     zeroed = substitute(lo, {a: Const(value=0) for a in anchors})
@@ -147,9 +149,9 @@ def _axis_span(lo: Expr, width: Expr, axis: int, location: str, anchors: set[str
         trips = extents.get(var, 1)
         if coeff > 0:
             hi += coeff * (trips - 1)
-    is_partition = axis == 0 and location in ("sbuf", "psum") and width.value == PARTITION_DIM
+    is_partition = axis == 0 and location in ("sbuf", "psum") and width.value == partition
     if is_partition:
-        return (hi + 1) * PARTITION_DIM
+        return (hi + 1) * partition
     return hi + width.value
 
 

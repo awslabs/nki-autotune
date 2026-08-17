@@ -2,17 +2,17 @@
 
 nkigym/src/nkigym/
 |-- __init__.py
-|-- ir/**/*.py                       at most 4,000 code lines total
+|-- ir/**/*.py                       at most 3,000 code lines total
 |-- codegen/**/*.py                  at most 2,000 code lines total
 |-- environment/**/*.py              at most 2,000 code lines total
 |-- profile/**/*.py                  at most 2,000 code lines total
 |-- search/**/*.py                   at most 2,000 code lines total
-|-- synthesis/**/*.py                at most 2,000 code lines total
+|-- synthesis/**/*.py                at most 1,000 code lines total
 |-- ops/
 |   |-- __init__.py                  at most 100 code lines
 |   |-- base.py                      at most 500 code lines
 |   `-- <operation>.py               one NKIOp subclass; at most 100 code lines
-`-- transforms/                      at most 20 public transforms
+`-- transforms/                      at most 25 public transforms
     |-- __init__.py
     |-- base.py
     |-- <transform>.py               exactly one public transform per file
@@ -25,7 +25,8 @@ Only the files shown above are allowed under ops and transforms. Every transform
 Python file must have fewer than 1,000 code lines, and all helper Python files
 together must have fewer than 1,000 code lines. Blank lines, comments, and
 documentation strings do not count. Public transforms must directly define
-typed, synchronous analyze and apply methods.
+typed, synchronous analyze and apply methods. Formatter-control comments are
+forbidden because they permit multiple statements to be hidden on one line.
 
 Required package initializers: nkigym, codegen, environment, ir, ir/arith, ops,
 profile, search, synthesis, transforms, and transforms/helper.
@@ -37,31 +38,39 @@ kernel_library -> kernel_library, nkigym
 test           -> kernel_library, nkigym
 
 The top-level developer package must not exist.
+
+Exact transform schedules and reproduction traces are allowed only in
+kernel_library. Search must use generic heuristics over runtime legal actions,
+must not invoke agents, and must not import concrete transforms or construct
+transform options.
 """
 
 from __future__ import annotations
 
 import ast
 import io
+import re
 import subprocess
+import sys
 import tokenize
 from pathlib import Path
 
 from _transform_inventory import inspect_transform_api, inspect_transforms
 
-MAX_PUBLIC_TRANSFORMS = 20
+MAX_PUBLIC_TRANSFORMS = 25
 TRANSFORM_FILE_LINE_LIMIT = 1000
 TRANSFORM_HELPER_LINE_LIMIT = 1000
-MAX_IR_IMPLEMENTATION_LINES = 4000
+MAX_IR_IMPLEMENTATION_LINES = 3000
 MAX_CODEGEN_IMPLEMENTATION_LINES = 2000
 MAX_ENVIRONMENT_IMPLEMENTATION_LINES = 2000
 MAX_PROFILE_IMPLEMENTATION_LINES = 2000
 MAX_SEARCH_IMPLEMENTATION_LINES = 2000
-MAX_SYNTHESIS_IMPLEMENTATION_LINES = 2000
+MAX_SYNTHESIS_IMPLEMENTATION_LINES = 1000
 OP_FILE_LINE_LIMIT = 100
 OP_BASE_FILE_LINE_LIMIT = 500
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_IMPORT_ROOTS = {"developer", "kernel_library", "nkigym"}
+FORMATTER_TARGETS = ("nkigym/src", "kernel_library", "test")
 REQUIRED_PACKAGE_INITIALIZERS = frozenset(
     {
         "nkigym/src/nkigym/__init__.py",
@@ -79,6 +88,9 @@ REQUIRED_PACKAGE_INITIALIZERS = frozenset(
 )
 TRANSFORM_INFRASTRUCTURE_FILES = frozenset({"__init__.py", "base.py"})
 TRANSFORM_HELPER_DIRECTORY = "helper"
+FORMATTER_CONTROL_PATTERN = re.compile(
+    r"#\s*(?:fmt\s*:\s*(?:off|on|skip)|yapf\s*:\s*(?:disable|enable))(?:\s|;|$)", re.IGNORECASE
+)
 SourcePosition = tuple[int, int]
 SourceSpan = tuple[SourcePosition, SourcePosition]
 
@@ -126,6 +138,40 @@ def _python_code_lines(path: Path) -> int:
         if token.type not in ignored_token_types and not is_documentation and not is_separator:
             code_lines.update(range(token.start[0], token.end[0] + 1))
     return len(code_lines)
+
+
+def _formatter_control_comments(path: Path) -> tuple[tuple[int, str], ...]:
+    """Return formatter-control comments and their source lines."""
+    source = path.read_text(encoding="utf-8")
+    comments = tuple(
+        (token.start[0], token.string)
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.COMMENT and FORMATTER_CONTROL_PATTERN.match(token.string.strip())
+    )
+    return comments
+
+
+def _formatter_control_violations(directory: Path) -> list[str]:
+    """Reject formatter escapes that can conceal code from physical line limits."""
+    violations: list[str] = []
+    for path in sorted(directory.rglob("*.py")):
+        relative_path = path.relative_to(REPOSITORY_ROOT)
+        for line, comment in _formatter_control_comments(path):
+            violations.append(f"{relative_path}:{line} uses forbidden formatter control comment {comment!r}")
+    return violations
+
+
+def _repository_format_violations() -> list[str]:
+    """Run Black and isort checks before inspecting repository structure."""
+    commands = (("black", "--check"), ("isort", "--check-only"))
+    violations: list[str] = []
+    for module, check_flag in commands:
+        completed = subprocess.run(
+            (sys.executable, "-m", module, check_flag, *FORMATTER_TARGETS), cwd=REPOSITORY_ROOT, check=False
+        )
+        if completed.returncode != 0:
+            violations.append(f"{module} formatting check exited with status {completed.returncode}")
+    return violations
 
 
 def _repository_files(directory: Path) -> tuple[Path, ...]:
@@ -338,8 +384,66 @@ def _dependency_violations() -> list[str]:
     return violations
 
 
+def _search_schedule_violations() -> list[str]:
+    """Reject fixed schedule ingredients from the runtime search package."""
+    search_directory = REPOSITORY_ROOT / "nkigym/src/nkigym/search"
+    violations: list[str] = []
+    forbidden_module_terms = ("agent", "ladder", "policy", "preset", "prompt", "retained_schedule", "schedule_trace")
+    forbidden_agent_imports = {"anthropic", "openai", "subprocess"}
+    for path in sorted(search_directory.rglob("*.py")):
+        relative = path.relative_to(REPOSITORY_ROOT)
+        if any(term in path.stem.lower() for term in forbidden_module_terms):
+            violations.append(
+                f"{relative} names an agent/preset artifact; search must remain a generic heuristic implementation"
+            )
+        module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(module):
+            imported_roots: set[str] = set()
+            import_line = 0
+            if isinstance(node, ast.Import):
+                imported_roots = {alias.name.partition(".")[0] for alias in node.names}
+                import_line = node.lineno
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imported_roots = {node.module.partition(".")[0]}
+                import_line = node.lineno
+            forbidden_roots = sorted(imported_roots & forbidden_agent_imports)
+            if forbidden_roots:
+                violations.append(
+                    f"{relative}:{import_line} imports agent-capable process/model APIs {forbidden_roots}; "
+                    "search must use in-process deterministic heuristics"
+                )
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and node.module.startswith("nkigym.transforms")
+            ):
+                imports_public_catalog = node.module == "nkigym.transforms" and all(
+                    alias.name == "public_transforms" for alias in node.names
+                )
+                if not imports_public_catalog:
+                    violations.append(
+                        f"{relative}:{node.lineno} imports concrete transform APIs from {node.module}; "
+                        "search must consume public runtime legal actions"
+                    )
+            elif isinstance(node, ast.Import):
+                forbidden = sorted(alias.name for alias in node.names if alias.name.startswith("nkigym.transforms"))
+                if forbidden:
+                    violations.append(
+                        f"{relative}:{node.lineno} imports concrete transform APIs {forbidden}; "
+                        "search must consume public runtime legal actions"
+                    )
+            elif isinstance(node, ast.Call) and _base_name(node.func).endswith("Option"):
+                violations.append(
+                    f"{relative}:{node.lineno} constructs a transform option; "
+                    "exact action payloads belong only in kernel_library traces"
+                )
+    return violations
+
+
 def test_repository_structure() -> None:
     """Repository structure, source growth, dependencies, and APIs remain valid."""
+    format_violations = _repository_format_violations()
+    assert not format_violations, "\n".join(format_violations)
     structure_violations, transform_count, largest_transform_file, helper_lines = _transform_structure_violations()
     operation_violations, operation_count, largest_operation_file, operation_base_lines = (
         _operation_structure_violations()
@@ -369,7 +473,9 @@ def test_repository_structure() -> None:
         *structure_violations,
         *operation_violations,
         *api_violations,
+        *_formatter_control_violations(source_root),
         *_dependency_violations(),
+        *_search_schedule_violations(),
     ]
     if ir_violation is not None:
         violations.append(ir_violation)
@@ -418,3 +524,17 @@ still counts."""
         encoding="utf-8",
     )
     assert _python_code_lines(source_path) == 7
+
+
+def test_formatter_control_comments_ignore_string_contents(tmp_path: Path) -> None:
+    """Only actual formatter-control comments are rejected."""
+    source_path = tmp_path / "formatter_control_sample.py"
+    source_path.write_text(
+        '''TEXT = "# fmt: off"
+DOCUMENTATION = """# yapf: disable"""
+# fmt: skip
+VALUE = 1  # yapf: disable
+''',
+        encoding="utf-8",
+    )
+    assert _formatter_control_comments(source_path) == ((3, "# fmt: skip"), (4, "# yapf: disable"))

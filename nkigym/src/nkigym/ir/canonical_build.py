@@ -77,11 +77,11 @@ def _trip_count(rec: "_OpRecord", abstract: str, analysis: "_AnalysisResult") ->
 def _tile_size(rec: "_OpRecord", abstract: str, analysis: "_AnalysisResult") -> int:
     """Return the canonical tile width for one operation axis."""
     extent = analysis.dim_sizes[rec.axis_map[abstract]]
-    minimum = rec.op_cls.MIN_TILE_SIZE.get(abstract, 1)
+    minimum = min(rec.op_cls.MIN_TILE_SIZE.get(abstract, 1), extent)
     maximum = rec.op_cls.MAX_TILE_SIZE.get(abstract)
     tile = extent if maximum is None else min(extent, maximum)
-    if extent < minimum:
-        raise ValueError(f"{rec.op_cls.__name__}.{abstract} extent {extent} is below MIN_TILE_SIZE {minimum}")
+    if tile < minimum:
+        raise ValueError(f"{rec.op_cls.__name__}.{abstract} tile {tile} is below canonical minimum {minimum}")
     if extent % tile != 0:
         raise ValueError(f"{rec.op_cls.__name__}.{abstract} extent {extent} is not divisible by canonical tile {tile}")
     return tile
@@ -190,8 +190,9 @@ def _build_region(
 ) -> BufferRegion:
     """Construct a :class:`BufferRegion` for ``slot`` using its axes and per-tile widths.
 
-    SBUF/PSUM operands use 3D layout with partition axis special: axis 0 has
-    width=128, lo is the bare partition-coord Var (not multiplied).
+    SBUF/PSUM operands use 3D layout with a special partition axis: axis 0
+    uses the buffer's physical partition extent, and its lower bound is the
+    bare partition-coordinate Var rather than an element offset.
     """
     from nkigym.ir.arith.expr import Mul
 
@@ -204,10 +205,12 @@ def _build_region(
         loop_var = loop_var_names.get(abstract)
         looped = loop_var is not None and _trip_count(rec, abstract, analysis) > 1
 
-        """Partition axis (axis 0) of SBUF/PSUM operands: tile is 128, lo is bare Var (not multiplied)."""
-        if axis_index == 0 and tensor_location in ("sbuf", "psum") and extent_per_tile == PARTITION_DIM and looped:
+        """Partition-axis offsets are tile indices rather than element offsets."""
+        tensor_extent = analysis.tensors[tensor_name].shape[0]
+        partition_extent = min(tensor_extent, PARTITION_DIM)
+        if axis_index == 0 and tensor_location in ("sbuf", "psum") and extent_per_tile == partition_extent and looped:
             assert loop_var is not None
-            ranges.append((Var(name=loop_var), Const(value=PARTITION_DIM)))
+            ranges.append((Var(name=loop_var), Const(value=partition_extent)))
         elif not looped:
             ranges.append((Const(value=0), Const(value=extent_per_tile)))
         else:

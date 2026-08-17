@@ -104,7 +104,7 @@ class CopyPropagation(Transform[CopyPropagationOption]):
         consumed = consumer_leaf.operand_bindings.get(option.consumer_operand)
         if source is None or copied is None or consumed != copied:
             return result
-        if copied.tensor in ir.param_buffers or copied.tensor == ir.return_name:
+        if copied.tensor in ir.param_buffers or copied.tensor in ir.return_names:
             return result
         copied_buffer = ir.buffer(copied.tensor)
         source_buffer = ir.buffer(source.tensor)
