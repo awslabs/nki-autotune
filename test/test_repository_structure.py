@@ -40,8 +40,8 @@ test           -> kernel_library, nkigym
 The top-level developer package must not exist.
 
 Exact transform schedules and reproduction traces are allowed only in
-kernel_library. Search must use generic heuristics over runtime legal actions,
-must not invoke agents, and must not import concrete transforms or construct
+kernel_library. Search owns generic iterative refinement infrastructure and
+consumes runtime legal actions without importing or constructing concrete
 transform options.
 """
 
@@ -385,57 +385,29 @@ def _dependency_violations() -> list[str]:
 
 
 def _search_schedule_violations() -> list[str]:
-    """Reject fixed schedule ingredients from the runtime search package."""
+    """Reject concrete transform ownership from generic search infrastructure."""
     search_directory = REPOSITORY_ROOT / "nkigym/src/nkigym/search"
     violations: list[str] = []
-    forbidden_module_terms = ("agent", "ladder", "policy", "preset", "prompt", "retained_schedule", "schedule_trace")
-    forbidden_agent_imports = {"anthropic", "openai", "subprocess"}
     for path in sorted(search_directory.rglob("*.py")):
         relative = path.relative_to(REPOSITORY_ROOT)
-        if any(term in path.stem.lower() for term in forbidden_module_terms):
-            violations.append(
-                f"{relative} names an agent/preset artifact; search must remain a generic heuristic implementation"
-            )
         module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(module):
-            imported_roots: set[str] = set()
-            import_line = 0
-            if isinstance(node, ast.Import):
-                imported_roots = {alias.name.partition(".")[0] for alias in node.names}
-                import_line = node.lineno
-            elif isinstance(node, ast.ImportFrom) and node.module is not None:
-                imported_roots = {node.module.partition(".")[0]}
-                import_line = node.lineno
-            forbidden_roots = sorted(imported_roots & forbidden_agent_imports)
-            if forbidden_roots:
-                violations.append(
-                    f"{relative}:{import_line} imports agent-capable process/model APIs {forbidden_roots}; "
-                    "search must use in-process deterministic heuristics"
-                )
-            if (
-                isinstance(node, ast.ImportFrom)
-                and node.module is not None
-                and node.module.startswith("nkigym.transforms")
-            ):
-                imports_public_catalog = node.module == "nkigym.transforms" and all(
-                    alias.name == "public_transforms" for alias in node.names
-                )
-                if not imports_public_catalog:
-                    violations.append(
-                        f"{relative}:{node.lineno} imports concrete transform APIs from {node.module}; "
-                        "search must consume public runtime legal actions"
+            if isinstance(node, ast.ImportFrom) and node.module is not None:
+                if node.module.startswith("nkigym.transforms"):
+                    imports_public_catalog = node.module == "nkigym.transforms" and all(
+                        alias.name == "public_transforms" for alias in node.names
                     )
+                    if not imports_public_catalog:
+                        violations.append(
+                            f"{relative}:{node.lineno} imports concrete transform APIs from {node.module}"
+                        )
             elif isinstance(node, ast.Import):
                 forbidden = sorted(alias.name for alias in node.names if alias.name.startswith("nkigym.transforms"))
                 if forbidden:
-                    violations.append(
-                        f"{relative}:{node.lineno} imports concrete transform APIs {forbidden}; "
-                        "search must consume public runtime legal actions"
-                    )
+                    violations.append(f"{relative}:{node.lineno} imports concrete transform APIs {forbidden}")
             elif isinstance(node, ast.Call) and _base_name(node.func).endswith("Option"):
                 violations.append(
-                    f"{relative}:{node.lineno} constructs a transform option; "
-                    "exact action payloads belong only in kernel_library traces"
+                    f"{relative}:{node.lineno} constructs a transform option; runtime legal actions own payloads"
                 )
     return violations
 

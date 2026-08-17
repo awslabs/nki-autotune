@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from nkigym.search.types import InputSpecs
+from nkigym.profile import InputSpecs
 
 
 def _numpy_ref(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
@@ -24,5 +24,5 @@ WORKLOAD = {
     "input_generator": _input_generator,
     "atol": 1e-3,
     "rtol": 1e-3,
-    "best_historical_mfu": 87.46,
+    "best_historical_latency_ms": 0.24978,
 }

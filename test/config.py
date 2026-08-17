@@ -1,4 +1,4 @@
 """Remote hosts used by the standalone acceptance tests."""
 
-MFU_PROFILE_HOSTS = ("gym-trn2-1", "gym-trn2-2")
+PROFILE_HOSTS = ("gym-trn2-1", "gym-trn2-2")
 SIMULATION_HOSTS = ("gym-cpu-1", "gym-cpu-2", "gym-cpu-3", "gym-cpu-4")

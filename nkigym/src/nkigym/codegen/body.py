@@ -536,7 +536,7 @@ def _emit_indirect_dma(node: ISANode, ir: KernelIR, rotations: dict[str, Expr], 
         operands = f"src={indirect}, dst={data_text}"
     else:
         operands = f"src={data_text}, dst={indirect}"
-    return f"nisa.dma_copy({operands}, oob_mode=oob_mode.skip, dge_mode=nisa.dge_mode.swdge)"
+    return f"nisa.dma_copy({operands}, oob_mode=oob_mode.error, dge_mode=nisa.dge_mode.swdge)"
 
 
 def _substituted_region(region: BufferRegion, substitutions: dict[str, Expr]) -> BufferRegion:

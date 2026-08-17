@@ -11,7 +11,7 @@ from typing import TypedDict, cast
 
 import numpy as np
 
-from nkigym.search.types import InputSpecs
+from nkigym.profile import InputSpecs
 
 ArrayResult = np.ndarray | tuple[np.ndarray, ...]
 InputGenerator = Callable[[InputSpecs, int], dict[str, np.ndarray]]
@@ -25,7 +25,7 @@ class Workload(TypedDict):
     input_generator: InputGenerator
     atol: float
     rtol: float
-    best_historical_mfu: float
+    best_historical_latency_ms: float
 
 
 _FIELDS = frozenset(Workload.__required_keys__)
@@ -47,7 +47,7 @@ def _validate_workload(module_name: str, raw_workload: object) -> Workload:
         raise ValueError(f"{module_name}.numpy_ref parameters must match input_specs")
     if list(inspect.signature(input_generator).parameters) != ["input_specs", "seed"]:
         raise ValueError(f"{module_name}.input_generator parameters must be input_specs and seed")
-    for field in ("atol", "rtol", "best_historical_mfu"):
+    for field in ("atol", "rtol", "best_historical_latency_ms"):
         value = values[field]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise ValueError(f"{module_name}.{field} must be finite")

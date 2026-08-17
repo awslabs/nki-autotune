@@ -11,6 +11,7 @@ import numpy as np
 
 InputSpecs = dict[str, tuple[tuple[int, ...], str]]
 ArrayResult = np.ndarray | tuple[np.ndarray, ...]
+_MAX_ATTENTION_VALIDATION_TOKENS = 128
 
 
 @dataclass(frozen=True)
@@ -73,7 +74,7 @@ def _lower_matmul(input_specs: InputSpecs, transposed: bool) -> SpecializedLower
             "return hbm_out",
         ]
         imports = (*_basic_imports(), "from nkigym.ops.transpose import NKITranspose")
-    return _identity_lowering(_render_source(imports, parameters, body), input_specs)
+    return _identity_lowering(_render_source(imports, parameters, body), input_specs, input_specs)
 
 
 def _lower_rmsnorm_matmul(input_specs: InputSpecs) -> SpecializedLowering:
@@ -99,13 +100,16 @@ def _lower_rmsnorm_matmul(input_specs: InputSpecs) -> SpecializedLowering:
         *_basic_imports(),
         "from nkigym.ops.tensor_scalar import NKITensorScalar",
     )
-    return _identity_lowering(_render_source(imports, tuple(input_specs), body), input_specs)
+    return _identity_lowering(_render_source(imports, tuple(input_specs), body), input_specs, input_specs)
 
 
 def _lower_attention(input_specs: InputSpecs) -> SpecializedLowering:
     """Lower materialized scaled dot-product attention to its retained graph."""
     query, key, value = tuple(input_specs)
-    head_dim = input_specs[query][0][0]
+    query_shape = input_specs[query][0]
+    key_shape = input_specs[key][0]
+    value_shape = input_specs[value][0]
+    head_dim = query_shape[0]
     body = [
         f"sbuf_{query} = NKILoad()(src={query})",
         f"sbuf_{key} = NKILoad()(src={key})",
@@ -132,7 +136,14 @@ def _lower_attention(input_specs: InputSpecs) -> SpecializedLowering:
         "from nkigym.ops.tensor_reduce import NKITensorReduce",
         "from nkigym.ops.tensor_scalar import NKITensorScalar",
     )
-    return _identity_lowering(_render_source(imports, tuple(input_specs), body), input_specs)
+    query_tokens = min(query_shape[1], _MAX_ATTENTION_VALIDATION_TOKENS)
+    key_value_tokens = min(key_shape[1], _MAX_ATTENTION_VALIDATION_TOKENS)
+    validation_specs = {
+        query: ((head_dim, query_tokens), input_specs[query][1]),
+        key: ((head_dim, key_value_tokens), input_specs[key][1]),
+        value: ((key_value_tokens, value_shape[1]), input_specs[value][1]),
+    }
+    return _identity_lowering(_render_source(imports, tuple(input_specs), body), input_specs, validation_specs)
 
 
 def _basic_imports() -> tuple[str, ...]:
@@ -145,13 +156,15 @@ def _basic_imports() -> tuple[str, ...]:
     )
 
 
-def _identity_lowering(source: str, input_specs: InputSpecs) -> SpecializedLowering:
+def _identity_lowering(source: str, input_specs: InputSpecs, validation_specs: InputSpecs) -> SpecializedLowering:
     """Build a no-adapter lowering for a rank-two expression program."""
 
     def validation_inputs(seed: int) -> dict[str, np.ndarray]:
         """Generate deterministic fp32 validation values."""
         rng = np.random.default_rng(seed)
-        return {name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in input_specs.items()}
+        return {
+            name: rng.standard_normal(shape).astype(np.float32) for name, (shape, _dtype) in validation_specs.items()
+        }
 
     return SpecializedLowering(
         source=source,

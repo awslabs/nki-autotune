@@ -15,7 +15,11 @@ from nkigym.transforms.base import Transform, TransformLegalityError, TransformO
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
 from nkigym.transforms.helper.normalize import _substitute_block_regions, normalize_block
 from nkigym.transforms.helper.tile_region import retile_region
-from nkigym.transforms.helper.tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
+from nkigym.transforms.helper.tree_ops import (
+    _block_local_descendants,
+    _replace_in_parent_children,
+    invalidate_stale_software_pipelines,
+)
 
 
 @dataclass(frozen=True)
@@ -156,7 +160,7 @@ class Split(Transform[SplitOption]):
             left=Mul(left=Var(name=outer.loop_var), right=Const(value=inner.extent)), right=Var(name=inner.loop_var)
         )
         _substitute_block_regions(ir.tree, block_nid, {target.loop_var: composed})
-        normalize_block(ir.tree, block_nid)
+        _normalize_split_block(ir.tree, block_nid)
 
     def _do_tensorize(self, ir: KernelIR, option: SplitOption) -> int:
         """Tensorize Split: insert ``factors[:-1]`` loops above the leaf, set the access width.
@@ -236,7 +240,7 @@ class Split(Transform[SplitOption]):
         )
         ir.tree.graph.nodes[block_nid]["data"] = new_block
 
-        normalize_block(ir.tree, block_nid)
+        _normalize_split_block(ir.tree, block_nid)
         return top_nid
 
 
@@ -244,6 +248,27 @@ def _resolve(tree: KernelTree, nid: int):
     if nid not in tree.graph:
         raise TransformLegalityError(f"Split.target_nid={nid} is not a node in the IR tree")
     return tree.data(nid)
+
+
+def _normalize_split_block(tree: KernelTree, block_nid: int) -> None:
+    """Normalize a split block and rebind renamed loops in nested blocks."""
+    loop_names = {
+        nid: node.loop_var
+        for nid in _block_local_descendants(tree, block_nid)
+        if isinstance((node := tree.data(nid)), ForNode)
+    }
+    nested_blocks = [nid for nid in tree.descendants(block_nid) if isinstance(tree.data(nid), BlockNode)]
+    normalize_block(tree, block_nid)
+    for nested_block in nested_blocks:
+        ancestors = set(tree.ancestors(nested_block))
+        substitutions: dict[str, Expr] = {}
+        for loop_nid, old_name in loop_names.items():
+            if loop_nid in ancestors and loop_nid in tree.graph:
+                new_name = tree.loop(loop_nid).loop_var
+                if new_name != old_name:
+                    substitutions[old_name] = Var(name=new_name)
+        if substitutions:
+            _substitute_block_regions(tree, nested_block, substitutions)
 
 
 def _enclosing_block_of(tree: KernelTree, nid: int) -> int | None:

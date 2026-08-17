@@ -1,54 +1,40 @@
-"""Types for deterministic heuristic schedule search."""
+"""Public types for iterative schedule refinement."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeAlias
 
+from nkigym.environment import Action
 from nkigym.ir import KernelIR
-from nkigym.search.heuristics import ScheduleStep
-
-EvaluationMetric: TypeAlias = float | int | str | bool | None
-InputSpecs: TypeAlias = dict[str, tuple[tuple[int, ...], str]]
+from nkigym.profile.types import ProfileMetrics
 
 
 @dataclass(frozen=True)
-class Evaluation:
-    """Measured hardware result for one schedule candidate."""
+class PolicyContext:
+    """State exposed to a policy before one refinement step."""
 
-    score: float | None
-    metrics: dict[str, EvaluationMetric]
-    message: str
-
-
-@dataclass(frozen=True)
-class ScheduleCandidate:
-    """One fully lowered schedule and its optional hardware measurement."""
-
-    candidate_id: int
-    family: str
-    strategy: str
     state: KernelIR
-    steps: tuple[ScheduleStep, ...]
-    evaluation: Evaluation
+    legal_actions: tuple[Action, ...]
+    evaluations: tuple[ProfileMetrics, ...]
+    max_transforms: int
+
+
+class Policy:
+    """Choose transforms while the backend owns evaluation and stopping."""
+
+    def select_actions(self, context: PolicyContext) -> tuple[Action, ...]:
+        """Return an ordered transform sequence, or an empty tuple to finish."""
+        raise NotImplementedError("search policy is not implemented")
 
 
 @dataclass(frozen=True)
 class SearchResult:
-    """Completed deterministic schedule search."""
+    """Summary of one completed refinement run."""
 
-    candidates: tuple[ScheduleCandidate, ...]
-    best_candidate_id: int | None
+    best_latency_ms: float
     transforms_applied: int
     evaluations_run: int
     finish_reason: str
 
-    @property
-    def best_candidate(self) -> ScheduleCandidate:
-        """Return the highest-MFU successfully measured schedule."""
-        if self.best_candidate_id is None:
-            raise RuntimeError("heuristic search produced no successful evaluation")
-        return self.candidates[self.best_candidate_id]
 
-
-__all__ = ["Evaluation", "EvaluationMetric", "InputSpecs", "ScheduleCandidate", "SearchResult"]
+__all__ = ["Policy", "PolicyContext", "SearchResult"]

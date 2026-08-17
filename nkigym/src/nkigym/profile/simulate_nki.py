@@ -19,10 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ParamSpec, TypeVar, cast
 
-import nki
 import numpy as np
-
-from nkigym.profile.simulate_nki_worker import _fp32_source
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -93,6 +90,10 @@ def simulate_fp32(kernel: Callable[_P, _R]) -> Callable[_P, _R]:
     casts each numpy input tensor to ``np.float32`` before invoking
     ``nki.simulate`` so the simulator sees fp32 end-to-end.
     """
+    import nki
+
+    from nkigym.profile.simulate_nki_worker import _fp32_source
+
     func = getattr(kernel, "func", kernel)
     source = _fp32_source(textwrap.dedent(inspect.getsource(func)))
     namespace: dict = dict(func.__globals__)
@@ -316,15 +317,24 @@ def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_
 
 
 def _start_remote_worker(host: str, remote_run: str, deadline: float, log: list[str]) -> None:
-    """Start one detached worker whose result and exit status are atomic files."""
+    """Start one detached worker and record its process group before returning."""
     worker = (
         f"{_REMOTE_PYTHON} "
         f'"$HOME"/{remote_run}/simulate_nki_worker.py '
         f'--worker "$HOME"/{remote_run}/request.pkl '
         f'"$HOME"/{remote_run}/result.json'
     )
-    script = f'{worker}; status=$?; printf "%s\\n" "$status" > "$HOME"/{remote_run}/worker.exit'
-    command = f"setsid -f sh -c {shlex.quote(script)} " f'>"$HOME"/{remote_run}/worker.log 2>&1 < /dev/null'
+    process_group_path = f'"$HOME"/{remote_run}/worker.pgid'
+    script = (
+        f'printf "%s\\n" "$$" > {process_group_path}; '
+        f'{worker}; status=$?; printf "%s\\n" "$status" > "$HOME"/{remote_run}/worker.exit'
+    )
+    launch = f"setsid -f sh -c {shlex.quote(script)} " f'>"$HOME"/{remote_run}/worker.log 2>&1 < /dev/null'
+    command = (
+        f'{launch}; attempts=0; while test "$attempts" -lt 100; do '
+        f"test -s {process_group_path} && exit 0; "
+        "attempts=$((attempts + 1)); sleep 0.1; done; exit 1"
+    )
     _run_transport_command(
         "Starting remote simulation worker", ["ssh", *_SSH_WORKER_OPTIONS, host, command], deadline, log
     )
@@ -401,8 +411,21 @@ def _record_timeout_output(error: subprocess.TimeoutExpired, log: list[str]) -> 
 
 
 def _cleanup_remote(host: str, remote_run: str, log: list[str]) -> None:
-    """Best-effort removal of one remote simulation directory."""
-    command = ["ssh", *_SSH_OPTIONS, host, f'rm -rf "$HOME"/{remote_run}']
+    """Best-effort termination and removal of one remote simulation run."""
+    remote_directory = f'"$HOME"/{remote_run}'
+    script = (
+        f"run={remote_directory}; "
+        'if test -s "$run/worker.pgid"; then '
+        'pgid=$(cat "$run/worker.pgid"); '
+        'case "$pgid" in ""|*[!0-9]*) exit 2 ;; esac; '
+        'if test "$pgid" -le 1; then exit 2; fi; '
+        'kill -TERM -- "-$pgid" 2>/dev/null || true; '
+        'attempts=0; while kill -0 -- "-$pgid" 2>/dev/null && test "$attempts" -lt 20; do '
+        "sleep 0.1; attempts=$((attempts + 1)); done; "
+        'if kill -0 -- "-$pgid" 2>/dev/null; then kill -KILL -- "-$pgid" 2>/dev/null || true; fi; '
+        'fi; rm -rf "$run"'
+    )
+    command = ["ssh", *_SSH_OPTIONS, host, script]
     try:
         completed = subprocess.run(command, text=True, capture_output=True, timeout=15, check=False)
         if completed.returncode != 0:

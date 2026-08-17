@@ -36,6 +36,7 @@ class NKITensorScalarReduce(NKIOp):
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+    PREFERRED_TILE_SIZE: ClassVar[dict[str, int]] = {"F": 512}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     @classmethod

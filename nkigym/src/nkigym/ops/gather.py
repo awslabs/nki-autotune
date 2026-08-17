@@ -8,7 +8,7 @@ from nkigym.ops.base import NKIOp, _operand_role
 
 
 class NKIGather(NKIOp):
-    """Gather HBM rows selected by one SBUF index per partition."""
+    """Gather valid HBM rows selected by one SBUF index per partition."""
 
     NAME: ClassVar[str] = "dma_copy"
     INDIRECT_DMA_MODE: ClassVar[str | None] = "gather"
@@ -27,12 +27,13 @@ class NKIGather(NKIOp):
             raise TypeError(f"NKIGather(indices=<role={role}>) expects SBUF indices")
 
     def _run(self, **kwargs: Any) -> np.ndarray:
-        """Gather rows and zero any negative padding index."""
+        """Gather rows after rejecting indices outside the HBM source."""
         source = np.asarray(kwargs["src"])
         indices = np.asarray(kwargs["indices"]).reshape(-1).astype(np.int64)
-        result = np.zeros((indices.size, source.shape[1]), dtype=source.dtype)
         valid = (indices >= 0) & (indices < source.shape[0])
-        result[valid] = source[indices[valid]]
+        if not np.all(valid):
+            raise ValueError("NKIGather indices must select valid source rows")
+        result = source[indices]
         return result
 
 
