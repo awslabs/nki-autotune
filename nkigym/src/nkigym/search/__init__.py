@@ -1,27 +1,6 @@
-"""Deterministic heuristic schedule search."""
+"""Iterative refinement with caller-supplied policy."""
 
-from nkigym.search.engine import HeuristicScheduleSearch, SearchConfig
-from nkigym.search.heuristics import (
-    SchedulePlan,
-    ScheduleStep,
-    build_heuristic_plan,
-    build_heuristic_plans,
-    operation_names,
-)
-from nkigym.search.schedule_search import run_heuristic_search
-from nkigym.search.types import Evaluation, InputSpecs, ScheduleCandidate, SearchResult
+from nkigym.search.api import run_search
+from nkigym.search.types import Policy, PolicyContext, SearchResult
 
-__all__ = [
-    "Evaluation",
-    "HeuristicScheduleSearch",
-    "InputSpecs",
-    "ScheduleCandidate",
-    "SchedulePlan",
-    "ScheduleStep",
-    "SearchConfig",
-    "SearchResult",
-    "build_heuristic_plan",
-    "build_heuristic_plans",
-    "operation_names",
-    "run_heuristic_search",
-]
+__all__ = ["Policy", "PolicyContext", "SearchResult", "run_search"]

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from nkigym.search.types import InputSpecs
+from nkigym.profile import InputSpecs
 
 _EPSILON = 1e-6
 
@@ -30,5 +30,5 @@ WORKLOAD = {
     "input_generator": _input_generator,
     "atol": 1e-3,
     "rtol": 2e-2,
-    "best_historical_mfu": 86.99,
+    "best_historical_latency_ms": 0.25112,
 }

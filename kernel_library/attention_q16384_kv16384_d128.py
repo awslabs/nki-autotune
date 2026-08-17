@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from nkigym.search.types import InputSpecs
+from nkigym.profile import InputSpecs
 
 _HEAD_DIM = 128
 
@@ -34,5 +34,5 @@ WORKLOAD = {
     "input_generator": _input_generator,
     "atol": 1e-5,
     "rtol": 2e-2,
-    "best_historical_mfu": 46.43,
+    "best_historical_latency_ms": 3.7639,
 }

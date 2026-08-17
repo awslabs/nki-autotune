@@ -221,6 +221,236 @@ OperatorContract = (
 )
 
 
+_RecurrenceValueKind = Literal["constant", "residual", "state", "additive", "multiplicative", "unknown"]
+
+
+@dataclass(frozen=True)
+class _RecurrenceFactor:
+    """One scalar or mapped expression over preceding recurrence states."""
+
+    operator: str
+    operands: tuple["_RecurrenceFactor", ...] = ()
+    stage: int | None = None
+    literal: float | None = None
+    scale: float = 1.0
+    bias: float = 0.0
+
+
+@dataclass(frozen=True)
+class _RecurrenceValue:
+    """Abstract state/chunk separation result."""
+
+    kind: _RecurrenceValueKind
+    factor: _RecurrenceFactor | None = None
+    factor_axes: tuple[str, ...] = ()
+    depends_on_progress: bool = False
+
+
+def _recurrence_factor_states(factor: _RecurrenceFactor | None) -> frozenset[int]:
+    """Return all recurrence stages referenced by a factor."""
+    states: set[int] = set()
+    if factor is not None:
+        if factor.stage is not None:
+            states.add(factor.stage)
+        for operand in factor.operands:
+            states.update(_recurrence_factor_states(operand))
+    return frozenset(states)
+
+
+def _recurrence_state_factor(stage: int) -> _RecurrenceFactor:
+    """Construct one recurrence-state reference."""
+    return _RecurrenceFactor(operator="state", stage=stage)
+
+
+def _recurrence_constant_factor(value: float) -> _RecurrenceFactor:
+    """Construct one scalar literal."""
+    return _RecurrenceFactor(operator="constant", literal=value)
+
+
+def _recurrence_unary_factor(
+    operator: str, operand: _RecurrenceFactor, scale: float = 1.0, bias: float = 0.0
+) -> _RecurrenceFactor:
+    """Construct one affine unary factor."""
+    return _RecurrenceFactor(operator=operator, operands=(operand,), scale=scale, bias=bias)
+
+
+def _recurrence_binary_factor(operator: str, left: _RecurrenceFactor, right: _RecurrenceFactor) -> _RecurrenceFactor:
+    """Construct one binary factor."""
+    return _RecurrenceFactor(operator=operator, operands=(left, right))
+
+
+def _evaluate_pointwise_contract(
+    contract: PointwiseContract, inputs: Mapping[str, _RecurrenceValue]
+) -> _RecurrenceValue:
+    """Interpret one unary or binary pointwise operation."""
+    operands = tuple((inputs[name] for name in contract.input_operands))
+    if len(operands) == 1:
+        if contract.bias_operand is not None and contract.bias_operand in inputs:
+            value = _copy_recurrence_affine(operands[0], contract.scale, contract.bias)
+            value = _add_recurrence_values(value, inputs[contract.bias_operand], "add")
+            result = value if contract.operator == "copy" else _apply_recurrence_unary(contract.operator, value)
+        else:
+            result = _apply_recurrence_unary(contract.operator, operands[0], contract.scale, contract.bias)
+    elif len(operands) == 2:
+        left, right = reversed(operands) if contract.reverse else operands
+        if contract.operator == "multiply":
+            result = _multiply_recurrence_values(left, right)
+        elif contract.operator in {"add", "subtract"}:
+            result = _add_recurrence_values(left, right, contract.operator)
+        elif contract.operator == "maximum" and left.kind == right.kind == "state":
+            assert left.factor is not None and right.factor is not None
+            result = _RecurrenceValue(
+                "state",
+                _recurrence_binary_factor("maximum", left.factor, right.factor),
+                tuple(dict.fromkeys((*left.factor_axes, *right.factor_axes))),
+            )
+        else:
+            result = _RecurrenceValue("unknown")
+    else:
+        result = _RecurrenceValue("unknown")
+    return result
+
+
+def _apply_recurrence_unary(
+    operator: str, value: _RecurrenceValue, scale: float = 1.0, bias: float = 0.0
+) -> _RecurrenceValue:
+    """Apply one unary map while retaining only proven separability."""
+    if operator == "copy":
+        result = _copy_recurrence_affine(value, scale, bias)
+    elif value.kind == "state" and value.factor is not None:
+        result = _RecurrenceValue(
+            "state", _recurrence_unary_factor(operator, value.factor, scale, bias), value.factor_axes
+        )
+    elif value.kind == "residual":
+        result = value
+    elif value.kind == "constant":
+        result = _RecurrenceValue("residual")
+    elif operator == "exp" and value.kind == "additive" and value.factor is not None:
+        result = _RecurrenceValue(
+            "multiplicative",
+            _recurrence_unary_factor("exp", value.factor, scale, bias),
+            value.factor_axes,
+            value.depends_on_progress,
+        )
+    elif operator in {"reciprocal", "square"} and value.kind == "multiplicative" and value.factor is not None:
+        factor = (
+            _recurrence_unary_factor("reciprocal", value.factor)
+            if operator == "reciprocal"
+            else _recurrence_binary_factor("multiply", value.factor, value.factor)
+        )
+        result = _RecurrenceValue("multiplicative", factor, value.factor_axes, value.depends_on_progress)
+    else:
+        result = _RecurrenceValue("unknown")
+    return result
+
+
+def _copy_recurrence_affine(value: _RecurrenceValue, scale: float, bias: float) -> _RecurrenceValue:
+    """Apply an affine identity map."""
+    if value.kind == "state" and value.factor is not None:
+        result = _RecurrenceValue(
+            "state", _recurrence_unary_factor("copy", value.factor, scale, bias), value.factor_axes
+        )
+    elif value.kind == "additive" and value.factor is not None:
+        result = _RecurrenceValue(
+            "additive",
+            _recurrence_unary_factor("copy", value.factor, scale, bias),
+            value.factor_axes,
+            value.depends_on_progress,
+        )
+    elif value.kind in {"residual", "constant"}:
+        result = _RecurrenceValue("residual", depends_on_progress=value.depends_on_progress)
+    elif scale == 1.0 and bias == 0.0:
+        result = value
+    else:
+        result = _RecurrenceValue("unknown")
+    return result
+
+
+def _multiply_recurrence_values(left: _RecurrenceValue, right: _RecurrenceValue) -> _RecurrenceValue:
+    """Multiply values while retaining separable state factors."""
+    if "unknown" in {left.kind, right.kind} or "additive" in {left.kind, right.kind}:
+        result = _RecurrenceValue("unknown")
+    else:
+        states = _recurrence_factor_states(left.factor) | _recurrence_factor_states(right.factor)
+        factor: _RecurrenceFactor | None = None
+        if states and left.factor is not None and right.factor is not None:
+            if left.factor == _recurrence_constant_factor(1.0):
+                factor = right.factor
+            elif right.factor == _recurrence_constant_factor(1.0):
+                factor = left.factor
+            else:
+                factor = _recurrence_binary_factor("multiply", left.factor, right.factor)
+        elif states:
+            factor = left.factor if _recurrence_factor_states(left.factor) else right.factor
+        axes = tuple(dict.fromkeys((*left.factor_axes, *right.factor_axes)))
+        progress = left.depends_on_progress or right.depends_on_progress
+        residual = left.kind in {"residual", "multiplicative"} or right.kind in {"residual", "multiplicative"}
+        if not states and left.kind == right.kind == "constant":
+            assert left.factor is not None and right.factor is not None
+            assert left.factor.literal is not None and right.factor.literal is not None
+            result = _RecurrenceValue(
+                "constant", _recurrence_constant_factor(left.factor.literal * right.factor.literal)
+            )
+        elif factor is None:
+            result = _RecurrenceValue("residual", depends_on_progress=progress)
+        else:
+            result = _RecurrenceValue(
+                "multiplicative" if residual else "state", factor, axes, progress if residual else False
+            )
+    return result
+
+
+def _add_recurrence_values(left: _RecurrenceValue, right: _RecurrenceValue, operator: str) -> _RecurrenceValue:
+    """Add or subtract values while retaining state/residual separation."""
+    if "unknown" in {left.kind, right.kind} or "multiplicative" in {left.kind, right.kind}:
+        result = _RecurrenceValue("unknown")
+    else:
+        left_factor = left.factor
+        right_factor = right.factor
+        states = _recurrence_factor_states(left_factor) | _recurrence_factor_states(right_factor)
+        if operator == "subtract" and right_factor is not None:
+            right_factor = _recurrence_unary_factor("copy", right_factor, -1.0)
+        if states and left_factor is not None and right_factor is not None:
+            factor = _recurrence_binary_factor("add", left_factor, right_factor)
+        elif states:
+            factor = left_factor if left_factor is not None else right_factor
+        else:
+            factor = None
+        axes = tuple(dict.fromkeys((*left.factor_axes, *right.factor_axes)))
+        progress = left.depends_on_progress or right.depends_on_progress
+        residual = left.kind in {"residual", "additive", "constant"} or right.kind in {
+            "residual",
+            "additive",
+            "constant",
+        }
+        if factor is None:
+            result = _RecurrenceValue("residual", depends_on_progress=progress)
+        else:
+            result = _RecurrenceValue(
+                "additive" if residual else "state", factor, axes, progress if residual else False
+            )
+    return result
+
+
+def _flatten_recurrence_product(factor: _RecurrenceFactor | None) -> tuple[_RecurrenceFactor, ...]:
+    """Return ordered leaves of a multiplication factor."""
+    if factor is None:
+        result = ()
+    elif factor.operator == "multiply" and len(factor.operands) == 2:
+        result = (*_flatten_recurrence_product(factor.operands[0]), *_flatten_recurrence_product(factor.operands[1]))
+    else:
+        result = (factor,)
+    return result
+
+
+def _recurrence_product_factor(factors: tuple[_RecurrenceFactor, ...]) -> _RecurrenceFactor | None:
+    """Rebuild an ordered product."""
+    result: _RecurrenceFactor | None = None
+    for factor in factors:
+        result = factor if result is None else _recurrence_binary_factor("multiply", result, factor)
+    return result
+
+
 def reduction_combinator(name: str) -> ReduceCombinator:
     """Resolve a supported reduction name to its algebraic properties."""
     normalized = "maximum" if name == "max" else name
@@ -279,6 +509,13 @@ class NKIOp:
     (``MAX`` when set, full extent when unset). Split/Fuse reject atoms
     that would produce a larger innermost tile.
     Empty = no cap for any axis.
+    """
+
+    PREFERRED_TILE_SIZE: ClassVar[dict[str, int]] = {}
+    """Preferred innermost-tile extent per abstract axis.
+
+    This is a performance hint for search, not a legality constraint. Empty
+    means no operation-specific preference.
     """
 
     RMW_OPERANDS: ClassVar[frozenset[str]] = frozenset()

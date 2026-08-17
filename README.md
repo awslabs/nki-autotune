@@ -97,9 +97,9 @@ reductions. Unsupported operations raise `ValueError`.
 ## Kernel Library
 
 Each module exposes one dictionary containing the NumPy reference, fixed input
-specifications, seeded input generator, correctness tolerances, historical MFU,
-and retained transform trace. `kernel_library.WORKLOADS` discovers modules
-automatically. Tests synthesize kernels directly from these dictionaries.
+specifications, seeded input generator, correctness tolerances, and historical
+latency. `kernel_library.WORKLOADS` discovers modules automatically. Tests
+synthesize kernels directly from these dictionaries.
 
 ## Security
 

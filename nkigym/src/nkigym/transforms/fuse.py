@@ -10,6 +10,7 @@ from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Const, Expr, Var, substitute, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
+from nkigym.ops.dma_transpose import NKIDMATranspose
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
 from nkigym.transforms.helper.normalize import _dim_from_loopvar, _substitute_block_regions, normalize_block
@@ -137,7 +138,7 @@ class Fuse(Transform[FuseOption]):
                 )
             inverse_axis_map = {concrete: abstract for abstract, concrete in block.axis_map.items()}
             abstract_axis = inverse_axis_map.get(option.target_axis)
-            max_tile = leaf.op_cls.MAX_TILE_SIZE.get(abstract_axis) if abstract_axis is not None else None
+            max_tile = _maximum_tensorize_width(ir, leaf, abstract_axis)
             absorbed_extent = prod(ir.tree.loop(nid).extent for nid in option.target_nids[:-1])
             fused_width = current_width * absorbed_extent
             if max_tile is not None and fused_width > max_tile:
@@ -260,6 +261,16 @@ class Fuse(Transform[FuseOption]):
         ir.tree.graph.nodes[block_nid]["data"] = new_block
 
         normalize_block(ir.tree, block_nid)
+
+
+def _maximum_tensorize_width(ir: KernelIR, leaf: ISANode, abstract_axis: str | None) -> int | None:
+    """Return the hardware tile limit for one tensorized operation axis."""
+    maximum = leaf.op_cls.MAX_TILE_SIZE.get(abstract_axis) if abstract_axis is not None else None
+    if leaf.op_cls is NKIDMATranspose and abstract_axis is not None:
+        source = leaf.operand_bindings["src"].tensor
+        if ir.buffer(source).location == "shared_hbm":
+            maximum = NKIDMATranspose.HBM_SOURCE_MAX_TILE_SIZE[abstract_axis]
+    return maximum
 
 
 def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
