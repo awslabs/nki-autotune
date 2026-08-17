@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 
 from nkigym.ir.arith.expr import to_affine
+from nkigym.ir.graph_index import ordered_tree_topology
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 
 
@@ -76,6 +77,7 @@ def buffer_placement_targets(
         raise KeyError(f"buffers declared by no block: {sorted(missing)}")
     touchers = _touchers_by_tensor(tree)
     regions = _regions_by_tensor(tree, frozenset(tensors))
+    _order, ancestors, _descendants = ordered_tree_topology(tree.graph, tree.root)
     targets: dict[str, int] = {}
     for tensor in tensors:
         buffer = buffers[tensor]
@@ -83,21 +85,23 @@ def buffer_placement_targets(
             target = tree.root
         else:
             touch = touchers.get(tensor)
-            lca = tree.root if not touch else _lca(tree, touch)
+            lca = tree.root if not touch else _lca(touch, ancestors)
             anchors = anchor_loop_nids_by_tensor.get(tensor) if anchor_loop_nids_by_tensor is not None else None
             if anchors is None:
-                anchors = _anchor_loop_nids_from_regions(tree, regions.get(tensor, []))
-            target = _safe_enclosing_block(tree, lca, anchors)
+                anchors = _anchor_loop_nids_from_regions(tree, regions.get(tensor, []), ancestors)
+            target = _safe_enclosing_block(tree, lca, anchors, ancestors)
         targets[tensor] = target
     return targets
 
 
-def _safe_enclosing_block(tree: KernelTree, lca_nid: int, anchor_loop_nids: frozenset[int]) -> int:
+def _safe_enclosing_block(
+    tree: KernelTree, lca_nid: int, anchor_loop_nids: frozenset[int], ancestors: dict[int, tuple[int, ...]]
+) -> int:
     """Return the deepest block at or above every non-anchor ancestor loop."""
-    target_nid = _enclosing_block(tree, lca_nid)
-    for ancestor in tree.ancestors(target_nid):
+    target_nid = _enclosing_block(tree, lca_nid, ancestors)
+    for ancestor in ancestors[target_nid]:
         if isinstance(tree.data(ancestor), ForNode) and ancestor not in anchor_loop_nids:
-            target_nid = _enclosing_block(tree, ancestor)
+            target_nid = _enclosing_block(tree, ancestor, ancestors)
             break
     return target_nid
 
@@ -110,7 +114,7 @@ def _declaring_block(tree: KernelTree, tensor: str) -> int:
     return owners[0]
 
 
-def _enclosing_block(tree: KernelTree, nid: int) -> int:
+def _enclosing_block(tree: KernelTree, nid: int, ancestors: dict[int, tuple[int, ...]]) -> int:
     """Return ``nid`` if it is a BlockNode, else its nearest BlockNode ancestor.
 
     A buffer is declared on a block, but the LCA of its touchers can be a
@@ -118,12 +122,10 @@ def _enclosing_block(tree: KernelTree, nid: int) -> int:
     lifted next to its tensor_copy under a shared d2 loop). The owning block is
     then the nearest BlockNode at or above that loop.
     """
-    cur = nid
-    while not isinstance(tree.data(cur), BlockNode):
-        parent = tree.parent(cur)
-        assert parent is not None, f"node {nid} has no enclosing BlockNode"
-        cur = parent
-    return cur
+    blocks = (
+        candidate for candidate in reversed((*ancestors[nid], nid)) if isinstance(tree.data(candidate), BlockNode)
+    )
+    return next(blocks)
 
 
 def _gather_buffers(tree: KernelTree) -> dict[str, Buffer]:
@@ -158,16 +160,18 @@ def _touchers_by_tensor(tree: KernelTree) -> dict[str, set[int]]:
     return touchers
 
 
-def _anchor_loop_nids_from_regions(tree: KernelTree, pairs: list[tuple[int, BufferRegion]]) -> frozenset[int]:
+def _anchor_loop_nids_from_regions(
+    tree: KernelTree, pairs: list[tuple[int, BufferRegion]], ancestors: dict[int, tuple[int, ...]]
+) -> frozenset[int]:
     """Return common outer loops that select one reusable buffer instance."""
     anchors: set[int] = set()
     if pairs:
         per_leaf = [
-            {ancestor for ancestor in tree.ancestors(leaf) if isinstance(tree.data(ancestor), ForNode)}
+            {ancestor for ancestor in ancestors[leaf] if isinstance(tree.data(ancestor), ForNode)}
             for leaf, _region in pairs
         ]
         common = set.intersection(*per_leaf)
-        candidates = [nid for nid in tree.ancestors(pairs[0][0]) if nid in common]
+        candidates = [nid for nid in ancestors[pairs[0][0]] if nid in common]
         regions = [region for _leaf, region in pairs]
         for nid in candidates:
             loop_var = tree.loop(nid).loop_var
@@ -204,27 +208,15 @@ def _regions_by_tensor(tree: KernelTree, tensors: frozenset[str]) -> dict[str, l
     return regions
 
 
-def _lca(tree: KernelTree, nids: set[int]) -> int:
+def _lca(nids: set[int], ancestors: dict[int, tuple[int, ...]]) -> int:
     """Lowest common ancestor of ``nids`` (deepest common ancestor).
 
     For a single-element set, returns that element.
     """
     if len(nids) == 1:
         return next(iter(nids))
-    ancestor_sets: list[set[int]] = []
-    for nid in nids:
-        anc = set(tree.ancestors(nid))
-        anc.add(nid)
-        ancestor_sets.append(anc)
-    common = ancestor_sets[0].intersection(*ancestor_sets[1:])
-    lca_nid = tree.root
-    max_depth = -1
-    for candidate in common:
-        depth = len(tree.ancestors(candidate))
-        if depth > max_depth:
-            max_depth = depth
-            lca_nid = candidate
-    return lca_nid
+    paths = [(*ancestors[nid], nid) for nid in nids]
+    return next(level[0] for level in reversed(tuple(zip(*paths))) if len(set(level)) == 1)
 
 
 __all__ = ["buffer_placement_targets", "place_buffer", "place_buffers"]

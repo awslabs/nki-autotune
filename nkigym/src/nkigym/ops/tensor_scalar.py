@@ -16,7 +16,16 @@ from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
 VE_PARTITION_MAX = 128
 VE_FREE_MAX = 512
 
-_OPS: dict[str, Any] = {"multiply": np.multiply, "add": np.add, "subtract": np.subtract}
+_OPS: dict[str, Any] = {
+    "multiply": np.multiply,
+    "add": np.add,
+    "subtract": np.subtract,
+    "minimum": np.minimum,
+    "maximum": np.maximum,
+    "divide": np.divide,
+    "greater_equal": lambda left, right: np.greater_equal(left, right).astype(np.float32),
+    "less": lambda left, right: np.less(left, right).astype(np.float32),
+}
 
 
 class NKITensorScalar(NKIOp):

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
@@ -10,7 +9,8 @@ from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.memset import NKIMemset
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.transpose import NKITranspose
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.search.state_facts import operation_facts
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.canonical_rewrite import (
     canonical_spec,
     finalize_rewrite,
@@ -51,10 +51,16 @@ class TransposeThroughMatmul(Transform[TransposeThroughMatmulOption]):
 
     def analyze(self, ir: KernelIR) -> list[TransposeThroughMatmulOption]:
         """Return every transpose that can commute through a canonical matmul."""
+        if not operation_facts(ir).has_ops(NKITranspose, NKIMatmul, NKIMemset, NKITensorCopy):
+            return []
         options: list[TransposeThroughMatmulOption] = []
-        for block_nid in ir.tree.children(ir.tree.root):
+        root_children = tuple(ir.tree.children(ir.tree.root))
+        for index, block_nid in enumerate(root_children):
+            leaf_nid = single_leaf(ir.tree, block_nid)
+            if leaf_nid is None or ir.tree.isa(leaf_nid).op_cls is not NKITranspose:
+                continue
             option = TransposeThroughMatmulOption(transpose_nid=block_nid)
-            if _match(ir, option) is not None:
+            if _match(ir, option, root_children, index) is not None:
                 options.append(option)
         return options
 
@@ -65,7 +71,7 @@ class TransposeThroughMatmul(Transform[TransposeThroughMatmulOption]):
             raise TransformLegalityError(
                 f"TransposeThroughMatmul target {option.transpose_nid} is not adjacent to an eligible canonical matmul"
             )
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         copied_match = _match(new_ir, option)
         if copied_match is None:
             raise AssertionError("TransposeThroughMatmul match disappeared after deepcopy")
@@ -74,17 +80,23 @@ class TransposeThroughMatmul(Transform[TransposeThroughMatmulOption]):
         return new_ir
 
 
-def _match(ir: KernelIR, option: TransposeThroughMatmulOption) -> _Match | None:
+def _match(
+    ir: KernelIR,
+    option: TransposeThroughMatmulOption,
+    root_children: tuple[int, ...] | None = None,
+    index: int | None = None,
+) -> _Match | None:
     """Return one legal matmul commute."""
     result: _Match | None = None
-    root_children = ir.tree.children(ir.tree.root)
-    if option.transpose_nid in root_children:
-        index = root_children.index(option.transpose_nid)
-        if 3 <= index and index + 1 < len(root_children):
-            memset_block = root_children[index - 3]
-            matmul_block = root_children[index - 2]
-            matmul_drain_block = root_children[index - 1]
-            transpose = match_transpose_chain(ir, option.transpose_nid, root_children[index + 1])
+    children = tuple(ir.tree.children(ir.tree.root)) if root_children is None else root_children
+    if index is None and option.transpose_nid in children:
+        index = children.index(option.transpose_nid)
+    if index is not None:
+        if 3 <= index and index + 1 < len(children):
+            memset_block = children[index - 3]
+            matmul_block = children[index - 2]
+            matmul_drain_block = children[index - 1]
+            transpose = match_transpose_chain(ir, option.transpose_nid, children[index + 1], adjacent=True)
             canonical = all(is_canonical_block(ir, block) for block in (memset_block, matmul_block, matmul_drain_block))
             if transpose is not None and canonical:
                 result = _validate_segment(
@@ -195,7 +207,7 @@ def _validate_segment(
                                 "M": matmul_block_data.axis_map["N"],
                                 "N": matmul_block_data.axis_map["M"],
                             },
-                            {},
+                            matmul.kwargs,
                         )
                         is not None
                     )
@@ -235,6 +247,10 @@ def _validate_segment(
 def _apply_match(ir: KernelIR, match: _Match) -> None:
     """Swap the matmul and consume the following logical transpose."""
     matmul_block = ir.tree.block(match.matmul_block)
+    matmul_leaf = single_leaf(ir.tree, match.matmul_block)
+    if matmul_leaf is None:
+        raise AssertionError("matched matmul block lost its ISA leaf")
+    matmul_kwargs = dict(ir.tree.isa(matmul_leaf).kwargs)
     k_axis = matmul_block.axis_map["K"]
     old_m_axis = matmul_block.axis_map["M"]
     old_n_axis = matmul_block.axis_map["N"]
@@ -249,7 +265,7 @@ def _apply_match(ir: KernelIR, match: _Match) -> None:
         NKIMatmul,
         {"stationary": match.moving, "moving": match.stationary, "dst": match.transpose.psum},
         {"K": k_axis, "M": old_n_axis, "N": old_m_axis},
-        {},
+        matmul_kwargs,
     )
     drain_spec = required_spec(
         ir,

@@ -9,9 +9,12 @@ import inspect
 import textwrap
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 
 from nkigym.ops.base import NKIOp
+
+_DIMENSION_TRACE_LOCK = RLock()
 
 
 @dataclass
@@ -171,12 +174,13 @@ class _TraceState:
 
 def _run_trace(func: Callable[..., Any], args: list[_Sym], state: _TraceState) -> None:
     """Invoke ``func(*args)`` with :meth:`NKIOp.__call__` hooked for analysis."""
-    original = NKIOp.__call__
-    NKIOp.__call__ = _make_hook(state)
-    try:
-        func(*args)
-    finally:
-        NKIOp.__call__ = original
+    with _DIMENSION_TRACE_LOCK:
+        original = NKIOp.__call__
+        NKIOp.__call__ = _make_hook(state)
+        try:
+            func(*args)
+        finally:
+            NKIOp.__call__ = original
 
 
 def _make_hook(state: _TraceState) -> Callable[..., Any]:
@@ -225,6 +229,9 @@ def _trace_compute_op(cls: type[NKIOp], kwargs: dict[str, Any], state: _TraceSta
                 _unify(existing, local[abstract], state, local)
             else:
                 local[abstract] = existing
+    for abstract, size in cls.FIXED_AXIS_SIZES.items():
+        if abstract not in local:
+            local[abstract] = state.fresh_dim(int(kwargs[size]) if isinstance(size, str) else size)
     op_kwargs = {k: v for k, v in kwargs.items() if not isinstance(v, _Sym)}
     record = _OpRecord(op_cls=cls, operand_names=operand_names, axis_map=local, kwargs=op_kwargs)
     state.op_records.append(record)
@@ -259,7 +266,7 @@ def _synthesize_outputs(
     """
     output_slots = [slot for slot in cls.OPERAND_AXES if slot not in cls.INPUT_OPERANDS]
     primary_slot = "reduce_res" if "reduce_res" in cls.OPERAND_AXES else "dst"
-    logical_dtype = input_syms[0].dtype if input_syms else None
+    logical_dtype = cls.OUTPUT_DTYPE or (input_syms[0].dtype if input_syms else None)
     primary_sym: _Sym | None = None
     for slot in output_slots:
         slot_name = name if slot == primary_slot else f"{name}_scratch"

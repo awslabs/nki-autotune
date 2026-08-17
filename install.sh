@@ -35,7 +35,8 @@ if [[ ! -x "$VENV/bin/python" ]]; then
 fi
 
 echo "==> Installing local environment"
-"$VENV/bin/python" -m pip install --only-binary=:all: --extra-index-url "$PIP_INDEX" -e "$ROOT/nkigym" black isort pytest
+"$VENV/bin/python" -m pip install --only-binary=:all: --extra-index-url "$PIP_INDEX" \
+    -e "$ROOT/nkigym" black isort pytest pytest-timeout
 
 install_remote_environment() {
     local remote_host="$1"

@@ -14,6 +14,10 @@ import numpy as np
 
 from nkigym.ops.base import NKIOp, PermutationContract, _operand_role
 
+_MATMUL_DTYPES = frozenset(
+    {"float8_e4m3", "float8_e5m2", "bfloat16", "float16", "tfloat32", "float32", "float8_e4m3fn"}
+)
+
 
 class NKITranspose(NKIOp):
     """Transpose ``data(P, F) -> dst(F, P)`` on Tensor Engine."""
@@ -21,6 +25,8 @@ class NKITranspose(NKIOp):
     NAME: ClassVar[str] = "nc_transpose"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"data": ("P", "F"), "dst": ("F", "P")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data"})
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"data": frozenset({"sbuf"})}
+    INPUT_STORAGE_DTYPES: ClassVar[dict[str, frozenset[str]]] = {"data": _MATMUL_DTYPES}
     """Tensor Engine caps the input at 128×128; Vector Engine at 32×32.
     We target Tensor Engine, so both axes are capped at 128."""
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}

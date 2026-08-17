@@ -8,6 +8,7 @@ online-fused rmsnorm+matmul kernel.
 """
 
 from collections.abc import Mapping
+from math import erf, sqrt
 from numbers import Real
 from typing import Any, ClassVar
 
@@ -16,6 +17,7 @@ import numpy as np
 from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
 
 _ACT_FNS: dict[str, Any] = {
+    "abs": np.abs,
     "square": np.square,
     "exp": np.exp,
     "copy": lambda x: x,
@@ -23,7 +25,14 @@ _ACT_FNS: dict[str, Any] = {
     "tanh": np.tanh,
     "rsqrt": lambda x: 1.0 / np.sqrt(x),
     "sqrt": np.sqrt,
+    "erf": lambda x: np.frompyfunc(erf, 1, 1)(x).astype(np.float32),
+    "gelu": lambda x: 0.5 * x * (1.0 + np.frompyfunc(erf, 1, 1)(x / sqrt(2.0)).astype(np.float32)),
+    "log": np.log,
+    "gelu_apprx_tanh": lambda x: 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * np.power(x, 3)))),
     "gelu_apprx_sigmoid": lambda x: x / (1.0 + np.exp(-1.702 * x)),
+    "silu": lambda x: x / (1.0 + np.exp(-x)),
+    "sigmoid": lambda x: 1.0 / (1.0 + np.exp(-x)),
+    "sign": np.sign,
 }
 
 

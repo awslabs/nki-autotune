@@ -22,6 +22,10 @@ class NKIMatmul(NKIOp):
         "dst": ("M", "N"),
     }
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"stationary", "moving"})
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {
+        "stationary": frozenset({"sbuf"}),
+        "moving": frozenset({"sbuf"}),
+    }
     RMW_OPERANDS: ClassVar[frozenset[str]] = frozenset({"dst"})
     RFACTOR_RECIPE: ClassVar[Literal["rmw", "slot"] | None] = "rmw"
     REDUCE_COMBINATOR: ClassVar[ReduceCombinator | None] = ReduceCombinator(combiner="add", identity=0.0)

@@ -113,8 +113,7 @@ class ProfileMetrics:
 
     def __post_init__(self) -> None:
         """Reject invalid core measurements and copy the raw summary."""
-        required = {"mfu_percent": self.mfu_percent, "latency_ms": self.latency_ms}
-        for name, value in required.items():
+        for name, value in (("mfu_percent", self.mfu_percent), ("latency_ms", self.latency_ms)):
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"profile metric {name!r} must be numeric")
             if not math.isfinite(float(value)) or float(value) < 0:
@@ -124,14 +123,3 @@ class ProfileMetrics:
     def as_dict(self) -> dict[str, float]:
         """Return the stable core measurements."""
         return {"mfu_percent": self.mfu_percent, "latency_ms": self.latency_ms}
-
-
-__all__ = [
-    "BatchProfileJob",
-    "BatchProfileRequest",
-    "InputSpecs",
-    "ProfileConfig",
-    "ProfileMetrics",
-    "ProfileRequest",
-    "ProfileResult",
-]

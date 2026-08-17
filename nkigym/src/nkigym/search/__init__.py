@@ -1,6 +1,21 @@
 """Iterative refinement with caller-supplied policy."""
 
-from nkigym.search.api import run_search
-from nkigym.search.types import Action, Policy, PolicyContext, SearchResult
+from importlib import import_module
 
-__all__ = ["Action", "Policy", "PolicyContext", "SearchResult", "run_search"]
+_EXPORTS = {
+    "Action": ("nkigym.search.types", "Action"),
+    "Policy": ("nkigym.search.types", "Policy"),
+    "PolicyContext": ("nkigym.search.types", "PolicyContext"),
+    "SearchResult": ("nkigym.search.types", "SearchResult"),
+    "run_search": ("nkigym.search.api", "run_search"),
+}
+
+
+def __getattr__(name: str) -> object:
+    """Load one public search symbol without eagerly importing the IR."""
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute = _EXPORTS[name]
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value

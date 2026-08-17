@@ -572,6 +572,9 @@ class NKIOp:
     Literal operands are unaffected.
     """
 
+    INPUT_STORAGE_DTYPES: ClassVar[dict[str, frozenset[str]]] = {}
+    """Accepted physical dtypes for input operands used by storage rewrites."""
+
     INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {}
     """Accepted physical locations for input operands used by storage rewrites.
 
@@ -579,6 +582,16 @@ class NKIOp:
     copy propagation. Runtime role checks remain the authoritative validation
     for direct DSL calls.
     """
+
+    @classmethod
+    def accepts_input_locations(cls, locations: Mapping[str, str]) -> bool:
+        """Return whether the complete input-location assignment is supported."""
+        return all(locations.get(operand) in accepted for operand, accepted in cls.INPUT_LOCATIONS.items())
+
+    @classmethod
+    def accepts_input_storage_dtypes(cls, dtypes: Mapping[str, str]) -> bool:
+        """Return whether the complete input-dtype assignment is supported."""
+        return all(dtypes.get(operand) in accepted for operand, accepted in cls.INPUT_STORAGE_DTYPES.items())
 
     def __init__(self, **kwargs: Any) -> None:
         """Stash constructor kwargs for merging into ``__call__`` kwargs."""
@@ -641,6 +654,12 @@ class NKIOp:
     destination uses a different dtype set the concrete allocation dtype here;
     for example, ``NKIMatmul`` accumulates into fp32 PSUM.
     """
+
+    OUTPUT_DTYPE: ClassVar[str | None] = None
+    """Logical dtype override for operations that explicitly cast their output."""
+
+    FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {}
+    """Abstract output axes whose extents are fixed by the instruction."""
 
     def _check_roles(self, **kwargs: Any) -> None:
         """Per-op role validation. Default: no-op.

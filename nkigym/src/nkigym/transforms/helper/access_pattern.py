@@ -40,11 +40,13 @@ def _pattern_tensors(tree: KernelTree) -> frozenset[str]:
 
 def subtree_has_access_patterns(tree: KernelTree, nid: int) -> bool:
     """Return whether ``nid`` or one of its descendants uses an access pattern."""
-    results = _SUBTREE_RESULTS.setdefault(tree, {})
-    result = results.get(nid)
+    pattern_nodes = _pattern_nodes(tree)
+    if not pattern_nodes:
+        return False
+    result = _SUBTREE_RESULTS.setdefault(tree, {}).get(nid)
     if result is None:
-        result = bool(({nid} | tree.descendants(nid)) & _pattern_nodes(tree))
-        results[nid] = result
+        result = bool(({nid} | tree.descendants(nid)) & pattern_nodes)
+        _SUBTREE_RESULTS[tree][nid] = result
     return result
 
 

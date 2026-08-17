@@ -20,12 +20,12 @@ def parse_request(payload: object) -> ProfileRequest:
     """Validate one request decoded from JSON."""
     if not isinstance(payload, dict):
         raise ValueError("profile request must be a JSON object")
-    func_name = _required_string(payload, "func_name")
-    input_specs = _parse_input_specs(payload.get("input_specs"))
-    neuronx_cc_args = _string_tuple(payload.get("neuronx_cc_args"), "neuronx_cc_args")
-    lnc = _required_integer(payload, "lnc")
-    config = ProfileConfig(input_specs=input_specs, neuronx_cc_args=neuronx_cc_args, lnc=lnc)
-    return ProfileRequest(func_name=func_name, config=config)
+    config = ProfileConfig(
+        input_specs=_parse_input_specs(payload.get("input_specs")),
+        neuronx_cc_args=_string_tuple(payload.get("neuronx_cc_args"), "neuronx_cc_args"),
+        lnc=_required_integer(payload, "lnc"),
+    )
+    return ProfileRequest(func_name=_required_string(payload, "func_name"), config=config)
 
 
 def batch_request_payload(request: BatchProfileRequest) -> dict[str, object]:
@@ -45,21 +45,13 @@ def parse_batch_request(payload: object) -> BatchProfileRequest:
     for raw_job in raw_jobs:
         if not isinstance(raw_job, dict):
             raise ValueError("batch profile jobs must be objects")
-        label = _required_string(raw_job, "label")
-        jobs.append(BatchProfileJob(label=label, request=parse_request(raw_job)))
-    max_workers = _required_integer(payload, "max_workers")
-    return BatchProfileRequest(jobs=tuple(jobs), max_workers=max_workers)
+        jobs.append(BatchProfileJob(label=_required_string(raw_job, "label"), request=parse_request(raw_job)))
+    return BatchProfileRequest(jobs=tuple(jobs), max_workers=_required_integer(payload, "max_workers"))
 
 
 def result_payload(result: ProfileResult) -> dict[str, object]:
     """Serialize one worker result to JSON-compatible values."""
-    return {
-        "profiler_summary": result.profiler_summary,
-        "error": result.error,
-        "elapsed_s": result.elapsed_s,
-        "compile_s": result.compile_s,
-        "profile_s": result.profile_s,
-    }
+    return vars(result).copy()
 
 
 def parse_result(payload: object) -> ProfileResult:
@@ -72,12 +64,12 @@ def parse_result(payload: object) -> ProfileResult:
     error = payload.get("error")
     if error is not None and not isinstance(error, str):
         raise ValueError("error must be a string or null")
-    elapsed_s = _non_negative_float(payload.get("elapsed_s"), "elapsed_s")
-    compile_s = _non_negative_float(payload.get("compile_s", 0.0), "compile_s")
-    profile_s = _non_negative_float(payload.get("profile_s", 0.0), "profile_s")
-    typed_summary = dict(summary) if summary is not None else None
     return ProfileResult(
-        profiler_summary=typed_summary, error=error, elapsed_s=elapsed_s, compile_s=compile_s, profile_s=profile_s
+        profiler_summary=dict(summary) if summary is not None else None,
+        error=error,
+        elapsed_s=_non_negative_float(payload.get("elapsed_s"), "elapsed_s"),
+        compile_s=_non_negative_float(payload.get("compile_s", 0.0), "compile_s"),
+        profile_s=_non_negative_float(payload.get("profile_s", 0.0), "profile_s"),
     )
 
 
@@ -90,17 +82,15 @@ def parse_batch_result(payload: object) -> tuple[float, int, tuple[str, ...]]:
     """Validate remote batch timing and completed label order."""
     if not isinstance(payload, dict):
         raise ValueError("batch profile result must be a JSON object")
-    elapsed_s = _non_negative_float(payload.get("elapsed_s"), "elapsed_s")
     workers = _required_integer(payload, "workers")
     raw_labels = payload.get("labels")
     if not isinstance(raw_labels, list) or not all(isinstance(label, str) for label in raw_labels):
         raise ValueError("batch profile result labels must be an array of strings")
-    labels = tuple(raw_labels)
     if workers <= 0:
         raise ValueError("batch profile result workers must be positive")
-    if len(labels) != len(set(labels)):
+    if len(raw_labels) != len(set(raw_labels)):
         raise ValueError("batch profile result labels must be unique")
-    return elapsed_s, workers, labels
+    return _non_negative_float(payload.get("elapsed_s"), "elapsed_s"), workers, tuple(raw_labels)
 
 
 def _required_string(payload: dict[object, object], field: str) -> str:
@@ -128,11 +118,10 @@ def _non_negative_float(value: object, field: str) -> float:
 
 def _positive_integer_tuple(value: object, field: str) -> tuple[int, ...]:
     """Validate a non-empty array of positive integers."""
-    if not isinstance(value, list) or not value:
+    items = value if isinstance(value, list) else []
+    if not items or not all(isinstance(item, int) and not isinstance(item, bool) and item > 0 for item in items):
         raise ValueError(f"{field} must be a non-empty array of positive integers")
-    if not all(isinstance(item, int) and not isinstance(item, bool) and item > 0 for item in value):
-        raise ValueError(f"{field} must be a non-empty array of positive integers")
-    return tuple(value)
+    return tuple(items)
 
 
 def _string_tuple(value: object, field: str) -> tuple[str, ...]:
@@ -150,19 +139,8 @@ def _parse_input_specs(value: object) -> dict[str, tuple[tuple[int, ...], str]]:
     for name, raw_spec in value.items():
         if not isinstance(name, str) or not isinstance(raw_spec, dict):
             raise ValueError("input_specs must map names to objects")
-        shape = _positive_integer_tuple(raw_spec.get("shape"), f"input_specs.{name}.shape")
-        dtype = _required_string(raw_spec, "dtype")
-        specs[name] = (shape, dtype)
+        specs[name] = (
+            _positive_integer_tuple(raw_spec.get("shape"), f"input_specs.{name}.shape"),
+            _required_string(raw_spec, "dtype"),
+        )
     return specs
-
-
-__all__ = [
-    "batch_request_payload",
-    "batch_result_payload",
-    "parse_batch_request",
-    "parse_batch_result",
-    "parse_request",
-    "parse_result",
-    "request_payload",
-    "result_payload",
-]

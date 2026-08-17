@@ -16,13 +16,34 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Add, Const, Expr, Mod, Mul, Var, _format_raw, format_expr, substitute, to_affine
 from nkigym.ir.tree import AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 
 _INDENT = "    "
+
+
+class _RenderIR:
+    """Read-only IR view with one buffer snapshot for source emission."""
+
+    def __init__(self, ir: KernelIR) -> None:
+        """Snapshot buffers after all schedule transformations are complete."""
+        self.ir = ir
+        self.buffers = ir.all_buffers()
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate immutable schedule metadata to the source IR."""
+        return getattr(self.ir, name)
+
+    def all_buffers(self) -> dict[str, Buffer]:
+        """Return the render-local buffer map."""
+        return self.buffers
+
+    def buffer(self, name: str) -> Buffer:
+        """Resolve one buffer from the render-local map."""
+        return self.buffers[name]
 
 
 def emit_body(ir: KernelIR) -> str:
@@ -43,6 +64,7 @@ def emit_body(ir: KernelIR) -> str:
     each child, the declarations anchored to that child.
     """
     code: list[str] = []
+    ir = cast(KernelIR, _RenderIR(ir))
     pipeline_map = _pipeline_loops(ir)
     emit_before = _alloc_emit_anchors(ir)
     _emit_block(
@@ -74,6 +96,8 @@ def _alloc_emit_anchors(ir: KernelIR) -> dict[int, list[Buffer]]:
         for loop_nid, annotation in _pipeline_loops(ir).items()
         for name in annotation["versioned_buffers"]
     }
+    ancestors = _ancestor_index(ir.tree)
+    owners = {buffer.name: nid for nid in ir.tree.blocks() for buffer in ir.tree.block(nid).alloc_buffers}
     leaves_by_tensor: dict[str, list[int]] = {}
     for nid in ir.tree.preorder():
         data = ir.tree.data(nid)
@@ -86,18 +110,36 @@ def _alloc_emit_anchors(ir: KernelIR) -> dict[int, list[Buffer]]:
             continue
         leaves = leaves_by_tensor.get(name)
         assert leaves, f"buffer {name!r} is declared but touched by no ISA leaf"
-        scope = ir.tree.root if buf.location == "shared_hbm" else _hoisted_scope(ir.tree, name, leaves)
+        scope = (
+            ir.tree.root
+            if buf.location == "shared_hbm"
+            else _hoisted_scope(ir.tree, name, leaves, owners[name], ancestors)
+        )
         version_loop = version_loops.get(name)
-        if version_loop is not None and (scope == version_loop or version_loop in ir.tree.ancestors(scope)):
+        if version_loop is not None and (scope == version_loop or version_loop in ancestors[scope]):
             parent = ir.tree.parent(version_loop)
             assert parent is not None, f"pipeline loop {version_loop} has no declaration scope"
             scope = parent
-        anchor = _anchor_child(ir.tree, scope, leaves)
+        anchor = _anchor_child(ir.tree, scope, leaves, ancestors)
         out.setdefault(anchor, []).append(buf)
     return out
 
 
-def _anchor_child(tree: KernelTree, scope: int, leaves: list[int]) -> int:
+def _ancestor_index(tree: KernelTree) -> dict[int, tuple[int, ...]]:
+    """Return root-first ancestor chains from one tree traversal."""
+    result: dict[int, tuple[int, ...]] = {tree.root: ()}
+    pending = [tree.root]
+    while pending:
+        parent = pending.pop()
+        child_ancestors = (*result[parent], parent)
+        children = tree.children(parent)
+        for child in children:
+            result[child] = child_ancestors
+        pending.extend(reversed(children))
+    return result
+
+
+def _anchor_child(tree: KernelTree, scope: int, leaves: list[int], ancestors: dict[int, tuple[int, ...]]) -> int:
     """Return the node to emit a buffer's declaration before.
 
     When ``scope`` is an ISA leaf (lone toucher), the buffer anchors to that leaf.
@@ -106,15 +148,17 @@ def _anchor_child(tree: KernelTree, scope: int, leaves: list[int]) -> int:
     """
     if isinstance(tree.data(scope), ISANode):
         return scope
-    touch = set(leaves)
-    for child in tree.children(scope):
-        subtree = {child, *tree.descendants(child)}
-        if subtree & touch:
-            return child
-    raise AssertionError(f"scope {scope} has no child whose subtree touches the buffer")
+    positions = {child: index for index, child in enumerate(tree.children(scope))}
+    direct_children: list[int] = []
+    for leaf in leaves:
+        path = (*ancestors[leaf], leaf)
+        if scope not in path:
+            raise AssertionError(f"scope {scope} does not enclose touching leaf {leaf}")
+        direct_children.append(path[path.index(scope) + 1])
+    return min(direct_children, key=positions.__getitem__)
 
 
-def _lca_nodes(tree: KernelTree, nids: list[int]) -> int:
+def _lca_nodes(tree: KernelTree, nids: list[int], ancestors: dict[int, tuple[int, ...]]) -> int:
     """Lowest common ancestor of ``nids`` — the deepest node on every root->nid path.
 
     Each node's path is its ancestors (root-first) plus itself; the LCA is the
@@ -123,7 +167,7 @@ def _lca_nodes(tree: KernelTree, nids: list[int]) -> int:
     unique = set(nids)
     if len(unique) == 1:
         return next(iter(unique))
-    paths = [[*tree.ancestors(nid), nid] for nid in unique]
+    paths = [[*ancestors[nid], nid] for nid in unique]
     lca = tree.root
     for level in zip(*paths):
         if len(set(level)) == 1:
@@ -152,17 +196,9 @@ def _carried_loop_vars(tree: KernelTree, name: str, leaves: list[int]) -> set[st
     return carried
 
 
-def _owning_block(tree: KernelTree, name: str) -> int:
-    """Return the block whose ``alloc_buffers`` entry materializes ``name``."""
-    for nid in tree.blocks():
-        block = tree.data(nid)
-        assert isinstance(block, BlockNode)
-        if any(buf.name == name for buf in block.alloc_buffers):
-            return nid
-    raise AssertionError(f"buffer {name!r} is declared by no block")
-
-
-def _hoisted_scope(tree: KernelTree, name: str, leaves: list[int]) -> int:
+def _hoisted_scope(
+    tree: KernelTree, name: str, leaves: list[int], owner: int, ancestors: dict[int, tuple[int, ...]]
+) -> int:
     """Find the tightest declaration scope consistent with placement and offsets.
 
     The owning block is a material placement boundary. The renderer may tighten
@@ -172,9 +208,8 @@ def _hoisted_scope(tree: KernelTree, name: str, leaves: list[int]) -> int:
     loop carries the allocation across that loop, so the scope rises above the
     outermost such loop.
     """
-    lca = _lca_nodes(tree, leaves)
-    owner = _owning_block(tree, name)
-    chain = [*tree.ancestors(lca), lca]
+    lca = _lca_nodes(tree, leaves, ancestors)
+    chain = [*ancestors[lca], lca]
     if owner in chain:
         owner_index = chain.index(owner)
         local_chain = chain[owner_index + 1 :]
@@ -463,7 +498,7 @@ def _emit_alloc(buf: Buffer) -> str:
         shape = str(buf.physical_shape())
         result = f"{buf.name} = nl.ndarray({shape}, dtype=nl.{buf.physical_dtype()}, buffer=nl.{buf.location})"
     else:
-        shape = "(" + ", ".join(str(s) for s in buf.per_tile_physical_shape()) + ")"
+        shape = str(tuple(buf.per_tile_physical_shape()))
         result = (
             f"{buf.name} = [nl.ndarray({shape}, dtype=nl.{buf.physical_dtype()}, "
             f"buffer=nl.{buf.location}) for _ in range({buf.list_len})]"
@@ -504,35 +539,56 @@ def _emit_isa_call(node: ISANode, ir: KernelIR, rotations: dict[str, Expr], subs
                     )
             buf = ir.buffer(region.tensor)
             rotation = rotations.get(region.tensor)
+            if slice_specs := getattr(op_cls, "INPUT_SLICES", {}).get(slot, ()):
+                for axis, start_key, width_key, *alignment in slice_specs:
+                    start, width = int(node.kwargs[start_key]), int(node.kwargs[width_key])
+                    if alignment:
+                        (output_slot,) = cast(tuple[str], tuple(alignment))
+                        output = _substituted_region(node.operand_bindings[output_slot], substitutions)
+                        region = region.with_partition_aligned_slice(axis, start, width, output)
+                    else:
+                        region = region.with_partition_aligned_slice(axis, start, width)
             if access_pattern is None:
                 rendered = render_buffer_region(region, buf, rotation)
             else:
                 rendered = render_access_pattern(region.tensor, access_pattern, buf, rotation)
             parts.append(f"{slot}={rendered}")
+    internal_kwargs = getattr(op_cls, "CODEGEN_ONLY_KWARGS", frozenset())
     for k, v in node.kwargs.items():
-        parts.append(f"{k}={_render_kwarg(k, v)}")
+        if k not in internal_kwargs:
+            parts.append(f"{k}={_render_kwarg(k, v)}")
     return f"nisa.{op_cls.NAME}({', '.join(parts)})"
 
 
 def _emit_indirect_dma(node: ISANode, ir: KernelIR, rotations: dict[str, Expr], substitutions: dict[str, Expr]) -> str:
-    """Render one row gather or scatter with an SBUF vector offset."""
+    """Render one row gather or scatter with an SBUF offset."""
     regions = {slot: _substituted_region(region, substitutions) for slot, region in node.operand_bindings.items()}
     source = regions["src"]
     indices = regions["indices"]
     destination = regions["dst"]
-    data_region = destination if node.op_cls.INDIRECT_DMA_MODE == "gather" else source
-    hbm_region = source if node.op_cls.INDIRECT_DMA_MODE == "gather" else destination
+    mode = node.op_cls.INDIRECT_DMA_MODE
+    gather = mode in {"gather", "scalar_gather"}
+    data_region = destination if gather else source
+    hbm_region = source if gather else destination
     partition = _constant_width(data_region, 0)
     free = _constant_width(data_region, 1)
-    free_lower = format_expr(hbm_region.ranges[1][0])
+    free_lower: Expr = hbm_region.ranges[1][0]
     hbm_buffer = ir.buffer(hbm_region.tensor)
     index_text = render_buffer_region(indices, ir.buffer(indices.tensor), rotations.get(indices.tensor))
     data_text = render_buffer_region(data_region, ir.buffer(data_region.tensor), rotations.get(data_region.tensor))
+    row_stride = hbm_buffer.shape[1]
+    if mode == "scalar_gather":
+        row_lower = data_region.ranges[0][0]
+        if ir.buffer(data_region.tensor).shape[0] > partition:
+            row_lower = Mul(left=row_lower, right=Const(value=partition))
+        free_lower = Add(left=Mul(left=row_lower, right=Const(value=free)), right=free_lower)
+        row_stride = free
+    offset_kind = "scalar_offset" if mode == "scalar_gather" else "vector_offset"
     indirect = (
-        f"{hbm_region.tensor}.ap(pattern=[[{hbm_buffer.shape[1]}, {partition}], [1, {free}]], "
-        f"offset={free_lower}, vector_offset={index_text}, indirect_dim=0)"
+        f"{hbm_region.tensor}.ap(pattern=[[{row_stride}, {partition}], [1, {free}]], "
+        f"offset={format_expr(free_lower)}, {offset_kind}={index_text}, indirect_dim=0)"
     )
-    if node.op_cls.INDIRECT_DMA_MODE == "gather":
+    if gather:
         operands = f"src={indirect}, dst={data_text}"
     else:
         operands = f"src={data_text}, dst={indirect}"
@@ -559,7 +615,7 @@ def _constant_width(region: BufferRegion, axis: int) -> int:
     return width.value
 
 
-_NL_OP_KWARGS = frozenset({"op", "op0", "op1", "reduce_op"})
+_NL_OP_KWARGS = frozenset({"comp_op0", "comp_op1", "dtype", "op", "op0", "op1", "reduce_op"})
 """ISA kwargs whose string value names an ``nl`` math operator. ``nisa`` ALU
 ops (``tensor_tensor``, ``tensor_scalar``, ``activation``, ``tensor_reduce``)
 take the operator as an ``nl`` reference (e.g. ``op=nl.add``), not a bare
@@ -569,6 +625,7 @@ via ``repr`` (e.g. memset's ``value=0.0``)."""
 
 def _render_kwarg(key: str, value: Any) -> str:
     """Render one ISA kwarg value, mapping ALU-operator names to ``nl.<name>``."""
+    value = "maximum" if key == "reduce_op" and value == "max" else value
     if key in _NL_OP_KWARGS and isinstance(value, str):
         rendered = f"nl.{value}"
     elif isinstance(value, float) and math.isinf(value):

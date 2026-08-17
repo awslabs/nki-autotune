@@ -69,6 +69,7 @@ class IterativeRefinement:
 
             context = PolicyContext(
                 state=state,
+                transforms=self.transforms,
                 legal_actions=legal_actions,
                 evaluations=tuple(evaluations),
                 max_transforms=self.config.max_transforms_per_evaluation,

@@ -18,7 +18,7 @@ class NKILoad(NKIOp):
     ``src.size == dst.size`` and partition-dim validation. Only the
     partition axis is capped by the NeuronCore's 128-partition SBUF
     layout; the free axis is unbounded."""
-    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 1}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_ROLE: ClassVar[str] = "sbuf"
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
@@ -32,8 +32,8 @@ class NKILoad(NKIOp):
     def _check_roles(self, **kwargs: Any) -> None:
         """``src`` must be HBM-resident (``param``)."""
         role = _operand_role(kwargs["src"])
-        if role is not None and role != "param":
-            raise TypeError(f"NKILoad(src=<role={role}>) expects HBM param; did you forget to load?")
+        if role is not None and role not in {"param", "shared_hbm", "stored"}:
+            raise TypeError(f"NKILoad(src=<role={role}>) expects an HBM tensor")
 
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: allocate and return a copy of ``src``."""

@@ -14,12 +14,14 @@ _PUBLIC_TRANSFORMS = (
     ("common_subexpression_elimination", "CommonSubexpressionElimination"),
     ("copy_propagation", "CopyPropagation"),
     ("decompose_broadcast_subtract", "DecomposeBroadcastSubtract"),
+    ("eliminate_dead_producer", "EliminateDeadProducer"),
     ("eliminate_identity_initializer", "EliminateIdentityInitializer"),
     ("fuse", "Fuse"),
     ("fuse_pointwise", "FusePointwise"),
     ("online_fusion", "OnlineFusion"),
     ("reorder", "Reorder"),
     ("rfactor", "RFactor"),
+    ("set_first_write_overwrite", "SetFirstWriteOverwrite"),
     ("software_pipeline", "SoftwarePipeline"),
     ("split", "Split"),
     ("transpose_pair", "TransposePair"),
@@ -45,6 +47,8 @@ _EXPORT_MODULES = {
     "CopyPropagationOption": "copy_propagation",
     "DecomposeBroadcastSubtract": "decompose_broadcast_subtract",
     "DecomposeBroadcastSubtractOption": "decompose_broadcast_subtract",
+    "EliminateDeadProducer": "eliminate_dead_producer",
+    "EliminateDeadProducerOption": "eliminate_dead_producer",
     "EliminateIdentityInitializer": "eliminate_identity_initializer",
     "EliminateIdentityInitializerOption": "eliminate_identity_initializer",
     "Fuse": "fuse",
@@ -58,6 +62,8 @@ _EXPORT_MODULES = {
     "ReorderOption": "reorder",
     "RFactor": "rfactor",
     "RFactorOption": "rfactor",
+    "SetFirstWriteOverwrite": "set_first_write_overwrite",
+    "SetFirstWriteOverwriteOption": "set_first_write_overwrite",
     "SoftwarePipeline": "software_pipeline",
     "SoftwarePipelineOption": "software_pipeline",
     "Split": "split",
@@ -89,6 +95,8 @@ CopyPropagation: type[Transform[Any]]
 CopyPropagationOption: type[TransformOption]
 DecomposeBroadcastSubtract: type[Transform[Any]]
 DecomposeBroadcastSubtractOption: type[TransformOption]
+EliminateDeadProducer: type[Transform[Any]]
+EliminateDeadProducerOption: type[TransformOption]
 EliminateIdentityInitializer: type[Transform[Any]]
 EliminateIdentityInitializerOption: type[TransformOption]
 Fuse: type[Transform[Any]]
@@ -103,6 +111,8 @@ Reorder: type[Transform[Any]]
 ReorderOption: type[TransformOption]
 RFactor: type[Transform[Any]]
 RFactorOption: type[TransformOption]
+SetFirstWriteOverwrite: type[Transform[Any]]
+SetFirstWriteOverwriteOption: type[TransformOption]
 SoftwarePipeline: type[Transform[Any]]
 SoftwarePipelineOption: type[TransformOption]
 Split: type[Transform[Any]]
@@ -167,6 +177,8 @@ __all__ = [
     "CopyPropagationOption",
     "DecomposeBroadcastSubtract",
     "DecomposeBroadcastSubtractOption",
+    "EliminateDeadProducer",
+    "EliminateDeadProducerOption",
     "EliminateIdentityInitializer",
     "EliminateIdentityInitializerOption",
     "Fuse",
@@ -181,6 +193,8 @@ __all__ = [
     "ReorderOption",
     "RFactor",
     "RFactorOption",
+    "SetFirstWriteOverwrite",
+    "SetFirstWriteOverwriteOption",
     "SoftwarePipeline",
     "SoftwarePipelineOption",
     "Split",

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
@@ -11,7 +10,15 @@ from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.base import PointwiseContract
 from nkigym.ops.tensor_scalar import NKITensorScalar
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.search.state_facts import operation_facts
+from nkigym.transforms.base import (
+    Transform,
+    TransformLegalityError,
+    TransformOption,
+    copy_for_rewrite,
+    intersects_software_pipeline,
+    software_pipeline_overlap_nodes,
+)
 from nkigym.transforms.helper.canonical_rewrite import append_root_buffers, finalize_rewrite, fresh_name, single_leaf
 from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
@@ -39,12 +46,15 @@ class DecomposeBroadcastSubtract(Transform[DecomposeBroadcastSubtractOption]):
 
     def analyze(self, ir: KernelIR) -> list[DecomposeBroadcastSubtractOption]:
         """Return supported broadcast subtractions."""
+        if "subtract" not in operation_facts(ir).pointwise_operators:
+            return []
         options: list[DecomposeBroadcastSubtractOption] = []
+        overlap_nodes = software_pipeline_overlap_nodes(ir)
         for block_nid in ir.tree.blocks():
             if block_nid == ir.tree.root:
                 continue
             option = DecomposeBroadcastSubtractOption(pointwise_block_nid=block_nid)
-            if _resolve(ir, option) is not None:
+            if _resolve(ir, option, overlap_nodes) is not None:
                 options.append(option)
         return options
 
@@ -53,7 +63,7 @@ class DecomposeBroadcastSubtract(Transform[DecomposeBroadcastSubtractOption]):
         match = _resolve(ir, option)
         if match is None:
             raise TransformLegalityError(f"illegal DecomposeBroadcastSubtract option: {option}")
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         copied_match = _resolve(new_ir, option)
         if copied_match is None:
             raise AssertionError(f"DecomposeBroadcastSubtract option disappeared after deepcopy: {option}")
@@ -61,7 +71,9 @@ class DecomposeBroadcastSubtract(Transform[DecomposeBroadcastSubtractOption]):
         return new_ir
 
 
-def _resolve(ir: KernelIR, option: DecomposeBroadcastSubtractOption) -> _Match | None:
+def _resolve(
+    ir: KernelIR, option: DecomposeBroadcastSubtractOption, overlap_nodes: frozenset[int] | None = None
+) -> _Match | None:
     """Resolve one canonical tensor-scalar subtraction."""
     result: _Match | None = None
     block_nid = option.pointwise_block_nid
@@ -69,6 +81,7 @@ def _resolve(ir: KernelIR, option: DecomposeBroadcastSubtractOption) -> _Match |
         block_nid in ir.tree.graph
         and ir.tree.parent(block_nid) is not None
         and isinstance(ir.tree.data(block_nid), BlockNode)
+        and not intersects_software_pipeline(ir, (block_nid,), overlap_nodes)
     ):
         leaf_nid = single_leaf(ir.tree, block_nid)
         if leaf_nid is not None:

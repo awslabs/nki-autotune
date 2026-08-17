@@ -44,6 +44,8 @@ class NKIActivationReduce(NKIOp):
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     PREFERRED_TILE_SIZE: ClassVar[dict[str, int]] = {"F": 512}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+    SUPPORTED_MAP_OPERATORS: ClassVar[frozenset[str]] = frozenset(_ACT_FNS)
+    SUPPORTED_REDUCERS: ClassVar[frozenset[str]] = frozenset(_RED_FNS)
 
     @classmethod
     def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> ReductionContract:

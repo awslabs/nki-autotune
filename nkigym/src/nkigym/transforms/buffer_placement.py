@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 
 from nkigym.ir import KernelIR
-from nkigym.ir.buffer_placement import buffer_placement_targets, place_buffer
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, KernelTree
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.search.buffer_placement import buffer_placement_targets, place_buffer
+from nkigym.search.serialization import inherit_analysis_result
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.access_pattern import tensor_has_access_pattern
 
 
@@ -40,9 +40,10 @@ class BufferPlacement(Transform[BufferPlacementOption]):
     def apply(self, ir: KernelIR, option: BufferPlacementOption) -> KernelIR:
         """Re-check legality, move one declaration on a deep copy, and rebuild dependencies."""
         self._check_legality(ir, option)
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         place_buffer(new_ir.tree, option.tensor)
         new_ir.dependency = Dependency(new_ir.tree)
+        inherit_analysis_result(ir, new_ir, "code-motion")
         return new_ir
 
     def _check_legality(self, ir: KernelIR, option: BufferPlacementOption) -> None:

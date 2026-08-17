@@ -14,27 +14,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from nkigym.ir.intern import InternedValue
+
 
 class NonAffineError(ValueError):
     """Raised when ``to_affine`` encounters a pattern that is not affine in Vars."""
 
 
 @dataclass(frozen=True, kw_only=True)
-class Const:
+class Const(InternedValue):
     """Integer literal."""
 
     value: int
 
 
 @dataclass(frozen=True, kw_only=True)
-class Var:
+class Var(InternedValue):
     """Symbolic variable identified by ``name``."""
 
     name: str
 
 
 @dataclass(frozen=True, kw_only=True)
-class Add:
+class Add(InternedValue):
     """Binary addition."""
 
     left: "Expr"
@@ -42,7 +44,7 @@ class Add:
 
 
 @dataclass(frozen=True, kw_only=True)
-class Mul:
+class Mul(InternedValue):
     """Binary multiplication. At most one operand may contain a Var (affinity)."""
 
     left: "Expr"
@@ -50,7 +52,7 @@ class Mul:
 
 
 @dataclass(frozen=True, kw_only=True)
-class FloorDiv:
+class FloorDiv(InternedValue):
     """Floor division. ``right`` must reduce to a non-zero ``Const`` for affinity."""
 
     left: "Expr"
@@ -58,7 +60,7 @@ class FloorDiv:
 
 
 @dataclass(frozen=True, kw_only=True)
-class Mod:
+class Mod(InternedValue):
     """Modulo. ``right`` must reduce to a non-zero ``Const`` for affinity."""
 
     left: "Expr"
@@ -66,7 +68,7 @@ class Mod:
 
 
 @dataclass(frozen=True, kw_only=True)
-class Sub:
+class Sub(InternedValue):
     """Binary subtraction."""
 
     left: "Expr"
@@ -74,7 +76,7 @@ class Sub:
 
 
 @dataclass(frozen=True, kw_only=True)
-class Min:
+class Min(InternedValue):
     """Binary minimum."""
 
     left: "Expr"
@@ -82,7 +84,7 @@ class Min:
 
 
 @dataclass(frozen=True, kw_only=True)
-class Max:
+class Max(InternedValue):
     """Binary maximum."""
 
     left: "Expr"
@@ -90,7 +92,7 @@ class Max:
 
 
 @dataclass(frozen=True, kw_only=True)
-class LT:
+class LT(InternedValue):
     """Predicate ``left < right``."""
 
     left: "Expr"
@@ -98,7 +100,7 @@ class LT:
 
 
 @dataclass(frozen=True, kw_only=True)
-class LE:
+class LE(InternedValue):
     """Predicate ``left <= right``."""
 
     left: "Expr"
@@ -106,7 +108,7 @@ class LE:
 
 
 @dataclass(frozen=True, kw_only=True)
-class EQ:
+class EQ(InternedValue):
     """Predicate ``left == right``."""
 
     left: "Expr"

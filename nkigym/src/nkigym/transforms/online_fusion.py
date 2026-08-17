@@ -7,41 +7,30 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import cast
 
-from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Const, Expr, Mul, Var, substitute, to_affine
-from nkigym.ir.recurrence import (
-    _build_match,
-    _compatible_block,
-    _Deferred,
-    _evaluate,
-    _Match,
-    _Stage,
-    _substitute_region,
+from nkigym.codegen.recurrence import (
+    _access_regions,
+    _derive,
+    _emit_copy,
+    _emit_initializer,
+    _Lowering,
+    _Plan,
+    _plan_buffers,
+    _recurrence_buffers,
+    _stage_region,
+    _stage_regions,
 )
+from nkigym.ir import KernelIR
+from nkigym.ir.arith.expr import Const, Expr, Mul, Var, to_affine
+from nkigym.ir.recurrence import _build_match, _compatible_block, _evaluate, _Match, _Stage
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.base import AxisRole, BilinearReductionContract, ReductionContract
-from nkigym.ops.base import _recurrence_factor_states as _factor_states
-from nkigym.ops.load import NKILoad
 from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_scalar import NKITensorScalar
 from nkigym.ops.tensor_scalar_reduce import NKITensorScalarReduce
-from nkigym.synthesis.recurrence import (
-    _access_regions,
-    _compile_factor,
-    _contribution_leaf,
-    _derive,
-    _emit_copy,
-    _emit_initializer,
-    _localized_buffers,
-    _Lowering,
-    _Plan,
-    _plan_buffers,
-    _stage_region,
-    _stage_regions,
-)
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.search.state_facts import operation_facts
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.canonical_rewrite import block_chain, finalize_rewrite, owning_block
 from nkigym.transforms.helper.operation_builder import NameSupply, OperationBuilder, OperationScope
 from nkigym.transforms.helper.value_graph import ValueGraph, build_value_graph, contract_input_operands
@@ -95,7 +84,7 @@ def _detect_matches(ir: KernelIR, complete: bool) -> list[_Match]:
         if len(evaluation.stages) < 2:
             continue
         maximal = _build_match(ir, graph, axis, evaluation)
-        if maximal is None:
+        if maximal is None or maximal.deferred_factor is not None:
             continue
         selected = maximal
         if not complete and len(maximal.stages) > 2:
@@ -164,35 +153,6 @@ def _mapped(match: _Match, ir: KernelIR) -> bool:
     """Return whether any recurrence state spans partition tiles."""
     names = [stage.state_tensor for stage in match.stages[:-1]] + [match.external_outputs[0]]
     return any((ir.buffer(name).shape[0] > PARTITION_DIM for name in names))
-
-
-def _scope_carrier(tree: KernelTree, scope: OperationScope) -> tuple[int, int, dict[str, Expr]]:
-    """Clone one mapped scope with fresh loop variables."""
-    used = {item.loop_var for nid in tree.graph if isinstance((item := tree.data(nid)), ForNode)}
-    substitutions: dict[str, Expr] = {}
-    loops: list[ForNode] = []
-    for loop in scope.loops:
-        stem = f"{loop.loop_var}_online_epilogue"
-        name = stem
-        suffix = 1
-        while name in used:
-            name = f"{stem}_{suffix}"
-            suffix += 1
-        used.add(name)
-        substitutions[loop.loop_var] = Var(name=name)
-        loops.append(replace(loop, loop_var=name))
-    block = replace(
-        scope.block,
-        iter_values=tuple((substitute(value, substitutions) for value in scope.block.iter_values)),
-        reads=(),
-        writes=(),
-        alloc_buffers=(),
-    )
-    root = tree.add_node(block)
-    parent = root
-    for loop in loops:
-        parent = tree.add_node(loop, parent=parent)
-    return (root, parent, substitutions)
 
 
 def _region_shape(region: BufferRegion) -> tuple[int, ...]:
@@ -373,7 +333,7 @@ def _group_scopes(
 
 def _can_lower(ir: KernelIR, match: _Match, chunk_size: int, prefix: bool = False) -> bool:
     """Return whether ordinary-IR lowering supports one option."""
-    valid = chunk_size in match.chunk_sizes and len(match.external_outputs) == 1
+    valid = chunk_size in match.chunk_sizes and len(match.external_outputs) == 1 and match.deferred_factor is None
     valid = valid and bool(match.absorbed_blocks)
     valid = valid and all((ir.tree.parent(block) == ir.tree.root for block in match.absorbed_blocks))
     if prefix:
@@ -408,6 +368,23 @@ def _can_lower(ir: KernelIR, match: _Match, chunk_size: int, prefix: bool = Fals
         scopes = tuple((_stage_scope(ir, graph, stage, match.progress_axis) for stage in match.stages))
         valid = _group_scopes(ir, match, graph, scopes) is not None
     return valid and _root_insertion(ir, match) is not None
+
+
+def _preserved_chunk_size(ir: KernelIR, match: _Match) -> int | None:
+    """Return the chain's existing common tile width on the progress axis."""
+    sizes: set[int] = set()
+    for nid in match.derivation_leaves:
+        leaf = ir.tree.isa(nid)
+        block = ir.tree.block(owning_block(ir.tree, nid))
+        for slot, region in leaf.operand_bindings.items():
+            for index, abstract in enumerate(leaf.op_cls.OPERAND_AXES[slot]):
+                if block.axis_map.get(abstract) == match.progress_axis:
+                    width = region.ranges[index][1]
+                    if not isinstance(width, Const):
+                        return None
+                    sizes.add(width.value)
+    size = next(iter(sizes)) if len(sizes) == 1 else None
+    return size if size in match.chunk_sizes else None
 
 
 def _new_context(
@@ -449,7 +426,7 @@ def _lower_tile(ir: KernelIR, match: _Match, graph: ValueGraph, chunk_size: int)
     original = ir.all_buffers()
     names = NameSupply(set(original))
     plans, added = _plan_buffers(ir, match, graph, names, False, False)
-    buffers = _localized_buffers(ir, match, graph, original, chunk_size)
+    buffers = _recurrence_buffers(ir, match, original)
     buffers.update(added)
     init = OperationBuilder(ir.tree, None, buffers, names)
     roots = [_emit_initializer(init, plan.state, stage.combinator.identity) for stage, plan in zip(match.stages, plans)]
@@ -467,7 +444,7 @@ def _lower_tile(ir: KernelIR, match: _Match, graph: ValueGraph, chunk_size: int)
         Var(name=f"i_{match.progress_axis}_online"),
     )
     _derive(context, plans)
-    roots.extend((carrier, *_append_epilogue(context, plans)))
+    roots.append(carrier)
     insertion = _root_insertion(ir, match)
     assert insertion is not None
     old = match.absorbed_blocks
@@ -485,7 +462,7 @@ def _lower_hbm(
     original = ir.all_buffers()
     names = NameSupply(set(original))
     plans, added = _plan_buffers(ir, match, graph, names, False, False)
-    buffers = _localized_buffers(ir, match, graph, original, chunk_size)
+    buffers = _recurrence_buffers(ir, match, original)
     buffers.update(added)
     stage_regions = tuple((_stage_region(ir, graph, stage) for stage in match.stages))
     regions = _stage_regions(plans, stage_regions)
@@ -521,7 +498,7 @@ def _lower_hbm(
         carry,
     )
     _derive(context, plans)
-    roots.extend((carrier, *_append_epilogue(context, plans)))
+    roots.append(carrier)
     insertion = _root_insertion(ir, match)
     assert insertion is not None
     old = match.absorbed_blocks
@@ -539,7 +516,7 @@ def _lower_grouped(
     original = ir.all_buffers()
     names = NameSupply(set(original))
     plans, added = _plan_buffers(ir, match, graph, names, True, False)
-    buffers = _localized_buffers(ir, match, graph, original, chunk_size)
+    buffers = _recurrence_buffers(ir, match, original)
     buffers.update(added)
     stage_regions = tuple((_stage_region(ir, graph, stage) for stage in match.stages))
     regions = _stage_regions(plans, stage_regions)
@@ -559,17 +536,6 @@ def _lower_grouped(
         progress = Const(value=0)
     context = _new_context(ir, match, graph, chunk_size, parent, buffers, names, regions, scopes, progress)
     _derive(context, plans)
-    if match.deferred_factor is not None:
-        deferred = match.deferred_factor
-        context.builder.parent = body
-        states = {index: plan.state for index, plan in enumerate(plans[: deferred.stage])}
-        state_indices = sorted(_factor_states(deferred.factor))
-        context.builder.scope = scopes[state_indices[-1]]
-        factor = _compile_factor(context.builder, deferred.factor, states, "deferred_factor")
-        source = match.external_outputs[0]
-        context.builder.regions[source] = replace(context.builder.region(plans[deferred.stage].current), tensor=source)
-        context.builder.scope = scopes[deferred.stage]
-        _emit_scaled(context.builder, plans[deferred.stage].current, factor, source)
     insertion = _root_insertion(ir, match)
     assert insertion is not None
     old = match.absorbed_blocks
@@ -578,72 +544,6 @@ def _lower_grouped(
         ir.tree.graph.remove_nodes_from({block, *ir.tree.descendants(block)})
     _seed_buffers(ir, buffers, _match_tensors(match, graph))
     finalize_rewrite(ir)
-
-
-def _emit_scaled(builder: OperationBuilder, data: str, factor: str, output: str) -> None:
-    """Emit one broadcast multiplication."""
-    builder.append(
-        NKITensorScalar,
-        {"data": builder.region(data), "operand0": builder.region(factor), "dst": builder.region(output)},
-        {"op0": "multiply"},
-    )
-
-
-def _append_epilogue(context: _Lowering, plans: tuple[_Plan, ...]) -> list[int]:
-    """Apply one deferred final factor after the sequential loop."""
-    deferred = context.match.deferred_factor
-    if deferred is None:
-        return []
-    states = {index: plan.state for index, plan in enumerate(plans[: deferred.stage])}
-    if context.carry_tensor is None:
-        root = context.builder.tree.add_node(
-            BlockNode(iter_vars=(), iter_values=(), reads=(), writes=(), alloc_buffers=())
-        )
-        builder = OperationBuilder(
-            context.builder.tree, root, context.builder.buffers, context.builder.names, context.builder.regions
-        )
-        factor = _compile_factor(builder, deferred.factor, states, "deferred_factor")
-        _emit_scaled(builder, plans[deferred.stage].current, factor, context.match.external_outputs[0])
-        return [root]
-    scope = context.scopes[deferred.stage]
-    if scope is None:
-        raise AssertionError("mapped deferred factor has no scope")
-    root, parent, substitutions = _scope_carrier(context.builder.tree, scope)
-    final_region = context.builder.region(plans[deferred.stage].current)
-    shape = _region_shape(final_region)
-    local_ranges = tuple(((Const(value=0), Const(value=extent)) for extent in shape))
-    numerator = context.builder.names.fresh("online_deferred_numerator")
-    normalized = context.match.external_outputs[0]
-    template = context.builder.buffers[plans[deferred.stage].current]
-    regions = {tensor: _substitute_region(region, substitutions) for tensor, region in context.builder.regions.items()}
-    context.builder.buffers[numerator] = replace(
-        template, name=numerator, shape=shape, location="sbuf", storage_dtype="float32", versions=1, list_len=1
-    )
-    regions[numerator] = BufferRegion(tensor=numerator, ranges=local_ranges)
-    regions[normalized] = replace(_substitute_region(final_region, substitutions), tensor=normalized)
-    output_scope = OperationScope(context.builder.tree.block(root), ())
-    builder = OperationBuilder(
-        context.builder.tree, parent, context.builder.buffers, context.builder.names, regions, output_scope, True
-    )
-    builder.append(
-        NKILoad, {"src": builder.region(context.carry_tensor), "dst": builder.region(numerator)}, {}, scope=None
-    )
-    state_indices = sorted(_factor_states(deferred.factor))
-    factor_scope = context.scopes[state_indices[-1]]
-    if factor_scope is None:
-        raise AssertionError("mapped deferred factor has no state scope")
-    factor_block = replace(
-        factor_scope.block,
-        iter_values=tuple((substitute(value, substitutions) for value in factor_scope.block.iter_values)),
-        reads=(),
-        writes=(),
-        alloc_buffers=(),
-    )
-    builder.scope = OperationScope(factor_block, ())
-    factor = _compile_factor(builder, deferred.factor, states, "deferred_factor")
-    builder.scope = output_scope
-    _emit_scaled(builder, numerator, factor, normalized)
-    return [root]
 
 
 def _rewrite_reducer_as_map(ir: KernelIR, stage: _Stage, contract: ReductionContract) -> None:
@@ -759,7 +659,7 @@ def _extend_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pref
     stage = match.stages[index]
     state = stage.state_tensor
     state_buffer = replace(ir.buffer(state), location="sbuf", storage_dtype="float32")
-    contribution_leaf = _contribution_leaf(match, graph, index)
+    contribution_leaf = match.stages[index].reducer_leaf
     contribution_source = ir.buffer(graph.outputs[contribution_leaf])
     raw_contribution: str | None = None
     if contribution_source.location == "psum":
@@ -772,7 +672,7 @@ def _extend_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pref
     current = names.fresh(f"{state}_online_current")
     plan = _Plan(state, contribution, current, raw_contribution)
     plans = (*prefix.plans, plan)
-    buffers = _localized_buffers(ir, match, graph, original, chunk_size)
+    buffers = _recurrence_buffers(ir, match, original)
     buffers[state] = state_buffer
     buffers[current] = replace(state_buffer, name=current)
     buffers[contribution] = contribution_buffer
@@ -829,10 +729,9 @@ def _complete_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pr
     names = NameSupply(set(all_buffers))
     final_stage = match.stages[-1]
     source = ir.buffer(match.external_outputs[0])
-    deferred = match.deferred_factor is not None and match.deferred_factor.stage == len(match.stages) - 1
-    state = names.fresh(f"{final_stage.state_tensor}_online_state") if deferred else match.external_outputs[0]
+    state = match.external_outputs[0]
     state_buffer = replace(source, name=state, location="sbuf", storage_dtype="float32")
-    contribution_leaf = _contribution_leaf(match, graph, len(match.stages) - 1)
+    contribution_leaf = match.stages[-1].reducer_leaf
     contribution_source = ir.buffer(graph.outputs[contribution_leaf])
     raw_contribution: str | None = None
     if contribution_source.location == "psum":
@@ -844,7 +743,7 @@ def _complete_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pr
         contribution_buffer = replace(contribution_source, name=contribution, storage_dtype="float32")
     final_plan = _Plan(state, contribution, state, raw_contribution)
     plans = (*prefix.plans, final_plan)
-    buffers = _localized_buffers(ir, match, graph, all_buffers, chunk_size)
+    buffers = _recurrence_buffers(ir, match, all_buffers)
     buffers[state] = state_buffer
     buffers[contribution] = contribution_buffer
     if raw_contribution is not None:
@@ -885,10 +784,8 @@ def _complete_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pr
         for nid in ir.tree.graph
         if nid not in previous and ir.tree.parent(nid) is None and isinstance(ir.tree.data(nid), BlockNode)
     ]
-    epilogue = _append_epilogue(context, plans)
     _insert_detached_roots(ir.tree, prefix.carrier, init_roots, before=True)
     _insert_children_before(ir.tree, prefix.loop, prefix.roll_forward, suffix)
-    _insert_detached_roots(ir.tree, prefix.carrier, epilogue, before=False)
     old = [block for block in match.absorbed_blocks if block in ir.tree.graph]
     roots = ir.tree.children(ir.tree.root)
     for block in old:
@@ -934,6 +831,7 @@ def _matching_complete(ir: KernelIR, prefix: _Match) -> _Match:
         for match in _detect_matches(ir, complete=True)
         if match.progress_axis == prefix.progress_axis
         and match.stages[: len(prefix.stages)] == prefix.stages
+        and match.deferred_factor is None
         and set(match.chunk_sizes) & set(prefix.chunk_sizes)
     ]
     if len(candidates) != 1:
@@ -950,7 +848,7 @@ def _continuations(ir: KernelIR, prefix: _Match, complete: _Match) -> tuple[_Mat
     result: list[_Match] = []
     for count in range(len(prefix.stages) + 1, len(complete.stages)):
         match = _build_match(ir, graph, prefix.progress_axis, evaluation, stage_count=count)
-        if match is None:
+        if match is None or match.deferred_factor is not None:
             raise TransformLegalityError(f"online-fusion chain has no valid {count}-stage prefix")
         result.append(match)
     return (*result, complete)
@@ -999,10 +897,9 @@ def _incremental_intact(ir: KernelIR, state: _Incremental) -> bool:
 
 @dataclass(frozen=True)
 class OnlineFusionOption(TransformOption):
-    """One proven recurrence and sequential chunk size."""
+    """One proven recurrence to rewrite without changing its tile width."""
 
     match_id: tuple[str, tuple[int, ...]]
-    chunk_size: int
 
 
 class OnlineFusion(Transform[OnlineFusionOption]):
@@ -1010,27 +907,23 @@ class OnlineFusion(Transform[OnlineFusionOption]):
 
     def analyze(self, ir: KernelIR) -> list[OnlineFusionOption]:
         """Enumerate contract-proven and lowering-supported options."""
-        state = _incremental_state(ir) if len(ir.return_names) == 1 else None
-        if len(ir.return_names) != 1 or any(
-            (
-                ir.tree.isa(nid).op_cls.algebraic_contract(ir.tree.isa(nid).kwargs) is None
-                for nid in ir.tree.preorder()
-                if isinstance(ir.tree.data(nid), ISANode)
-            )
-        ):
+        facts = operation_facts(ir)
+        if len(ir.return_names) != 1 or facts.has_unknown_contract:
             options = []
-        elif state is not None:
+        elif (state := _incremental_state(ir)) is not None:
             options = (
-                [OnlineFusionOption(state.remaining[0].match_id, state.chunk_size)]
+                [OnlineFusionOption(state.remaining[0].match_id)]
                 if state.remaining and _incremental_intact(ir, state)
                 else []
             )
+        elif not facts.has_reduction:
+            options = []
         else:
             options = [
-                OnlineFusionOption(match.match_id, chunk_size)
+                OnlineFusionOption(match.match_id)
                 for match in _detect_matches(ir, complete=False)
-                for chunk_size in match.chunk_sizes
-                if _can_lower(ir, match, chunk_size, prefix=match.incremental_prefix)
+                if (chunk_size := _preserved_chunk_size(ir, match)) is not None
+                and _can_lower(ir, match, chunk_size, prefix=match.incremental_prefix)
             ]
         return options
 
@@ -1041,20 +934,19 @@ class OnlineFusion(Transform[OnlineFusionOption]):
             if (
                 not state.remaining
                 or option.match_id != state.remaining[0].match_id
-                or option.chunk_size != state.chunk_size
                 or (not _incremental_intact(ir, state))
             ):
                 raise TransformLegalityError(f"illegal OnlineFusion completion option: {option}")
-            result = copy.deepcopy(ir)
+            result = copy_for_rewrite(ir)
             copied = _incremental_state(result)
             assert copied is not None
             next_match = copied.remaining[0]
             final = len(copied.remaining) == 1
             prefix = copied.prefix
             if final:
-                _complete_prefix(result, next_match, copied.graph, copied.prefix, option.chunk_size)
+                _complete_prefix(result, next_match, copied.graph, copied.prefix, copied.chunk_size)
             else:
-                prefix = _extend_prefix(result, next_match, copied.graph, copied.prefix, option.chunk_size)
+                prefix = _extend_prefix(result, next_match, copied.graph, copied.prefix, copied.chunk_size)
             root = result.tree.block(result.tree.root)
             annotations = dict(root.annotations)
             if final:
@@ -1067,21 +959,28 @@ class OnlineFusion(Transform[OnlineFusionOption]):
             return result
         matches = {match.match_id: match for match in _detect_matches(ir, complete=False)}
         match = matches.get(option.match_id)
-        if match is None or not _can_lower(ir, match, option.chunk_size, prefix=match.incremental_prefix):
+        chunk_size = None if match is None else _preserved_chunk_size(ir, match)
+        if (
+            match is None
+            or chunk_size is None
+            or not _can_lower(ir, match, chunk_size, prefix=match.incremental_prefix)
+        ):
             raise TransformLegalityError(f"illegal OnlineFusion option: {option}")
-        result = copy.deepcopy(ir)
+        result = copy_for_rewrite(ir)
         copied_matches = {candidate.match_id: candidate for candidate in _detect_matches(result, complete=False)}
         copied_match = copied_matches[option.match_id]
+        copied_chunk_size = _preserved_chunk_size(result, copied_match)
+        assert copied_chunk_size == chunk_size
         if copied_match.incremental_prefix:
             complete = _matching_complete(result, copied_match)
             graph = build_value_graph(result)
             remaining = _continuations(result, copied_match, complete)
-            prefix = _lower_prefix(result, copied_match, complete, option.chunk_size)
-            state = _capture_incremental(result, complete, graph, option.chunk_size, prefix, remaining)
+            prefix = _lower_prefix(result, copied_match, complete, chunk_size)
+            state = _capture_incremental(result, complete, graph, chunk_size, prefix, remaining)
             root = result.tree.block(result.tree.root)
             annotations = dict(root.annotations)
             annotations[_INCREMENTAL_ANNOTATION] = state
             result.tree.graph.nodes[result.tree.root]["data"] = replace(root, annotations=annotations)
         else:
-            _lower_complete(result, copied_match, option.chunk_size)
+            _lower_complete(result, copied_match, chunk_size)
         return result

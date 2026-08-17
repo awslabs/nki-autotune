@@ -24,14 +24,17 @@ class TransposeChain:
     source_axes: tuple[str, str]
 
 
-def match_transpose_chain(ir: KernelIR, transpose_block: int, drain_block: int) -> TransposeChain | None:
+def match_transpose_chain(
+    ir: KernelIR, transpose_block: int, drain_block: int, adjacent: bool | None = None
+) -> TransposeChain | None:
     """Return one canonical adjacent transpose chain."""
     result: TransposeChain | None = None
-    root_children = ir.tree.children(ir.tree.root)
-    adjacent = False
-    if transpose_block in root_children:
-        index = root_children.index(transpose_block)
-        adjacent = index + 1 < len(root_children) and root_children[index + 1] == drain_block
+    if adjacent is None:
+        root_children = ir.tree.children(ir.tree.root)
+        adjacent = False
+        if transpose_block in root_children:
+            index = root_children.index(transpose_block)
+            adjacent = index + 1 < len(root_children) and root_children[index + 1] == drain_block
     if adjacent and is_canonical_block(ir, transpose_block) and is_canonical_block(ir, drain_block):
         transpose_leaf = single_leaf(ir.tree, transpose_block)
         drain_leaf = single_leaf(ir.tree, drain_block)

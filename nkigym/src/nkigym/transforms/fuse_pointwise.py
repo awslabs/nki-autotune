@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
@@ -12,7 +11,15 @@ from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.base import AxisRole, CopyContract, PointwiseContract, ReductionContract
 from nkigym.ops.tensor_scalar_reduce import NKITensorScalarReduce
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.search.state_facts import operation_facts
+from nkigym.transforms.base import (
+    Transform,
+    TransformLegalityError,
+    TransformOption,
+    copy_for_rewrite,
+    intersects_software_pipeline,
+    software_pipeline_overlap_nodes,
+)
 from nkigym.transforms.helper.canonical_rewrite import block_chain, finalize_rewrite, remove_buffers, single_leaf
 from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
@@ -82,12 +89,15 @@ class FusePointwise(Transform[FusePointwiseOption]):
 
     def analyze(self, ir: KernelIR) -> list[FusePointwiseOption]:
         """Enumerate adjacent pointwise-consumer pairs with a native fused ISA."""
+        if not operation_facts(ir).pointwise_operators:
+            return []
         options: list[FusePointwiseOption] = []
+        overlap_nodes = software_pipeline_overlap_nodes(ir)
         for parent_nid in ir.tree.preorder():
             children = ir.tree.children(parent_nid)
             for pointwise_nid, consumer_nid in zip(children, children[1:]):
                 option = FusePointwiseOption(pointwise_block_nid=pointwise_nid, consumer_block_nid=consumer_nid)
-                if self._resolve(ir, option) is not None:
+                if self._resolve(ir, option, overlap_nodes, adjacent=True) is not None:
                     options.append(option)
         return options
 
@@ -96,7 +106,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
         fusion = self._resolve(ir, option)
         if fusion is None:
             raise TransformLegalityError(f"illegal FusePointwise option: {option}")
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         copied_fusion = self._resolve(new_ir, option)
         if copied_fusion is None:
             raise AssertionError(f"FusePointwise option disappeared after deepcopy: {option}")
@@ -104,9 +114,21 @@ class FusePointwise(Transform[FusePointwiseOption]):
         return new_ir
 
     def _resolve(
-        self, ir: KernelIR, option: FusePointwiseOption
+        self,
+        ir: KernelIR,
+        option: FusePointwiseOption,
+        overlap_nodes: frozenset[int] | None = None,
+        adjacent: bool | None = None,
     ) -> _BroadcastActivationMatch | _PointwiseActivationMatch | _PointwiseCopyMatch | _ReductionFusion | None:
         """Resolve one adjacent pair to exactly one native fusion."""
+        if adjacent is None:
+            adjacent = self._are_adjacent(ir, option.pointwise_block_nid, option.consumer_block_nid)
+        if not adjacent:
+            return None
+        if intersects_software_pipeline(ir, (option.pointwise_block_nid, option.consumer_block_nid), overlap_nodes):
+            return None
+        if not all(self._isolated_block(ir, nid) for nid in (option.pointwise_block_nid, option.consumer_block_nid)):
+            return None
         fusion = self._resolve_copy(ir, option)
         if fusion is None:
             fusion = self._resolve_activation(ir, option)
@@ -115,6 +137,12 @@ class FusePointwise(Transform[FusePointwiseOption]):
         if fusion is None:
             fusion = self._resolve_reduction(ir, option)
         return fusion
+
+    def _isolated_block(self, ir: KernelIR, block_nid: int) -> bool:
+        """Return whether one block subtree contains exactly its owned ISA leaf."""
+        leaf = single_leaf(ir.tree, block_nid)
+        leaves = [nid for nid in ir.tree.descendants(block_nid) if isinstance(ir.tree.data(nid), ISANode)]
+        return leaf is not None and leaves == [leaf]
 
     def _rewrite(
         self,
@@ -141,7 +169,6 @@ class FusePointwise(Transform[FusePointwiseOption]):
             and copy_nid in ir.tree.graph
             and isinstance(ir.tree.data(pointwise_nid), BlockNode)
             and isinstance(ir.tree.data(copy_nid), BlockNode)
-            and self._are_adjacent(ir, pointwise_nid, copy_nid)
         ):
             pointwise_leaf_nid = single_leaf(ir.tree, pointwise_nid)
             copy_leaf_nid = single_leaf(ir.tree, copy_nid)
@@ -247,7 +274,6 @@ class FusePointwise(Transform[FusePointwiseOption]):
             and activation_nid in ir.tree.graph
             and isinstance(ir.tree.data(pointwise_nid), BlockNode)
             and isinstance(ir.tree.data(activation_nid), BlockNode)
-            and self._are_adjacent(ir, pointwise_nid, activation_nid)
         ):
             pointwise_leaf_nid = single_leaf(ir.tree, pointwise_nid)
             activation_leaf_nid = single_leaf(ir.tree, activation_nid)
@@ -324,7 +350,6 @@ class FusePointwise(Transform[FusePointwiseOption]):
             and activation_nid in ir.tree.graph
             and isinstance(ir.tree.data(pointwise_nid), BlockNode)
             and isinstance(ir.tree.data(activation_nid), BlockNode)
-            and self._are_adjacent(ir, pointwise_nid, activation_nid)
         ):
             pointwise_leaf_nid = single_leaf(ir.tree, pointwise_nid)
             activation_leaf_nid = single_leaf(ir.tree, activation_nid)
@@ -336,6 +361,8 @@ class FusePointwise(Transform[FusePointwiseOption]):
                 contracts = isinstance(pointwise, PointwiseContract) and isinstance(activation, ReductionContract)
                 pointwise_contract = cast(PointwiseContract, pointwise)
                 activation_contract = cast(ReductionContract, activation)
+                pointwise_block = ir.tree.block(pointwise_nid)
+                activation_block = ir.tree.block(activation_nid)
                 supported = contracts and (
                     activation_leaf.op_cls is NKIActivationReduce
                     and activation_contract.bias_operand == "bias"
@@ -350,6 +377,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
                     and activation_contract.bias == 0.0
                     and not pointwise_leaf.access_patterns
                     and not activation_leaf.access_patterns
+                    and self._blocks_align(pointwise_block, activation_block, activation_contract)
                 )
                 if supported:
                     broadcast_slot = next(iter(pointwise_contract.broadcast_operands))
@@ -364,6 +392,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
                         and intermediate is not None
                         and activation_input is not None
                         and activation_input.tensor == intermediate.tensor
+                        and data.ranges == activation_input.ranges
                     ):
                         buffers = ir.all_buffers()
                         removed_nodes = {pointwise_nid, *ir.tree.descendants(pointwise_nid)}
@@ -528,16 +557,6 @@ class FusePointwise(Transform[FusePointwiseOption]):
             ir.tree.data(reduction_nid), BlockNode
         ):
             return result
-        parent = ir.tree.parent(pointwise_nid)
-        siblings = ir.tree.children(parent) if parent is not None else []
-        if (
-            parent is None
-            or ir.tree.parent(reduction_nid) != parent
-            or pointwise_nid not in siblings
-            or siblings.index(reduction_nid) != siblings.index(pointwise_nid) + 1
-        ):
-            return result
-
         pointwise_leaf_nid = single_leaf(ir.tree, pointwise_nid)
         reduction_leaf_nid = single_leaf(ir.tree, reduction_nid)
         pointwise_chain = block_chain(ir.tree, pointwise_nid)
@@ -578,15 +597,33 @@ class FusePointwise(Transform[FusePointwiseOption]):
         native = self._native_fusion(pointwise_leaf, pointwise_contract, reduction_contract, mapped, reduced_output)
         if native is not None:
             op_cls, bindings, kwargs = native
-            result = _ReductionFusion(
-                option=option,
-                pointwise_leaf_nid=pointwise_leaf_nid,
-                reduction_leaf_nid=reduction_leaf_nid,
-                op_cls=op_cls,
-                bindings=bindings,
-                kwargs=kwargs,
-                reduction_axis=pointwise_block.axis_map[reduction_contract.reduction_axis],
+            buffers = ir.all_buffers()
+            inputs = {
+                operand: buffers[region.tensor]
+                for operand, region in bindings.items()
+                if operand in op_cls.INPUT_OPERANDS
+            }
+            locations = all(
+                buffer.location in op_cls.INPUT_LOCATIONS.get(operand, ()) for operand, buffer in inputs.items()
             )
+            storage = all(
+                (accepted := op_cls.INPUT_STORAGE_DTYPES.get(operand)) is None or buffer.physical_dtype() in accepted
+                for operand, buffer in inputs.items()
+            ) and all(
+                (required := op_cls.REQUIRED_INPUT_STORAGE_DTYPES.get(operand)) is None
+                or buffer.physical_dtype() == required
+                for operand, buffer in inputs.items()
+            )
+            if locations and storage:
+                result = _ReductionFusion(
+                    option=option,
+                    pointwise_leaf_nid=pointwise_leaf_nid,
+                    reduction_leaf_nid=reduction_leaf_nid,
+                    op_cls=op_cls,
+                    bindings=bindings,
+                    kwargs=kwargs,
+                    reduction_axis=pointwise_block.axis_map[reduction_contract.reduction_axis],
+                )
         return result
 
     def _blocks_align(self, pointwise: BlockNode, reduction: BlockNode, contract: ReductionContract) -> bool:
@@ -628,7 +665,9 @@ class FusePointwise(Transform[FusePointwiseOption]):
             len(pointwise.input_operands) == 1
             and not pointwise.broadcast_operands
             and not pointwise.reverse
+            and pointwise.operator in NKIActivationReduce.SUPPORTED_MAP_OPERATORS
             and reduction.combinator.combiner in _ACTIVATION_REDUCERS
+            and reduction.combinator.combiner in NKIActivationReduce.SUPPORTED_REDUCERS
         ):
             source = leaf.operand_bindings.get(pointwise.input_operands[0])
             if source is not None:
@@ -659,7 +698,9 @@ class FusePointwise(Transform[FusePointwiseOption]):
             and not pointwise.reverse
             and pointwise.scale == 1.0
             and pointwise.bias == 0.0
+            and pointwise.operator in NKITensorScalarReduce.SUPPORTED_MAP_OPERATORS
             and reduction.combinator.combiner in _TENSOR_SCALAR_REDUCERS
+            and reduction.combinator.combiner in NKITensorScalarReduce.SUPPORTED_REDUCERS
         ):
             scalar_slot = next(iter(pointwise.broadcast_operands))
             data_slots = [slot for slot in pointwise.input_operands if slot != scalar_slot]
@@ -680,13 +721,25 @@ class FusePointwise(Transform[FusePointwiseOption]):
         """Replace the pointwise block and delete the redundant reduction block."""
         pointwise_nid = fusion.option.pointwise_block_nid
         reduction_nid = fusion.option.consumer_block_nid
+        reduction_leaf = ir.tree.isa(fusion.reduction_leaf_nid)
+        replacement_tensors = {region.tensor for region in fusion.bindings.values()}
+        obsolete = {
+            region.tensor
+            for operand, region in reduction_leaf.operand_bindings.items()
+            if operand not in reduction_leaf.op_cls.INPUT_OPERANDS and region.tensor not in replacement_tensors
+        }
+        remove_buffers(ir, obsolete)
         pointwise_block = ir.tree.block(pointwise_nid)
         reduction_block = ir.tree.block(reduction_nid)
         iter_vars = tuple(
             replace(iter_var, role=AxisRole.ACCUMULATION) if iter_var.axis == fusion.reduction_axis else iter_var
             for iter_var in pointwise_block.iter_vars
         )
-        writes = tuple(dict.fromkeys((*pointwise_block.writes, *reduction_block.writes)))
+        writes = tuple(
+            dict.fromkeys(
+                region for region in (*pointwise_block.writes, *reduction_block.writes) if region.tensor not in obsolete
+            )
+        )
         allocations = tuple(
             {
                 buffer.name: buffer for buffer in (*pointwise_block.alloc_buffers, *reduction_block.alloc_buffers)

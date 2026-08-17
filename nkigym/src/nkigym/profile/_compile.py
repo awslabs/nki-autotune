@@ -26,8 +26,7 @@ def load_kernel(kernel_path: Path, func_name: str) -> Any:
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
-    kernel = getattr(module, func_name)
-    return kernel
+    return getattr(module, func_name)
 
 
 @contextlib.contextmanager
@@ -48,10 +47,9 @@ def _capture_stderr() -> Generator[Path, None, None]:
 
 def _run_compiler(kernel: Kernel, inputs: dict[str, np.ndarray], options: CompileOptions) -> None:
     """Trace the NKI function and lower it to a NEFF artifact."""
-    frontend = TracerFrontend()
     with _capture_stderr() as stderr_path:
         try:
-            bir = compile_to_bir(kernel, frontend=frontend, inputs=inputs, compile_opts=options)
+            bir = compile_to_bir(kernel, frontend=TracerFrontend(), inputs=inputs, compile_opts=options)
             input_specs = bir.descriptor.input_specs
             output_specs = bir.descriptor.output_specs
             input_arrays = [np.zeros(spec.shape, dtype=np.dtype(spec.dtype)) for spec in input_specs]
@@ -95,6 +93,3 @@ def compile_kernel(
     if not neff_path.is_file():
         raise RuntimeError(f"compiler returned without creating {neff_path}")
     return neff_path
-
-
-__all__ = ["compile_kernel", "load_kernel"]

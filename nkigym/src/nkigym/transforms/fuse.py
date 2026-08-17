@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 from math import prod
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Const, Expr, Var, substitute, to_affine
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import BlockNode, ForNode, ISANode, KernelTree
+from nkigym.ir.tree import BlockNode, Buffer, ForNode, ISANode, KernelTree
 from nkigym.ops.dma_transpose import NKIDMATranspose
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.base import (
+    Transform,
+    TransformLegalityError,
+    TransformOption,
+    copy_for_rewrite,
+    intersects_software_pipeline,
+    software_pipeline_overlap_nodes,
+)
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
-from nkigym.transforms.helper.normalize import _dim_from_loopvar, _substitute_block_regions, normalize_block
+from nkigym.transforms.helper.normalize import _substitute_block_regions, normalize_block
 from nkigym.transforms.helper.tile_region import retile_region
-from nkigym.transforms.helper.tree_ops import _replace_in_parent_children, invalidate_stale_software_pipelines
+from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 from nkigym.transforms.split import _current_tensorize_width
 
 
@@ -41,6 +47,8 @@ class Fuse(Transform[FuseOption]):
     def analyze(self, ir: KernelIR) -> list[FuseOption]:
         """Return every legal adjacent loop-loop and loop-tensorize pair."""
         options: list[FuseOption] = []
+        overlap_nodes = software_pipeline_overlap_nodes(ir)
+        buffers = ir.all_buffers()
         for nid in ir.tree.preorder():
             data = ir.tree.data(nid)
             if not isinstance(data, ForNode):
@@ -50,9 +58,10 @@ class Fuse(Transform[FuseOption]):
                 continue
             kid_data = ir.tree.data(kids[0])
             if isinstance(kid_data, ForNode):
-                if _dim_from_loopvar(data.loop_var) == _dim_from_loopvar(kid_data.loop_var):
+                axis = _axis_of_loop(ir.tree, nid)
+                if axis is not None and axis == _axis_of_loop(ir.tree, kids[0]):
                     option = FuseOption(target_nids=(nid, kids[0]), target_axis=None)
-                    if self._is_legal(ir, option):
+                    if self._is_legal(ir, option, overlap_nodes, buffers):
                         options.append(option)
             elif isinstance(kid_data, ISANode):
                 _block_nid, block = _find_enclosing_block(ir.tree, kids[0])
@@ -63,22 +72,27 @@ class Fuse(Transform[FuseOption]):
                 ]
                 for target_axis in target_axes:
                     option = FuseOption(target_nids=(nid, kids[0]), target_axis=target_axis)
-                    if self._is_legal(ir, option):
+                    if self._is_legal(ir, option, overlap_nodes, buffers):
                         options.append(option)
         return options
 
     def apply(self, ir: KernelIR, option: FuseOption) -> KernelIR:
         self._check_legality(ir, option)
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         if option.target_axis is None:
             self._do_outer_trip(new_ir, option)
         else:
             self._do_tensorize(new_ir, option)
-        invalidate_stale_software_pipelines(new_ir)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
-    def _check_legality(self, ir: KernelIR, option: FuseOption) -> None:
+    def _check_legality(
+        self,
+        ir: KernelIR,
+        option: FuseOption,
+        overlap_nodes: frozenset[int] | None = None,
+        buffers: dict[str, Buffer] | None = None,
+    ) -> None:
         if len(option.target_nids) != 2:
             raise TransformLegalityError(
                 f"Fuse.target_nids must contain exactly two adjacent entries; got {option.target_nids}"
@@ -86,6 +100,8 @@ class Fuse(Transform[FuseOption]):
         for nid in option.target_nids:
             if nid not in ir.tree.graph:
                 raise TransformLegalityError(f"Fuse.target_nids contains unknown nid {nid}")
+        if intersects_software_pipeline(ir, option.target_nids, overlap_nodes):
+            raise TransformLegalityError("Fuse cannot alter an active software-pipeline scope")
         if subtree_has_access_patterns(ir.tree, option.target_nids[0]):
             raise TransformLegalityError("Fuse cannot rewrite a loop or ISA operand with an explicit access pattern")
         nodes = [ir.tree.data(nid) for nid in option.target_nids]
@@ -100,6 +116,9 @@ class Fuse(Transform[FuseOption]):
                     raise TransformLegalityError(
                         f"Fuse outer-trip flavour: nid {parent_nid} must have a single child {child_nid}; got {kids}"
                     )
+            axis = _axis_of_loop(ir.tree, option.target_nids[0])
+            if axis is None or axis != _axis_of_loop(ir.tree, option.target_nids[1]):
+                raise TransformLegalityError("Fuse outer-trip loops must bind the same concrete block axis")
             _check_no_partial_loop_dependence(ir.tree, option.target_nids)
         else:
             """Tensorize flavour: prefix is ForNodes; last is the ISA leaf."""
@@ -138,13 +157,18 @@ class Fuse(Transform[FuseOption]):
                 )
             inverse_axis_map = {concrete: abstract for abstract, concrete in block.axis_map.items()}
             abstract_axis = inverse_axis_map.get(option.target_axis)
-            max_tile = _maximum_tensorize_width(ir, leaf, abstract_axis)
+            if abstract_axis in getattr(leaf.op_cls, "NON_TILABLE_AXES", ()):
+                raise TransformLegalityError(f"Fuse cannot widen non-tileable {leaf.op_cls.__name__}.{abstract_axis}")
+            if buffers is None:
+                buffers = ir.all_buffers()
+            max_tile = _maximum_tensorize_width(leaf, abstract_axis, buffers)
             absorbed_extent = prod(ir.tree.loop(nid).extent for nid in option.target_nids[:-1])
             fused_width = current_width * absorbed_extent
             if max_tile is not None and fused_width > max_tile:
                 raise TransformLegalityError(
                     f"Fuse.target_axis={option.target_axis!r}: fused tile {fused_width} > MAX_TILE_SIZE {max_tile}"
                 )
+            self._check_tensorize_buffer_bounds(buffers, leaf, abstract_axis, absorbed_extent)
 
     def _check_tensorize_loop_uses(self, leaf: ISANode, block: BlockNode, loop_var: str, target_axis: str) -> None:
         """Reject loop uses that widening the selected operand axis cannot absorb."""
@@ -165,10 +189,38 @@ class Fuse(Transform[FuseOption]):
             uses = ", ".join(invalid_uses)
             raise TransformLegalityError(f"Fuse loop {loop_var!r} has uses outside target_axis={target_axis!r}: {uses}")
 
-    def _is_legal(self, ir: KernelIR, option: FuseOption) -> bool:
+    def _check_tensorize_buffer_bounds(
+        self, buffers: dict[str, Buffer], leaf: ISANode, abstract_axis: str | None, absorbed_extent: int
+    ) -> None:
+        """Reject widened on-chip regions that exceed compacted allocations."""
+        for slot, region in leaf.operand_bindings.items():
+            axes = leaf.op_cls.OPERAND_AXES[slot]
+            axis_index = axes.index(abstract_axis) if abstract_axis in axes else None
+            if axis_index is None or axis_index >= len(region.ranges):
+                continue
+            width = region.ranges[axis_index][1]
+            buffer = buffers[region.tensor]
+            if (
+                isinstance(width, Const)
+                and buffer.location in {"sbuf", "psum"}
+                and axis_index < len(buffer.shape)
+                and width.value * absorbed_extent > buffer.shape[axis_index]
+            ):
+                raise TransformLegalityError(
+                    f"Fuse would widen {region.tensor}[{axis_index}] to {width.value * absorbed_extent}, "
+                    f"beyond its compacted extent {buffer.shape[axis_index]}"
+                )
+
+    def _is_legal(
+        self,
+        ir: KernelIR,
+        option: FuseOption,
+        overlap_nodes: frozenset[int] | None = None,
+        buffers: dict[str, Buffer] | None = None,
+    ) -> bool:
         """Return whether ``option`` passes the same checks used by :meth:`apply`."""
         try:
-            self._check_legality(ir, option)
+            self._check_legality(ir, option, overlap_nodes, buffers)
         except TransformLegalityError:
             return False
         return True
@@ -263,12 +315,12 @@ class Fuse(Transform[FuseOption]):
         normalize_block(ir.tree, block_nid)
 
 
-def _maximum_tensorize_width(ir: KernelIR, leaf: ISANode, abstract_axis: str | None) -> int | None:
+def _maximum_tensorize_width(leaf: ISANode, abstract_axis: str | None, buffers: dict[str, Buffer]) -> int | None:
     """Return the hardware tile limit for one tensorized operation axis."""
     maximum = leaf.op_cls.MAX_TILE_SIZE.get(abstract_axis) if abstract_axis is not None else None
     if leaf.op_cls is NKIDMATranspose and abstract_axis is not None:
         source = leaf.operand_bindings["src"].tensor
-        if ir.buffer(source).location == "shared_hbm":
+        if buffers[source].location == "shared_hbm":
             maximum = NKIDMATranspose.HBM_SOURCE_MAX_TILE_SIZE[abstract_axis]
     return maximum
 
@@ -280,6 +332,19 @@ def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
         if isinstance(data, BlockNode):
             return ancestor, data
     raise TransformLegalityError(f"no enclosing BlockNode for nid {nid}")
+
+
+def _axis_of_loop(tree: KernelTree, loop_nid: int) -> str | None:
+    """Return the unique concrete block axis driven by one loop."""
+    loop_var = tree.loop(loop_nid).loop_var
+    enclosing, _block = _find_enclosing_block(tree, loop_nid)
+    axes = {
+        iter_var.axis
+        for block_nid in {enclosing, *tree.blocks(loop_nid)}
+        for iter_var, value in zip(tree.block(block_nid).iter_vars, tree.block(block_nid).iter_values)
+        if loop_var in to_affine(value)
+    }
+    return next(iter(axes)) if len(axes) == 1 else None
 
 
 def _normalize_block_hierarchy(

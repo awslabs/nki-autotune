@@ -28,6 +28,7 @@ class NKITensorTensor(NKIOp):
     NAME: ClassVar[str] = "tensor_tensor"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data1": ("P", "F"), "data2": ("P", "F"), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data1", "data2"})
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"data1": frozenset({"sbuf"}), "data2": frozenset({"sbuf"})}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"

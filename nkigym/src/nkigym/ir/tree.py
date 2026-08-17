@@ -21,12 +21,12 @@ sub-payloads carried on :class:`BlockNode` and :class:`ISANode`.
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from dataclasses import dataclass, field, replace
+from typing import Any, TypeVar, cast
 
 import networkx as nx
 
-from nkigym.ir.arith.expr import Expr
+from nkigym.ir.arith.expr import Add, Const, Expr, Mul
 from nkigym.ops.base import AxisRole, NKIOp
 
 PARTITION_DIM = 128
@@ -228,6 +228,19 @@ class BufferRegion:
     tensor: str
     ranges: tuple[tuple[Expr, Expr], ...]
 
+    def with_partition_aligned_slice(
+        self, axis: int, start: int, width: int, output: BufferRegion | None = None
+    ) -> BufferRegion:
+        """Return one static slice, optionally aligned to a partition tile."""
+        lower: Expr = Const(value=start)
+        slice_width: Expr = Const(value=width)
+        if output is not None:
+            offset, slice_width = output.ranges[axis]
+            lower = Add(left=lower, right=Mul(left=offset, right=slice_width))
+        ranges = list(self.ranges)
+        ranges[axis] = (lower, slice_width)
+        return replace(self, ranges=tuple(ranges))
+
 
 @dataclass(frozen=True, kw_only=True)
 class BlockNode:
@@ -312,7 +325,7 @@ class KernelTree:
 
     def data(self, nid: int) -> NodeData:
         """Return the payload attached to node ``nid``."""
-        return self.graph.nodes[nid]["data"]
+        return cast(NodeData, getattr(self.graph, "_node")[nid]["data"])
 
     def _expect_data(self, nid: int, expected: type[_NodeT]) -> _NodeT:
         """Return node data after validating its concrete payload type."""
@@ -335,13 +348,12 @@ class KernelTree:
 
     def children(self, nid: int) -> list[int]:
         """Return the ordered list of direct children of ``nid``."""
-        return list(self.graph.successors(nid))
+        return list(getattr(self.graph, "_succ")[nid])
 
     def parent(self, nid: int) -> int | None:
         """Return the parent of ``nid`` (``None`` for the root)."""
-        predecessors = iter(self.graph.predecessors(nid))
-        parent = next(predecessors, None)
-        if parent is None:
+        predecessors = iter(getattr(self.graph, "_pred")[nid])
+        if (parent := next(predecessors, None)) is None:
             return None
         extra_parent = next(predecessors, None)
         if extra_parent is not None:
@@ -361,19 +373,19 @@ class KernelTree:
     def descendants(self, nid: int) -> set[int]:
         """Return the set of all transitive descendants of ``nid``."""
         descendants = {nid}
-        pending = list(self.graph.successors(nid))
+        pending = list((successors := getattr(self.graph, "_succ"))[nid])
         while pending:
             descendant = pending.pop()
             if descendant not in descendants:
                 descendants.add(descendant)
-                pending.extend(self.graph.successors(descendant))
+                pending.extend(successors[descendant])
         descendants.remove(nid)
         return descendants
 
     def preorder(self, nid: int | None = None) -> Iterator[int]:
         """Yield node ids in pre-order DFS from ``nid`` (default: root)."""
         start = self.root if nid is None else nid
-        pending = [start]
+        pending, successors = [start], getattr(self.graph, "_succ")
         visited: set[int] = set()
         while pending:
             current = pending.pop()
@@ -381,12 +393,13 @@ class KernelTree:
                 continue
             visited.add(current)
             yield current
-            pending.extend(reversed(tuple(self.graph.successors(current))))
+            pending.extend(reversed(tuple(successors[current])))
 
     def leaves(self, nid: int | None = None) -> Iterator[int]:
         """Yield leaves (out-degree 0) reachable from ``nid``."""
+        successors = getattr(self.graph, "_succ")
         for m in self.preorder(nid):
-            if self.graph.out_degree(m) == 0:
+            if not successors[m]:
                 yield m
 
     def blocks(self, nid: int | None = None) -> Iterator[int]:

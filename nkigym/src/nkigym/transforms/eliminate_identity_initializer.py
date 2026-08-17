@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
-import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from nkigym.ir import KernelIR, to_affine
 from nkigym.ir.tree import BlockNode, ForNode
 from nkigym.ops.base import BilinearReductionContract, InitializerContract, ReductionContract
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.search.state_facts import operation_facts
+from nkigym.transforms.base import (
+    Transform,
+    TransformLegalityError,
+    TransformOption,
+    copy_for_rewrite,
+    intersects_software_pipeline,
+    software_pipeline_overlap_nodes,
+)
 from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, owning_block, single_leaf
 from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
@@ -34,24 +41,28 @@ class _InitializerMatch:
 
 
 class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]):
-    """Remove an identity fill when a one-step reduction overwrites first."""
+    """Remove an identity fill after first-write overwrite is explicit."""
 
     def analyze(self, ir: KernelIR) -> list[EliminateIdentityInitializerOption]:
         """Return every identity initializer with proven overwrite semantics."""
+        facts = operation_facts(ir)
+        if not facts.has_initializer or not facts.has_reduction:
+            return []
         options: list[EliminateIdentityInitializerOption] = []
+        overlap_nodes = software_pipeline_overlap_nodes(ir)
         for initializer_block_nid in ir.tree.blocks():
             option = self._candidate_option(ir, initializer_block_nid)
-            if option is not None and self._resolve(ir, option) is not None:
+            if option is not None and self._resolve(ir, option, explicit=True, overlap_nodes=overlap_nodes) is not None:
                 options.append(option)
         return options
 
     def apply(self, ir: KernelIR, option: EliminateIdentityInitializerOption) -> KernelIR:
         """Recheck, copy, remove the initializer block, and rebuild metadata."""
-        match = self._resolve(ir, option)
+        match = self._resolve(ir, option, explicit=True)
         if match is None:
             raise TransformLegalityError(f"illegal EliminateIdentityInitializer option: {option}")
-        new_ir = copy.deepcopy(ir)
-        copied_match = self._resolve(new_ir, option)
+        new_ir = copy_for_rewrite(ir)
+        copied_match = self._resolve(new_ir, option, explicit=True)
         if copied_match is None:
             raise AssertionError(f"EliminateIdentityInitializer option disappeared after deepcopy: {option}")
         self._remove_initializer(new_ir, copied_match)
@@ -67,8 +78,7 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             if isinstance(contract, InitializerContract):
                 region = initializer.operand_bindings.get(contract.output_operand)
                 if region is not None:
-                    touches = set(ir.dependency.touches_by_tensor.get(region.tensor, ()))
-                    ordered = [nid for nid in ir.tree.preorder() if nid in touches]
+                    ordered = ir.dependency.touches_by_tensor.get(region.tensor, ())
                     if initializer_leaf_nid in ordered:
                         index = ordered.index(initializer_leaf_nid)
                         if index + 1 < len(ordered):
@@ -80,8 +90,14 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
                             )
         return option
 
-    def _resolve(self, ir: KernelIR, option: EliminateIdentityInitializerOption) -> _InitializerMatch | None:
-        """Resolve a fresh one-step reduction whose first write replaces identity."""
+    def _resolve(
+        self,
+        ir: KernelIR,
+        option: EliminateIdentityInitializerOption,
+        explicit: bool,
+        overlap_nodes: frozenset[int] | None = None,
+    ) -> _InitializerMatch | None:
+        """Resolve a one-step identity/reduction pair before or after marking."""
         result: _InitializerMatch | None = None
         initializer_block_nid = option.initializer_block_nid
         reduction_block_nid = option.reduction_block_nid
@@ -90,6 +106,8 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
         if not isinstance(ir.tree.data(initializer_block_nid), BlockNode) or not isinstance(
             ir.tree.data(reduction_block_nid), BlockNode
         ):
+            return result
+        if intersects_software_pipeline(ir, (initializer_block_nid, reduction_block_nid), overlap_nodes):
             return result
         initializer_leaf_nid = single_leaf(ir.tree, initializer_block_nid)
         reduction_leaf_nid = single_leaf(ir.tree, reduction_block_nid)
@@ -105,14 +123,21 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
         output_operand, reduction_axis, identity = reduction_fields
         initializer_region = initializer.operand_bindings.get(initializer_contract.output_operand)
         reduction_region = reduction.operand_bindings.get(output_operand)
+        reduction_block = ir.tree.block(reduction_block_nid)
+        rmw = output_operand in reduction.op_cls.rmw_operands(reduction.kwargs)
+        state_matches = (
+            (not rmw and reduction_region not in reduction_block.reads)
+            if explicit
+            else (rmw and reduction_region in reduction_block.reads)
+        )
         if (
             initializer_region is None
             or reduction_region is None
             or initializer_region.tensor != option.tensor
             or reduction_region != initializer_region
             or initializer_contract.value != identity
-            or output_operand not in reduction.op_cls.rmw_operands(reduction.kwargs)
             or not reduction.op_cls.first_write_overwrites(output_operand, reduction.kwargs)
+            or not state_matches
         ):
             return result
         reset_loop_nid = ir.tree.parent(initializer_block_nid)
@@ -122,7 +147,7 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             or not isinstance(ir.tree.data(reset_loop_nid), ForNode)
             or reset_loop_nid not in ir.tree.ancestors(reduction_leaf_nid)
             or self._has_reduction_loop(ir, reset_loop_nid, reduction_block_nid, reduction_leaf_nid, reduction_axis)
-            or self._has_local_loop(ir, initializer_block_nid)
+            or set(ir.tree.descendants(initializer_block_nid)) != {initializer_leaf_nid}
             or allocation_block_nid is None
             or not isinstance(ir.tree.data(allocation_block_nid), BlockNode)
             or self._buffer_owner(ir, option.tensor) != allocation_block_nid
@@ -168,10 +193,6 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             for nid in ancestors[reset_index + 1 :]
         )
 
-    def _has_local_loop(self, ir: KernelIR, block_nid: int) -> bool:
-        """Return whether an initializer block contains a loop."""
-        return any(isinstance(ir.tree.data(nid), ForNode) for nid in ir.tree.descendants(block_nid))
-
     def _buffer_owner(self, ir: KernelIR, tensor: str) -> int | None:
         """Return the unique block declaring ``tensor``."""
         owners = [
@@ -209,21 +230,11 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
         )
 
     def _remove_initializer(self, ir: KernelIR, match: _InitializerMatch) -> None:
-        """Remove the fill and make the single reduction write explicit."""
+        """Remove one identity fill already superseded by an explicit overwrite."""
         block_nid = match.option.initializer_block_nid
         parent = ir.tree.parent(block_nid)
         if parent != match.reset_loop_nid:
             raise AssertionError(f"initializer block {block_nid} moved out of reset loop")
-        reduction = ir.tree.isa(match.reduction_leaf_nid)
-        output_region = reduction.operand_bindings[match.output_operand]
-        kwargs = reduction.op_cls.with_first_write_overwrite(match.output_operand, reduction.kwargs)
-        ir.tree.graph.nodes[match.reduction_leaf_nid]["data"] = replace(reduction, kwargs=kwargs)
-        reduction_block_nid = match.option.reduction_block_nid
-        reduction_block = ir.tree.block(reduction_block_nid)
-        reads = tuple(region for region in reduction_block.reads if region != output_region)
-        if len(reads) + 1 != len(reduction_block.reads):
-            raise AssertionError(f"reduction block {reduction_block_nid} does not read its destination exactly once")
-        ir.tree.graph.nodes[reduction_block_nid]["data"] = replace(reduction_block, reads=reads)
         removed = {block_nid, *ir.tree.descendants(block_nid)}
         _replace_in_parent_children(ir.tree, match.reset_loop_nid, [block_nid], [])
         ir.tree.graph.remove_nodes_from(removed)
