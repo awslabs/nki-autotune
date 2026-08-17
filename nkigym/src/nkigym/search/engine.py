@@ -7,12 +7,13 @@ import math
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from nkigym.codegen import render
-from nkigym.environment import Action, KernelMDP
 from nkigym.ir import KernelIR
 from nkigym.profile import InputSpecs, ProfileMetrics, profile_metrics
-from nkigym.search.types import Policy, PolicyContext, SearchResult
+from nkigym.search.types import Action, Policy, PolicyContext, SearchResult
+from nkigym.transforms import Transform
 
 
 @dataclass(frozen=True)
@@ -43,22 +44,25 @@ class SearchConfig:
 class IterativeRefinement:
     """Apply policy-selected transforms and periodically evaluate the result."""
 
-    def __init__(self, environment: KernelMDP, policy: Policy, config: SearchConfig) -> None:
+    def __init__(
+        self, initial_state: KernelIR, transforms: tuple[Transform[Any], ...], policy: Policy, config: SearchConfig
+    ) -> None:
         """Store the fixed process collaborators."""
-        self.environment = environment
+        self.initial_state = initial_state
+        self.transforms = transforms
         self.policy = policy
         self.config = config
 
     def run(self) -> SearchResult:
         """Refine linearly until the policy or a process limit stops."""
         self._prepare_trace()
-        state = self.environment.reset()
+        state = self.initial_state
         evaluations = [self._evaluate(state, (), 0)]
         transforms_applied = 0
         finish_reason = self._stop_after_evaluation(evaluations)
 
         while finish_reason is None:
-            legal_actions = tuple(self.environment.legal_actions(state))
+            legal_actions = self._legal_actions(state)
             if not legal_actions:
                 finish_reason = "no legal transforms remain"
                 continue
@@ -93,13 +97,18 @@ class IterativeRefinement:
         self._write_result(result)
         return result
 
+    def _legal_actions(self, state: KernelIR) -> tuple[Action, ...]:
+        """Return every legal action in transform and option order."""
+        return tuple((transform, option) for transform in self.transforms for option in transform.analyze(state))
+
     def _apply_actions(self, state: KernelIR, actions: tuple[Action, ...]) -> KernelIR:
         """Apply an ordered sequence while re-checking every action."""
         current = state
         for action in actions:
-            if action not in self.environment.legal_actions(current):
+            if action not in self._legal_actions(current):
                 raise ValueError("policy returned an action that is not legal after its predecessors")
-            current = self.environment.step(current, action)
+            transform, option = action
+            current = transform.apply(current, option)
         return current
 
     def _evaluate(self, state: KernelIR, actions: tuple[Action, ...], evaluation_id: int) -> ProfileMetrics:

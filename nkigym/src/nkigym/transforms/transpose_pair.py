@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import copy
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from nkigym.ir import KernelIR
@@ -10,7 +10,7 @@ from nkigym.ir.tree import Buffer, ISANode
 from nkigym.ops.dma_transpose import NKIDMATranspose
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.transpose import NKITranspose
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.canonical_rewrite import (
     append_block,
     append_root_buffers,
@@ -79,50 +79,75 @@ class _TransposeExecution:
     output: str
 
 
+@dataclass(frozen=True)
+class _TransposeAnalysisFacts:
+    """Tree-wide facts shared by transpose-pair candidates."""
+
+    root_children: tuple[int, ...]
+    root_indices: dict[int, int]
+    root_owners: dict[int, int]
+    buffers: dict[str, Buffer]
+    extents: dict[str, int]
+    canonical_blocks: dict[int, bool]
+    input_uses: dict[str, tuple[tuple[int, str], ...]]
+    last_writer_positions: dict[str, int]
+    preorder_positions: dict[int, int]
+
+
 class TransposePair(Transform[TransposePairOption]):
     """Insert or cancel one behavior-preserving logical transpose pair."""
 
     def analyze(self, ir: KernelIR) -> list[TransposePairOption]:
         """Return every legal pair insertion and cancellation."""
         options: list[TransposePairOption] = []
-        pair_edges = _identity_pair_edges(ir)
-        for block_nid in ir.tree.children(ir.tree.root):
+        facts = _transpose_analysis_facts(ir)
+        executions = _transpose_executions(ir, facts)
+        cancel_matches = _cancel_matches_from_facts(ir, executions, facts)
+        pair_edges = _identity_pair_edges_from_matches(cancel_matches.values())
+        for block_nid in facts.root_children:
             leaf_nid = single_leaf(ir.tree, block_nid)
             if leaf_nid is not None:
                 leaf = ir.tree.isa(leaf_nid)
                 for operand, region in leaf.operand_bindings.items():
                     option = InsertTransposePairOption(consumer_nid=leaf_nid, operand=operand, source=region.tensor)
-                    if _match_insert(ir, option, pair_edges) is not None:
+                    if _match_insert(ir, option, pair_edges, facts) is not None:
                         options.append(option)
-        for block_nid in ir.tree.children(ir.tree.root):
-            option = CancelTransposePairOption(first_transpose_nid=block_nid)
-            if _match_cancel(ir, option) is not None:
-                options.append(option)
+        options.extend(
+            CancelTransposePairOption(first_transpose_nid=block_nid)
+            for block_nid in facts.root_children
+            if block_nid in cancel_matches
+        )
         return options
 
     def apply(self, ir: KernelIR, option: TransposePairOption) -> KernelIR:
         """Recheck and apply one insertion or cancellation."""
-        new_ir = copy.deepcopy(ir)
+        facts = _transpose_analysis_facts(ir)
+        executions = _transpose_executions(ir, facts)
+        cancel_matches = _cancel_matches_from_facts(ir, executions, facts)
         if isinstance(option, InsertTransposePairOption):
-            match = _match_insert(ir, option)
-            copied_match = _match_insert(new_ir, option)
-            if match is None or copied_match is None:
+            pair_edges = _identity_pair_edges_from_matches(cancel_matches.values())
+            match = _match_insert(ir, option, pair_edges, facts)
+            if match is None:
                 raise TransformLegalityError(
                     f"illegal transpose-pair insertion at {option.consumer_nid}:{option.operand}"
                 )
-            _apply_insert(new_ir, copied_match)
+            new_ir = copy_for_rewrite(ir)
+            _apply_insert(new_ir, match)
         else:
-            match = _match_cancel(ir, option)
-            copied_match = _match_cancel(new_ir, option)
-            if match is None or copied_match is None:
+            match = cancel_matches.get(option.first_transpose_nid)
+            if match is None:
                 raise TransformLegalityError(f"illegal transpose-pair cancellation at {option.first_transpose_nid}")
-            _apply_cancel(new_ir, copied_match)
+            new_ir = copy_for_rewrite(ir)
+            _apply_cancel(new_ir, match)
         finalize_rewrite(new_ir)
         return new_ir
 
 
 def _match_insert(
-    ir: KernelIR, option: InsertTransposePairOption, pair_edges: set[tuple[int, str, str]] | None = None
+    ir: KernelIR,
+    option: InsertTransposePairOption,
+    pair_edges: set[tuple[int, str, str]] | None = None,
+    facts: _TransposeAnalysisFacts | None = None,
 ) -> _InsertMatch | None:
     """Return one legal pair-insertion edge."""
     result: _InsertMatch | None = None
@@ -134,18 +159,25 @@ def _match_insert(
         and isinstance(ir.tree.data(option.consumer_nid), ISANode)
     ):
         consumer = ir.tree.isa(option.consumer_nid)
-        consumer_block = _root_owner(ir, option.consumer_nid)
+        consumer_block = (
+            facts.root_owners.get(option.consumer_nid) if facts is not None else _root_owner(ir, option.consumer_nid)
+        )
         input_bound = option.operand in consumer.op_cls.INPUT_OPERANDS and option.operand in consumer.operand_bindings
-        if consumer_block is not None and input_bound and is_canonical_block(ir, consumer_block):
+        canonical = (
+            facts.canonical_blocks.get(consumer_block, False)
+            if facts is not None and consumer_block is not None
+            else consumer_block is not None and is_canonical_block(ir, consumer_block)
+        )
+        if consumer_block is not None and input_bound and canonical:
             source = consumer.operand_bindings[option.operand].tensor
             axes = consumer.op_cls.OPERAND_AXES[option.operand]
-            buffers = ir.all_buffers()
+            buffers = facts.buffers if facts is not None else ir.all_buffers()
             axis_map = ir.tree.block(consumer_block).axis_map
             mapped = len(axes) == 2 and all(axis in axis_map for axis in axes)
             if source == option.source and source in buffers and mapped:
                 source_buffer = buffers[source]
                 source_axes = (axis_map[axes[0]], axis_map[axes[1]])
-                extents = axis_extents(ir)
+                extents = facts.extents if facts is not None else axis_extents(ir)
                 shape_matches = source_buffer.shape == tuple(extents[axis] for axis in source_axes)
                 tileable = all(extent >= 128 and extent % 128 == 0 for extent in source_buffer.shape)
                 physical_dtype = source_buffer.physical_dtype() == source_buffer.dtype
@@ -178,12 +210,17 @@ def _identity_pair_edges(ir: KernelIR) -> set[tuple[int, str, str]]:
     return pair_edges
 
 
-def _match_transpose_execution(ir: KernelIR, root_children: list[int], index: int) -> _TransposeExecution | None:
+def _match_transpose_execution(
+    ir: KernelIR, root_children: list[int], index: int, facts: _TransposeAnalysisFacts | None = None
+) -> _TransposeExecution | None:
     """Return one logical or DMA transpose beginning at ``index``."""
     result: _TransposeExecution | None = None
+    block_nid = root_children[index]
+    leaf_nid = single_leaf(ir.tree, block_nid)
+    op_cls = ir.tree.isa(leaf_nid).op_cls if leaf_nid is not None else None
     logical = (
-        match_transpose_chain(ir, root_children[index], root_children[index + 1])
-        if index + 1 < len(root_children)
+        match_transpose_chain(ir, block_nid, root_children[index + 1])
+        if op_cls is NKITranspose and index + 1 < len(root_children)
         else None
     )
     if logical is not None:
@@ -197,20 +234,23 @@ def _match_transpose_execution(ir: KernelIR, root_children: list[int], index: in
             output=logical.output,
         )
     else:
-        result = _match_dma_transpose_execution(ir, root_children[index])
+        result = _match_dma_transpose_execution(ir, block_nid, facts) if op_cls is NKIDMATranspose else None
     return result
 
 
-def _match_dma_transpose_execution(ir: KernelIR, block_nid: int) -> _TransposeExecution | None:
+def _match_dma_transpose_execution(
+    ir: KernelIR, block_nid: int, facts: _TransposeAnalysisFacts | None = None
+) -> _TransposeExecution | None:
     """Return one canonical DMA transpose over complete SBUF/HBM buffers."""
     result: _TransposeExecution | None = None
     leaf_nid = single_leaf(ir.tree, block_nid)
-    if leaf_nid is not None and is_canonical_block(ir, block_nid):
+    canonical = facts.canonical_blocks.get(block_nid, False) if facts is not None else is_canonical_block(ir, block_nid)
+    if leaf_nid is not None and canonical:
         leaf = ir.tree.isa(leaf_nid)
         if leaf.op_cls is NKIDMATranspose:
             source = leaf.operand_bindings["src"].tensor
             output = leaf.operand_bindings["dst"].tensor
-            buffers = ir.all_buffers()
+            buffers = facts.buffers if facts is not None else ir.all_buffers()
             if source in buffers and output in buffers:
                 source_buffer = buffers[source]
                 output_buffer = buffers[output]
@@ -233,6 +273,92 @@ def _match_dma_transpose_execution(ir: KernelIR, block_nid: int) -> _TransposeEx
                         source=source,
                         output=output,
                     )
+    return result
+
+
+def _transpose_analysis_facts(ir: KernelIR) -> _TransposeAnalysisFacts:
+    """Build one shared context for all transpose-pair candidates."""
+    root_children = tuple(ir.tree.children(ir.tree.root))
+    root_owners = {
+        nid: block_nid for block_nid in root_children for nid in (block_nid, *ir.tree.descendants(block_nid))
+    }
+    preorder = tuple(ir.tree.preorder())
+    positions = {nid: index for index, nid in enumerate(preorder)}
+    input_uses: dict[str, list[tuple[int, str]]] = {}
+    last_writers: dict[str, int] = {}
+    for leaf_nid in preorder:
+        node = ir.tree.data(leaf_nid)
+        if isinstance(node, ISANode):
+            for operand, region in node.operand_bindings.items():
+                if operand in node.op_cls.INPUT_OPERANDS:
+                    input_uses.setdefault(region.tensor, []).append((leaf_nid, operand))
+                else:
+                    last_writers[region.tensor] = positions[leaf_nid]
+    return _TransposeAnalysisFacts(
+        root_children=root_children,
+        root_indices={nid: index for index, nid in enumerate(root_children)},
+        root_owners=root_owners,
+        buffers=ir.all_buffers(),
+        extents=axis_extents(ir),
+        canonical_blocks={nid: is_canonical_block(ir, nid) for nid in root_children},
+        input_uses={tensor: tuple(uses) for tensor, uses in input_uses.items()},
+        last_writer_positions=last_writers,
+        preorder_positions=positions,
+    )
+
+
+def _transpose_executions(ir: KernelIR, facts: _TransposeAnalysisFacts) -> tuple[_TransposeExecution | None, ...]:
+    """Match each possible root-level transpose execution once."""
+    root_children = list(facts.root_children)
+    return tuple(_match_transpose_execution(ir, root_children, index, facts) for index in range(len(root_children)))
+
+
+def _cancel_matches_from_facts(
+    ir: KernelIR, executions: tuple[_TransposeExecution | None, ...], facts: _TransposeAnalysisFacts
+) -> dict[int, _CancelMatch]:
+    """Return cancellation matches keyed by their first root block."""
+    return {
+        facts.root_children[index]: match
+        for index in range(len(facts.root_children))
+        if (match := _match_cancel_from_facts(ir, index, executions, facts)) is not None
+    }
+
+
+def _identity_pair_edges_from_matches(matches: Iterable[_CancelMatch]) -> set[tuple[int, str, str]]:
+    """Return insertion edges already covered by matched identity pairs."""
+    pair_edges: set[tuple[int, str, str]] = set()
+    for match in matches:
+        pair_edges.add((match.first.input_leaf, match.first.input_operand, match.first.source))
+        pair_edges.add((match.second.input_leaf, match.second.input_operand, match.second.source))
+        pair_edges.update((leaf, operand, match.second.output) for leaf, operand in match.consumers)
+    return pair_edges
+
+
+def _match_cancel_from_facts(
+    ir: KernelIR, index: int, executions: tuple[_TransposeExecution | None, ...], facts: _TransposeAnalysisFacts
+) -> _CancelMatch | None:
+    """Return one cancellation match using pre-indexed tree facts."""
+    result: _CancelMatch | None = None
+    first = executions[index]
+    if first is not None:
+        second_index = index + len(first.blocks)
+        second = executions[second_index] if second_index < len(executions) else None
+        if second is not None and second.source == first.output:
+            consumers = tuple(use for use in facts.input_uses.get(second.output, ()) if use[0] != second.output_leaf)
+            exact_middle = set(ir.dependency.touches_by_tensor.get(first.output, ())) == {
+                first.output_leaf,
+                second.input_leaf,
+            }
+            exact_output = set(ir.dependency.touches_by_tensor.get(second.output, ())) == {
+                second.output_leaf,
+                *(leaf for leaf, _operand in consumers),
+            }
+            restored_shape = facts.buffers[second.output].shape == facts.buffers[first.source].shape
+            source_stable = (
+                facts.last_writer_positions.get(first.source, -1) <= facts.preorder_positions[first.input_leaf]
+            )
+            if consumers and exact_middle and exact_output and restored_shape and source_stable:
+                result = _CancelMatch(first=first, second=second, consumers=consumers)
     return result
 
 

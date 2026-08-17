@@ -7,7 +7,6 @@ are manifested by the renderer."""
 
 from __future__ import annotations
 
-import copy
 import itertools
 from dataclasses import dataclass, replace
 from weakref import WeakKeyDictionary
@@ -17,7 +16,7 @@ from nkigym.ir.arith.expr import Add, Const, Expr, Var, substitute
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.access_pattern import tensor_has_access_pattern
 
 _EXHAUSTIVE_STAGE_CHILD_LIMIT = 8
@@ -61,7 +60,7 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
         """Re-check legality, deep-copy, derive versions, write annotation."""
         children = self._selected_children(ir, option)
         self._check_legality(ir, option, children)
-        new_ir = copy.deepcopy(ir)
+        new_ir = copy_for_rewrite(ir)
         new_children = list(new_ir.tree.children(option.loop_nid))
         versioned_buffers = self._apply_versions(new_ir, option, new_children)
         parent = self._parent_block(new_ir, option.loop_nid)

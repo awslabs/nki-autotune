@@ -29,6 +29,7 @@ class _CanonicalContext:
 
     buffers: dict[str, Buffer]
     extents: dict[str, int]
+    canonical_blocks: dict[int, bool]
 
 
 _CONTEXTS: WeakKeyDictionary[KernelTree, _CanonicalContext] = WeakKeyDictionary()
@@ -39,7 +40,7 @@ def _canonical_context(ir: KernelIR) -> _CanonicalContext:
     """Return cached canonical-matching facts for the current tree."""
     context = _CONTEXTS.get(ir.tree)
     if context is None:
-        context = _CanonicalContext(buffers=ir.all_buffers(), extents=axis_extents(ir))
+        context = _CanonicalContext(buffers=ir.all_buffers(), extents=axis_extents(ir), canonical_blocks={})
         _CONTEXTS[ir.tree] = context
     return context
 
@@ -89,18 +90,22 @@ def owning_block(tree: KernelTree, leaf_nid: int) -> int:
 
 def is_canonical_block(ir: KernelIR, block_nid: int) -> bool:
     """Return whether ``block_nid`` exactly matches canonical construction."""
-    result = False
-    leaf_nid = single_leaf(ir.tree, block_nid)
-    if leaf_nid is not None:
-        leaf = ir.tree.isa(leaf_nid)
-        operand_names = {slot: region.tensor for slot, region in leaf.operand_bindings.items()}
-        spec = canonical_spec(
-            ir, leaf.op_cls, operand_names, ir.tree.block(block_nid).axis_map, leaf.kwargs, _canonical_context(ir)
-        )
-        chain = block_chain(ir.tree, block_nid)
-        if spec is not None and chain is not None:
-            block = replace(ir.tree.block(block_nid), alloc_buffers=())
-            result = (block, *chain[1:]) == (spec.block, *spec.loops, spec.leaf)
+    context = _canonical_context(ir)
+    result = context.canonical_blocks.get(block_nid)
+    if result is None:
+        result = False
+        leaf_nid = single_leaf(ir.tree, block_nid)
+        if leaf_nid is not None:
+            leaf = ir.tree.isa(leaf_nid)
+            operand_names = {slot: region.tensor for slot, region in leaf.operand_bindings.items()}
+            spec = canonical_spec(
+                ir, leaf.op_cls, operand_names, ir.tree.block(block_nid).axis_map, leaf.kwargs, context
+            )
+            chain = block_chain(ir.tree, block_nid)
+            if spec is not None and chain is not None:
+                block = replace(ir.tree.block(block_nid), alloc_buffers=())
+                result = (block, *chain[1:]) == (spec.block, *spec.loops, spec.leaf)
+        context.canonical_blocks[block_nid] = result
     return result
 
 

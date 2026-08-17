@@ -8,7 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from nkigym.environment import KernelMDP
+from nkigym.ir import build_initial_ir
 from nkigym.profile import InputSpecs
 from nkigym.search.engine import IterativeRefinement, SearchConfig
 from nkigym.search.types import Policy, SearchResult
@@ -36,7 +36,8 @@ def run_search(
         if output_dir is None:
             output_dir = Path(stack.enter_context(TemporaryDirectory(prefix="nkigym-search-")))
         refinement = IterativeRefinement(
-            environment=KernelMDP(kernel_func, input_specs, public_transforms()),
+            initial_state=build_initial_ir(kernel_func, input_specs),
+            transforms=tuple(public_transforms()),
             policy=policy,
             config=SearchConfig(
                 trace_dir=output_dir,

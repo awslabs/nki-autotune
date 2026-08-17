@@ -41,8 +41,16 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
         options: list[CommonSubexpressionEliminationOption] = []
         for parent_nid in ir.tree.preorder():
             blocks = [nid for nid in ir.tree.children(parent_nid) if isinstance(ir.tree.data(nid), BlockNode)]
-            for index, canonical_nid in enumerate(blocks):
-                for redundant_nid in blocks[index + 1 :]:
+            pointwise_blocks = [
+                nid
+                for nid in blocks
+                if (leaf_nid := single_leaf(ir.tree, nid)) is not None
+                and isinstance(
+                    ir.tree.isa(leaf_nid).op_cls.algebraic_contract(ir.tree.isa(leaf_nid).kwargs), PointwiseContract
+                )
+            ]
+            for index, canonical_nid in enumerate(pointwise_blocks):
+                for redundant_nid in pointwise_blocks[index + 1 :]:
                     option = CommonSubexpressionEliminationOption(
                         canonical_block_nid=canonical_nid, redundant_block_nid=redundant_nid
                     )

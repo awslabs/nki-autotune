@@ -6,7 +6,7 @@ import copy
 from dataclasses import dataclass
 
 from nkigym.ir import KernelIR
-from nkigym.ir.buffer_placement import place_buffer
+from nkigym.ir.buffer_placement import buffer_placement_targets, place_buffer
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, KernelTree
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
@@ -54,27 +54,16 @@ class BufferPlacement(Transform[BufferPlacementOption]):
             raise TransformLegalityError(f"BufferPlacement: {option.tensor} is shared_hbm (must remain at root)")
         if tensor_has_access_pattern(ir.tree, option.tensor):
             raise TransformLegalityError(f"BufferPlacement: {option.tensor} participates in an explicit access pattern")
-        if not self._would_change(ir.tree, option.tensor):
+        if option.tensor not in self._would_change_many(ir.tree, (option.tensor,)):
             raise TransformLegalityError(f"BufferPlacement: {option.tensor} is already at its target scope (no-op)")
 
-    def _would_change(self, tree: KernelTree, tensor: str) -> bool:
-        """Return whether selected declaration placement would change."""
-        before = _declaration_blocks(tree, frozenset((tensor,)))[tensor]
-        probe = copy.deepcopy(tree)
-        place_buffer(probe, tensor)
-        after = _declaration_blocks(probe, frozenset((tensor,)))[tensor]
-        return after != before
-
     def _would_change_many(self, tree: KernelTree, tensors: tuple[str, ...]) -> set[str]:
-        """Return declarations that move using one selected-buffer-only probe."""
+        """Return declarations whose computed lifetime-safe block differs."""
         selected = frozenset(tensors)
         changed: set[str] = set()
         if selected:
             before = _declaration_blocks(tree, selected)
-            probe = copy.deepcopy(tree)
-            for tensor in tensors:
-                place_buffer(probe, tensor)
-            after = _declaration_blocks(probe, selected)
+            after = buffer_placement_targets(tree, tensors)
             changed = {tensor for tensor in tensors if after[tensor] != before[tensor]}
         return changed
 

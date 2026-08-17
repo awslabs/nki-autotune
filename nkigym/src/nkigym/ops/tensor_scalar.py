@@ -1,4 +1,4 @@
-"""Tensor-scalar elementwise op: ``nisa.tensor_scalar`` + ``tensor_scalar_block`` gadget.
+"""Tensor-scalar ``nisa.tensor_scalar`` operation.
 
 Applies ``output = data <op> operand0`` where ``operand0`` is either a
 compile-time scalar or a per-partition ``(P,)`` vector broadcast along
@@ -9,8 +9,6 @@ form to multiply ``(d0, d1)`` lhs tiles by the 1D rsqrt result.
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
-import nki.isa as nisa
-import nki.language as nl
 import numpy as np
 
 from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
@@ -19,7 +17,6 @@ VE_PARTITION_MAX = 128
 VE_FREE_MAX = 512
 
 _OPS: dict[str, Any] = {"multiply": np.multiply, "add": np.add, "subtract": np.subtract}
-_NL_OPS: dict[str, Any] = {"multiply": nl.multiply, "add": nl.add, "subtract": nl.subtract}
 
 
 class NKITensorScalar(NKIOp):
@@ -73,25 +70,3 @@ class NKITensorScalar(NKIOp):
         )
         operands = (broadcast, data) if kwargs.get("reverse0", False) else (data, broadcast)
         return _OPS[kwargs["op0"]](*operands)
-
-
-def tensor_scalar_block(sbuf_dst: Any, sbuf_data: Any, sbuf_operand0: Any, op: Any) -> None:
-    """Apply ``dst[i] = data[i] <op> operand0[i]`` per leaf, broadcasting along F.
-
-    ``sbuf_operand0`` is a list of ``(p_tile, 1)`` leaves — one per
-    M-tile. ``sbuf_data`` / ``sbuf_dst`` are lists of ``(p_tile, f_tile)``
-    leaves.
-    """
-    p_tile, f_tile = sbuf_data[0].shape
-    for i in range(len(sbuf_data)):
-        nisa.tensor_scalar(
-            dst=sbuf_dst[i][0:p_tile, 0:f_tile],
-            data=sbuf_data[i][0:p_tile, 0:f_tile],
-            op0=op,
-            operand0=sbuf_operand0[i][0:p_tile, 0:1],
-        )
-
-
-def nl_op(name: str) -> Any:
-    """Resolve an op-name string to its ``nl.*`` callable."""
-    return _NL_OPS[name]

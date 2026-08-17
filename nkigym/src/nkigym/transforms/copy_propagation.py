@@ -6,7 +6,7 @@ import copy
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
-from nkigym.ir.tree import BlockNode, BufferRegion, ISANode
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ISANode
 from nkigym.ops.base import CopyContract
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption
 from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, remove_buffers, single_leaf
@@ -39,6 +39,7 @@ class CopyPropagation(Transform[CopyPropagationOption]):
     def analyze(self, ir: KernelIR) -> list[CopyPropagationOption]:
         """Return every adjacent copy-consumer pair accepted by storage contracts."""
         options: list[CopyPropagationOption] = []
+        buffers = ir.all_buffers()
         for parent_nid in ir.tree.preorder():
             children = ir.tree.children(parent_nid)
             for copy_nid, consumer_nid in zip(children, children[1:]):
@@ -54,23 +55,25 @@ class CopyPropagation(Transform[CopyPropagationOption]):
                     option = CopyPropagationOption(
                         copy_block_nid=copy_nid, consumer_block_nid=consumer_nid, consumer_operand=operand
                     )
-                    if self._resolve(ir, option) is not None:
+                    if self._resolve(ir, option, buffers) is not None:
                         options.append(option)
         return options
 
     def apply(self, ir: KernelIR, option: CopyPropagationOption) -> KernelIR:
         """Recheck, copy, propagate the source region, and delete the copy."""
-        match = self._resolve(ir, option)
+        match = self._resolve(ir, option, ir.all_buffers())
         if match is None:
             raise TransformLegalityError(f"illegal CopyPropagation option: {option}")
         new_ir = copy.deepcopy(ir)
-        copied_match = self._resolve(new_ir, option)
+        copied_match = self._resolve(new_ir, option, new_ir.all_buffers())
         if copied_match is None:
             raise AssertionError(f"CopyPropagation option disappeared after deepcopy: {option}")
         self._rewrite(new_ir, copied_match)
         return new_ir
 
-    def _resolve(self, ir: KernelIR, option: CopyPropagationOption) -> _CopyPropagationMatch | None:
+    def _resolve(
+        self, ir: KernelIR, option: CopyPropagationOption, buffers: dict[str, Buffer]
+    ) -> _CopyPropagationMatch | None:
         """Resolve an option when copy semantics, storage, and use-def all agree."""
         result: _CopyPropagationMatch | None = None
         copy_nid = option.copy_block_nid
@@ -106,8 +109,8 @@ class CopyPropagation(Transform[CopyPropagationOption]):
             return result
         if copied.tensor in ir.param_buffers or copied.tensor in ir.return_names:
             return result
-        copied_buffer = ir.buffer(copied.tensor)
-        source_buffer = ir.buffer(source.tensor)
+        copied_buffer = buffers[copied.tensor]
+        source_buffer = buffers[source.tensor]
         accepted = consumer_leaf.op_cls.INPUT_LOCATIONS.get(option.consumer_operand, frozenset())
         required_dtype = consumer_leaf.op_cls.REQUIRED_INPUT_STORAGE_DTYPES.get(option.consumer_operand)
         if (

@@ -13,6 +13,7 @@ Each concrete transform under :mod:`nkigym.transforms` subclasses
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -30,6 +31,15 @@ class TransformOption:
 
 class TransformLegalityError(ValueError):
     """Raised by :meth:`Transform.apply` when ``option`` is illegal for ``ir``."""
+
+
+def copy_for_rewrite(ir: KernelIR) -> KernelIR:
+    """Copy mutable IR state without cloning dependency data that will be rebuilt."""
+    result = copy.copy(ir)
+    result.param_names = list(ir.param_names)
+    result.param_buffers = dict(ir.param_buffers)
+    result.tree = copy.deepcopy(ir.tree)
+    return result
 
 
 _OptionT = TypeVar("_OptionT", bound=TransformOption)
@@ -52,4 +62,4 @@ class Transform(Generic[_OptionT]):
         raise NotImplementedError
 
 
-__all__ = ["Transform", "TransformLegalityError", "TransformOption"]
+__all__ = ["Transform", "TransformLegalityError", "TransformOption", "copy_for_rewrite"]

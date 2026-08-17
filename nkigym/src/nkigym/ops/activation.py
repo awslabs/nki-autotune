@@ -1,14 +1,10 @@
-"""Standalone activation op: ``nisa.activation`` + ``activation_block`` gadget.
+"""Standalone ``nisa.activation`` operation.
 
 Applies ``op(data * scale + bias)`` elementwise. Unlike
 :class:`NKIActivationReduce` this op does not reduce the free axis —
 its output matches the input shape. Used for 1D per-row math such as
 ``rsqrt(m_state/K + eps)`` and ``reciprocal(rms_old)`` in the
 online-fused rmsnorm+matmul kernel.
-
-The underlying gadget ``activation_block`` is shared with
-:mod:`nkigym.ops.activation_reduce` — it's the same call the reducer's
-``post_op`` phase emits after the F loop closes.
 """
 
 from collections.abc import Mapping

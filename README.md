@@ -31,20 +31,22 @@ workload metadata, and use
 [`neuron-explorer capture`](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/use-neuron-profile.html)
 to profile one execution.
 
-Use the top-level function for hardware profiling:
+Use the metrics API for hardware profiling:
 
 ```python
 from pathlib import Path
 
-from nkigym.profile import profile
+from nkigym.profile import profile_metrics
 
-mfu_percent, latency_ms = profile(
+metrics = profile_metrics(
     host="gym-1",
     kernel=Path("kernel.py").read_text(),
     func_name="nki_kernel",
     input_specs={"x": ((128, 512), "bfloat16")},
     cache_dir="/tmp/kernel-profile",
 )
+
+print(metrics.mfu_percent, metrics.latency_ms)
 ```
 
 The cache directory contains the submitted kernel and request, transport and
@@ -77,17 +79,19 @@ call a model service:
 ```python
 import numpy as np
 
-from nkigym.synthesis import compile_numpy_to_nkigym
+from nkigym.synthesis import synthesize_numpy_to_nkigym
 
 
 def f_numpy(lhs, rhs):
     return lhs.astype(np.float32) @ rhs.astype(np.float32)
 
 
-source = compile_numpy_to_nkigym(
+kernel = synthesize_numpy_to_nkigym(
     f_numpy,
     {"lhs": ((2048, 2048), "bfloat16"), "rhs": ((2048, 2048), "bfloat16")},
 )
+
+source = kernel.source
 ```
 
 The supported subset includes 2D transpose and matmul, scalar or per-row

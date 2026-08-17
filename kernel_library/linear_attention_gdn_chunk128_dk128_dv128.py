@@ -69,5 +69,5 @@ WORKLOAD = {
     "input_generator": _input_generator,
     "atol": 1e-2,
     "rtol": 0.0,
-    "best_historical_latency_ms": 0.04329,
+    "best_historical_latency_ms": 0.035689111,
 }
