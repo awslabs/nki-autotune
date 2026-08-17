@@ -24,6 +24,21 @@ worker dependencies remotely. The `--host` option accepts one or more SSH
 destinations. The installer requires `python3`, `ssh`, and `rsync`; the Trn2
 host must already have the Neuron driver, runtime, and tools.
 
+## Tests
+
+Host-dependent acceptance tests have no repository defaults. Pass the Trn2 and
+CPU SSH destinations on every run:
+
+```bash
+pytest \
+  --trn2-hosts gym-trn2-1 gym-trn2-2 \
+  --cpu-hosts gym-cpu-1 gym-cpu-2
+```
+
+Each option accepts one or more hosts. Search workloads are distributed across
+the Trn2 hosts, while each CPU simulation batch uses all CPU hosts. Tests that
+do not use remote hosts can run without these options.
+
 CPU checks use the official
 [`nki.simulate`](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.simulate.html)
 API. Hardware profiles upload only the rendered `kernel.py`, stream its
@@ -100,10 +115,30 @@ reductions. Unsupported operations raise `ValueError`.
 
 ## Kernel Library
 
-Each module exposes one dictionary containing the NumPy reference, fixed input
-specifications, seeded input generator, correctness tolerances, and historical
-latency. `kernel_library.WORKLOADS` discovers modules automatically. Tests
-synthesize kernels directly from these dictionaries.
+Every workload is an exact seven-field dictionary containing a copied NAKB
+PyTorch golden reference, tensor input specifications, seeded input generator,
+correctness tolerances, a fixed NAKB baseline in `nakb_latency_ms`, and one
+best historical latency.
+
+`kernel_library.NAKB_WORKLOADS` contains 127 complete measured NAKB targets
+grouped into 26 flat, self-contained Python modules by workload type. Static
+numerical choices are bound into the callable, and configurations with
+different callables, input specifications, generators, tolerances, or latency
+records remain separate dictionaries. NAKB configurations without every
+required field are not included. `kernel_library.WORKLOADS` exposes only exact
+aliases to entries in `NAKB_WORKLOADS`.
+
+The seeded generators retain NAKB's NumPy input-generation convention.
+`TorchReference` applies NAKB's NumPy-to-Torch argument conversion before
+calling the copied golden:
+
+```python
+from kernel_library import NAKB_WORKLOADS
+
+workload = NAKB_WORKLOADS["cumsum"][0]
+inputs = workload["input_generator"](workload["input_specs"], seed=0)
+outputs = workload["torch_ref"](**inputs)
+```
 
 ## Security
 
