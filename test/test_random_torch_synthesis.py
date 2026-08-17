@@ -1,4 +1,4 @@
-"""Random NumPy expression-graph coverage for programmatic synthesis."""
+"""Random Torch expression-graph coverage for programmatic synthesis."""
 
 from __future__ import annotations
 
@@ -8,13 +8,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
-import numpy as np
 import pytest
+import torch
 
-from nkigym.synthesis import synthesize_numpy_to_nkigym
+from nkigym.profile import InputSpecs
+from nkigym.synthesis import synthesize_torch_to_nkigym
 
-InputSpecs = dict[str, tuple[tuple[int, ...], str]]
-NumpyFunction = Callable[..., np.ndarray]
+TorchFunction = Callable[..., torch.Tensor]
 RANDOM_PROGRAM_COUNT = 12
 MATRIX_EXTENTS = (128, 256)
 INPUT_NAMES = ("input_a", "input_b", "input_c")
@@ -22,8 +22,8 @@ SCALARS = (0.25, 0.5, 0.75, 1.25)
 
 
 @dataclass(frozen=True)
-class RandomNumpyProgram:
-    """One generated NumPy function and its replay metadata."""
+class RandomTorchProgram:
+    """One generated Torch function and its replay metadata."""
 
     source: str
     input_specs: InputSpecs
@@ -35,13 +35,13 @@ def _combine_expression(current: str, operand: str, rng: random.Random) -> tuple
     scalar = rng.choice(SCALARS)
     operation = rng.choice(("add", "subtract", "multiply", "maximum"))
     if operation == "add":
-        expression = f"{current} + {scalar!r} * np.tanh({operand})"
+        expression = f"{current} + {scalar!r} * torch.tanh({operand})"
     elif operation == "subtract":
-        expression = f"{current} - {scalar!r} * np.tanh({operand})"
+        expression = f"{current} - {scalar!r} * torch.tanh({operand})"
     elif operation == "multiply":
-        expression = f"{current} * np.tanh({operand})"
+        expression = f"{current} * torch.tanh({operand})"
     else:
-        expression = f"np.maximum({current}, {operand})"
+        expression = f"torch.maximum({current}, {operand})"
     return expression, operation
 
 
@@ -53,9 +53,9 @@ def _random_expression(current: str, rng: random.Random) -> tuple[str, str]:
         ("tanh", "square_tanh", "add_scalar", "subtract_scalar", "reverse_subtract", "multiply_scalar", "combine")
     )
     if operation == "tanh":
-        expression = f"np.tanh({current})"
+        expression = f"torch.tanh({current})"
     elif operation == "square_tanh":
-        expression = f"np.square(np.tanh({current}))"
+        expression = f"torch.square(torch.tanh({current}))"
     elif operation == "add_scalar":
         expression = f"{current} + {scalar!r}"
     elif operation == "subtract_scalar":
@@ -69,8 +69,8 @@ def _random_expression(current: str, rng: random.Random) -> tuple[str, str]:
     return expression, operation
 
 
-def _random_program(seed: int) -> RandomNumpyProgram:
-    """Construct one replayable straight-line NumPy expression graph."""
+def _random_program(seed: int) -> RandomTorchProgram:
+    """Construct one replayable straight-line Torch expression graph."""
     rng = random.Random(seed)
     shape = (rng.choice(MATRIX_EXTENTS), rng.choice(MATRIX_EXTENTS))
     remaining_inputs = list(INPUT_NAMES)
@@ -92,28 +92,28 @@ def _random_program(seed: int) -> RandomNumpyProgram:
         operations.append(operation)
         current = target
     body = "\n".join((*statements, f"    return {current}"))
-    source = f"def f_numpy({', '.join(INPUT_NAMES)}):\n{body}\n"
+    source = f"def f_torch({', '.join(INPUT_NAMES)}):\n{body}\n"
     input_specs: InputSpecs = {name: (shape, "bfloat16") for name in INPUT_NAMES}
-    return RandomNumpyProgram(source=source, input_specs=input_specs, operations=tuple(operations))
+    return RandomTorchProgram(source=source, input_specs=input_specs, operations=tuple(operations))
 
 
-def _compile_numpy_function(program: RandomNumpyProgram, seed: int, program_index: int) -> NumpyFunction:
+def _compile_torch_function(program: RandomTorchProgram, seed: int, program_index: int) -> TorchFunction:
     """Compile generated source while retaining it for AST-based synthesis."""
-    filename = f"<random-numpy-synthesis-{seed}-{program_index}>"
+    filename = f"<random-torch-synthesis-{seed}-{program_index}>"
     linecache.cache[filename] = (len(program.source), None, program.source.splitlines(keepends=True), filename)
-    namespace: dict[str, object] = {"__name__": "__random_numpy_synthesis__", "np": np}
+    namespace: dict[str, object] = {"__name__": "__random_torch_synthesis__", "torch": torch}
     exec(compile(program.source, filename, "exec"), namespace)  # noqa: S102
-    function = namespace.get("f_numpy")
+    function = namespace.get("f_torch")
     if not callable(function):
-        raise RuntimeError("generated source did not define f_numpy")
-    return cast(NumpyFunction, function)
+        raise RuntimeError("generated source did not define f_torch")
+    return cast(TorchFunction, function)
 
 
-def _random_inputs(input_specs: InputSpecs, rng: random.Random) -> dict[str, np.ndarray]:
+def _random_inputs(input_specs: InputSpecs, rng: random.Random) -> dict[str, torch.Tensor]:
     """Generate independent replayable FP32 inputs."""
-    numpy_rng = np.random.default_rng(rng.randrange(1 << 63))
+    generator = torch.Generator().manual_seed(rng.randrange(1 << 63))
     return {
-        name: numpy_rng.uniform(-0.5, 0.5, size=shape).astype(np.float32)
+        name: torch.rand(shape, generator=generator, dtype=torch.float32) - 0.5
         for name, (shape, _dtype) in input_specs.items()
     }
 
@@ -121,23 +121,24 @@ def _random_inputs(input_specs: InputSpecs, rng: random.Random) -> dict[str, np.
 @pytest.mark.parametrize(
     "program_index", [pytest.param(index, id=f"random_program_{index}") for index in range(RANDOM_PROGRAM_COUNT)]
 )
-def test_random_numpy_functions_synthesize_and_match_fp32(program_index: int) -> None:
-    """Synthesize one random NumPy expression graph and compare fresh inputs."""
+def test_random_torch_functions_synthesize_and_match_fp32(program_index: int) -> None:
+    """Synthesize one random Torch expression graph and compare fresh inputs."""
     seed = random.SystemRandom().randrange(1 << 63)
     rng = random.Random(seed)
     program = _random_program(seed)
     print(
         f"program={program_index} seed={seed} operations={','.join(program.operations)}\n{program.source}", flush=True
     )
-    function = _compile_numpy_function(program, seed, program_index)
-    kernel = synthesize_numpy_to_nkigym(function, program.input_specs, seed=rng.randrange(1 << 63))
+    function = _compile_torch_function(program, seed, program_index)
+    kernel = synthesize_torch_to_nkigym(function, program.input_specs, seed=rng.randrange(1 << 63))
     reference_inputs = _random_inputs(program.input_specs, rng)
-    expected = function(**{name: value.copy() for name, value in reference_inputs.items()})
-    actual = kernel.function(**{name: value.copy() for name, value in reference_inputs.items()})
-    np.testing.assert_allclose(
-        actual,
-        expected,
+    expected = kernel.adapt_output(function(**{name: value.clone() for name, value in reference_inputs.items()}))
+    kernel_inputs = kernel.adapt_inputs({name: value.clone() for name, value in reference_inputs.items()})
+    actual = kernel.function(**kernel_inputs)
+    torch.testing.assert_close(
+        torch.as_tensor(actual),
+        torch.as_tensor(expected),
         atol=5e-3,
         rtol=5e-3,
-        err_msg=f"program={program_index} seed={seed} operations={program.operations}",
+        msg=f"program={program_index} seed={seed} operations={program.operations}",
     )

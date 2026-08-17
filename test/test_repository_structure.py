@@ -20,12 +20,20 @@ nkigym/src/nkigym/
         |-- __init__.py
         `-- <helper>.py              no public transforms
 
+kernel_library/
+|-- __init__.py
+`-- nakb_<workload>.py               one direct Python module per workload
+
 Only the files shown above are allowed under ops and transforms. Every transform
 Python file must have fewer than 1,000 code lines, and all helper Python files
 together must have fewer than 1,000 code lines. Blank lines, comments, and
 documentation strings do not count. Public transforms must directly define
 typed, synchronous analyze and apply methods. Formatter-control comments are
 forbidden because they permit multiple statements to be hidden on one line.
+Only the package initializer and direct workload Python modules are allowed
+under kernel_library; helper files and subdirectories are forbidden. No Python
+source files are allowed outside the documented nkigym implementation
+directories.
 
 Required package initializers: nkigym, codegen, ir, ir/arith, ops, profile,
 search, synthesis, transforms, and transforms/helper.
@@ -69,6 +77,7 @@ OP_BASE_FILE_LINE_LIMIT = 500
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_IMPORT_ROOTS = {"developer", "kernel_library", "nkigym"}
 FORMATTER_TARGETS = ("nkigym/src", "kernel_library", "test")
+NKIGYM_IMPLEMENTATION_DIRECTORIES = frozenset({"codegen", "ir", "ops", "profile", "search", "synthesis", "transforms"})
 REQUIRED_PACKAGE_INITIALIZERS = frozenset(
     {
         "nkigym/src/nkigym/__init__.py",
@@ -195,6 +204,23 @@ def _package_initializer_violations() -> list[str]:
     for relative_path in sorted(REQUIRED_PACKAGE_INITIALIZERS):
         if not (REPOSITORY_ROOT / relative_path).is_file():
             violations.append(f"{relative_path} is required")
+    return violations
+
+
+def _nkigym_source_layout_violations() -> list[str]:
+    """Reject Python source outside the documented implementation directories."""
+    source_directory = REPOSITORY_ROOT / "nkigym/src/nkigym"
+    violations: list[str] = []
+    for relative_path in _repository_files(source_directory):
+        is_root_initializer = relative_path == Path("__init__.py")
+        is_implementation_file = (
+            len(relative_path.parts) > 1 and relative_path.parts[0] in NKIGYM_IMPLEMENTATION_DIRECTORIES
+        )
+        if relative_path.suffix == ".py" and not is_root_initializer and not is_implementation_file:
+            violations.append(
+                f"nkigym/src/nkigym/{relative_path.as_posix()} is not allowed; keep Python source under a "
+                "documented implementation directory"
+            )
     return violations
 
 
@@ -329,6 +355,23 @@ def _operation_structure_violations() -> tuple[list[str], int, int, int]:
     return violations, operation_count, largest_operation_file, base_lines
 
 
+def _kernel_library_structure_violations() -> list[str]:
+    """Allow only the initializer and direct NAKB workload modules."""
+    kernel_library_directory = REPOSITORY_ROOT / "kernel_library"
+    violations: list[str] = []
+    for relative_path in _repository_files(kernel_library_directory):
+        is_initializer = relative_path == Path("__init__.py")
+        is_workload_module = (
+            len(relative_path.parts) == 1 and relative_path.suffix == ".py" and relative_path.name.startswith("nakb_")
+        )
+        if not is_initializer and not is_workload_module:
+            violations.append(
+                f"kernel_library/{relative_path.as_posix()} is not allowed; keep only __init__.py and direct "
+                "nakb_*.py workload modules"
+            )
+    return violations
+
+
 def _transform_api_violations() -> list[str]:
     """Return all public analyze/apply contract violations."""
     inspections = inspect_transform_api(REPOSITORY_ROOT)
@@ -436,9 +479,11 @@ def test_repository_structure() -> None:
     )
     violations = [
         *_package_initializer_violations(),
+        *_nkigym_source_layout_violations(),
         *structure_violations,
         *operation_violations,
         *api_violations,
+        *_kernel_library_structure_violations(),
         *_formatter_control_violations(source_root),
         *_dependency_violations(),
         *_search_schedule_violations(),
