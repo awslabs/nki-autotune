@@ -11,6 +11,7 @@ from typing import Any, ClassVar, Literal
 import numpy as np
 
 from nkigym.ops.base import AxisRole, NKIOp, ReductionContract, _operand_role, reduction_combinator
+from nkigym.ops.tensor_scalar import NKITensorScalar
 
 _OPS: dict[str, Any] = {
     "abs": lambda data, _operand: np.abs(data),
@@ -79,6 +80,9 @@ class NKITensorScalarReduce(NKIOp):
             scale=scale,
             bias=bias,
             mapped_output_operand="dst",
+            mapped_op_cls=NKITensorScalar,
+            mapped_input_operands=("data", "operand0"),
+            mapped_excluded_kwargs=frozenset({"reduce_op"}),
         )
 
     def _check_roles(self, **kwargs: Any) -> None:

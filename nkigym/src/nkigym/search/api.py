@@ -53,6 +53,3 @@ def run_search(
         )
         result = refinement.run()
     return result
-
-
-__all__ = ["run_search"]

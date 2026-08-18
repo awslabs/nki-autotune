@@ -8,10 +8,12 @@ from nkigym.transforms.base import Transform, TransformLegalityError, TransformO
 _PUBLIC_TRANSFORMS = (
     ("batch_permutation", "BatchPermutation"),
     ("buffer_placement", "BufferPlacement"),
+    ("buffer_region_normalization", "BufferRegionNormalization"),
     ("buffer_compaction", "BufferCompaction"),
     ("buffer_layout", "BufferLayout"),
     ("code_motion", "CodeMotion"),
     ("common_subexpression_elimination", "CommonSubexpressionElimination"),
+    ("commute_broadcast_factor", "CommuteBroadcastFactor"),
     ("copy_propagation", "CopyPropagation"),
     ("decompose_broadcast_subtract", "DecomposeBroadcastSubtract"),
     ("eliminate_dead_producer", "EliminateDeadProducer"),
@@ -19,13 +21,14 @@ _PUBLIC_TRANSFORMS = (
     ("fuse", "Fuse"),
     ("fuse_pointwise", "FusePointwise"),
     ("online_fusion", "OnlineFusion"),
+    ("program_shard", "ProgramShard"),
+    ("program_store_partition", "ProgramStorePartition"),
     ("reorder", "Reorder"),
     ("rfactor", "RFactor"),
     ("set_first_write_overwrite", "SetFirstWriteOverwrite"),
     ("software_pipeline", "SoftwarePipeline"),
     ("split", "Split"),
     ("transpose_pair", "TransposePair"),
-    ("transpose_through_load", "TransposeThroughLoad"),
     ("transpose_through_matmul", "TransposeThroughMatmul"),
     ("transpose_through_tensor_copy", "TransposeThroughTensorCopy"),
 )
@@ -38,11 +41,15 @@ _EXPORT_MODULES = {
     "BufferLayoutOption": "buffer_layout",
     "BufferPlacement": "buffer_placement",
     "BufferPlacementOption": "buffer_placement",
+    "BufferRegionNormalization": "buffer_region_normalization",
+    "BufferRegionNormalizationOption": "buffer_region_normalization",
     "CancelTransposePairOption": "transpose_pair",
     "CodeMotion": "code_motion",
     "CodeMotionOption": "code_motion",
     "CommonSubexpressionElimination": "common_subexpression_elimination",
     "CommonSubexpressionEliminationOption": "common_subexpression_elimination",
+    "CommuteBroadcastFactor": "commute_broadcast_factor",
+    "CommuteBroadcastFactorOption": "commute_broadcast_factor",
     "CopyPropagation": "copy_propagation",
     "CopyPropagationOption": "copy_propagation",
     "DecomposeBroadcastSubtract": "decompose_broadcast_subtract",
@@ -58,6 +65,10 @@ _EXPORT_MODULES = {
     "InsertTransposePairOption": "transpose_pair",
     "OnlineFusion": "online_fusion",
     "OnlineFusionOption": "online_fusion",
+    "ProgramShard": "program_shard",
+    "ProgramShardOption": "program_shard",
+    "ProgramStorePartition": "program_store_partition",
+    "ProgramStorePartitionOption": "program_store_partition",
     "Reorder": "reorder",
     "ReorderOption": "reorder",
     "RFactor": "rfactor",
@@ -70,8 +81,6 @@ _EXPORT_MODULES = {
     "SplitOption": "split",
     "TransposePair": "transpose_pair",
     "TransposePairOption": "transpose_pair",
-    "TransposeThroughLoad": "transpose_through_load",
-    "TransposeThroughLoadOption": "transpose_through_load",
     "TransposeThroughMatmul": "transpose_through_matmul",
     "TransposeThroughMatmulOption": "transpose_through_matmul",
     "TransposeThroughTensorCopy": "transpose_through_tensor_copy",
@@ -86,7 +95,11 @@ BufferLayout: type[Transform[Any]]
 BufferLayoutOption: type[TransformOption]
 BufferPlacement: type[Transform[Any]]
 BufferPlacementOption: type[TransformOption]
+BufferRegionNormalization: type[Transform[Any]]
+BufferRegionNormalizationOption: type[TransformOption]
 CancelTransposePairOption: type[TransformOption]
+CommuteBroadcastFactor: type[Transform[Any]]
+CommuteBroadcastFactorOption: type[TransformOption]
 CodeMotion: type[Transform[Any]]
 CodeMotionOption: type[TransformOption]
 CommonSubexpressionElimination: type[Transform[Any]]
@@ -106,6 +119,10 @@ FusePointwiseOption: type[TransformOption]
 InsertTransposePairOption: type[TransformOption]
 OnlineFusion: type[Transform[Any]]
 OnlineFusionOption: type[TransformOption]
+ProgramShard: type[Transform[Any]]
+ProgramShardOption: type[TransformOption]
+ProgramStorePartition: type[Transform[Any]]
+ProgramStorePartitionOption: type[TransformOption]
 PUBLIC_TRANSFORM_TYPES: tuple[type[Transform[Any]], ...]
 Reorder: type[Transform[Any]]
 ReorderOption: type[TransformOption]
@@ -119,8 +136,6 @@ Split: type[Transform[Any]]
 SplitOption: type[TransformOption]
 TransposePair: type[Transform[Any]]
 TransposePairOption: type[TransformOption]
-TransposeThroughLoad: type[Transform[Any]]
-TransposeThroughLoadOption: type[TransformOption]
 TransposeThroughMatmul: type[Transform[Any]]
 TransposeThroughMatmulOption: type[TransformOption]
 TransposeThroughTensorCopy: type[Transform[Any]]
@@ -168,7 +183,11 @@ __all__ = [
     "BufferLayoutOption",
     "BufferPlacement",
     "BufferPlacementOption",
+    "BufferRegionNormalization",
+    "BufferRegionNormalizationOption",
     "CancelTransposePairOption",
+    "CommuteBroadcastFactor",
+    "CommuteBroadcastFactorOption",
     "CodeMotion",
     "CodeMotionOption",
     "CommonSubexpressionElimination",
@@ -188,6 +207,10 @@ __all__ = [
     "InsertTransposePairOption",
     "OnlineFusion",
     "OnlineFusionOption",
+    "ProgramShard",
+    "ProgramShardOption",
+    "ProgramStorePartition",
+    "ProgramStorePartitionOption",
     "PUBLIC_TRANSFORM_TYPES",
     "Reorder",
     "ReorderOption",
@@ -204,8 +227,6 @@ __all__ = [
     "TransformOption",
     "TransposePair",
     "TransposePairOption",
-    "TransposeThroughLoad",
-    "TransposeThroughLoadOption",
     "TransposeThroughMatmul",
     "TransposeThroughMatmulOption",
     "TransposeThroughTensorCopy",

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
 from nkigym.ir.tree import BlockNode, ISANode
 from nkigym.ops.base import CopyContract, PointwiseContract
+from nkigym.search.program_sharding import PROGRAM_SHARDS_ANNOTATION, configured_program_shards
 from nkigym.search.state_facts import operation_facts
 from nkigym.transforms.base import (
     Transform,
@@ -16,7 +17,7 @@ from nkigym.transforms.base import (
     intersects_software_pipeline,
     software_pipeline_overlap_nodes,
 )
-from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, remove_buffers, single_leaf
+from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, single_leaf
 from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
 
@@ -37,7 +38,7 @@ class _DeadProducerMatch:
 
 
 class EliminateDeadProducer(Transform[EliminateDeadProducerOption]):
-    """Delete one unused pure producer and its private allocation."""
+    """Delete one unused pure producer."""
 
     def analyze(self, ir: KernelIR) -> list[EliminateDeadProducerOption]:
         """Return every isolated pure block with an unread private output."""
@@ -51,7 +52,7 @@ class EliminateDeadProducer(Transform[EliminateDeadProducerOption]):
         return [option for option in options if self._resolve(ir, option, overlap_nodes, owners) is not None]
 
     def apply(self, ir: KernelIR, option: EliminateDeadProducerOption) -> KernelIR:
-        """Recheck, copy, and remove one dead producer plus its output buffer."""
+        """Recheck, copy, and remove one dead producer block."""
         match = self._resolve(ir, option)
         if match is None:
             raise TransformLegalityError(f"illegal EliminateDeadProducer option: {option}")
@@ -62,9 +63,17 @@ class EliminateDeadProducer(Transform[EliminateDeadProducerOption]):
         parent = result.tree.parent(copied.block_nid)
         if parent is None:
             raise AssertionError(f"producer block {copied.block_nid} has no parent")
-        remove_buffers(result, {copied.output_tensor})
+        removed = {copied.block_nid, *result.tree.descendants(copied.block_nid)}
+        shards = configured_program_shards(result)
         _replace_in_parent_children(result.tree, parent, [copied.block_nid], [])
-        result.tree.graph.remove_nodes_from({copied.block_nid, *result.tree.descendants(copied.block_nid)})
+        result.tree.graph.remove_nodes_from(removed)
+        if removed.intersection(shards):
+            root = result.tree.block(result.tree.root)
+            annotations = dict(root.annotations)
+            annotations[PROGRAM_SHARDS_ANNOTATION] = {
+                loop_nid: programs for loop_nid, programs in shards.items() if loop_nid not in removed
+            }
+            result.tree.graph.nodes[result.tree.root]["data"] = replace(root, annotations=annotations)
         finalize_rewrite(result)
         return result
 

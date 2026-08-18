@@ -1,4 +1,4 @@
-"""Decompose one matrix-minus-row broadcast into negation followed by addition."""
+"""Apply one behavior-preserving pointwise algebraic reassociation."""
 
 from __future__ import annotations
 
@@ -42,31 +42,30 @@ class _Match:
 
 
 class DecomposeBroadcastSubtract(Transform[DecomposeBroadcastSubtractOption]):
-    """Rewrite ``data - row`` as ``data + (-row)``."""
+    """Replace one matrix-minus-row operation with negation followed by addition."""
 
     def analyze(self, ir: KernelIR) -> list[DecomposeBroadcastSubtractOption]:
-        """Return supported broadcast subtractions."""
-        if "subtract" not in operation_facts(ir).pointwise_operators:
-            return []
+        """Return supported broadcast-subtraction decompositions."""
         options: list[DecomposeBroadcastSubtractOption] = []
-        overlap_nodes = software_pipeline_overlap_nodes(ir)
-        for block_nid in ir.tree.blocks():
-            if block_nid == ir.tree.root:
-                continue
-            option = DecomposeBroadcastSubtractOption(pointwise_block_nid=block_nid)
-            if _resolve(ir, option, overlap_nodes) is not None:
-                options.append(option)
+        if "subtract" in operation_facts(ir).pointwise_operators:
+            overlap_nodes = software_pipeline_overlap_nodes(ir)
+            for block_nid in ir.tree.blocks():
+                if block_nid == ir.tree.root:
+                    continue
+                option = DecomposeBroadcastSubtractOption(pointwise_block_nid=block_nid)
+                if _resolve(ir, option, overlap_nodes) is not None:
+                    options.append(option)
         return options
 
     def apply(self, ir: KernelIR, option: DecomposeBroadcastSubtractOption) -> KernelIR:
-        """Recheck, copy, and introduce one row-vector negation."""
+        """Recheck and decompose one selected broadcast subtraction."""
         match = _resolve(ir, option)
         if match is None:
-            raise TransformLegalityError(f"illegal DecomposeBroadcastSubtract option: {option}")
+            raise TransformLegalityError(f"illegal broadcast-subtraction decomposition: {option}")
         new_ir = copy_for_rewrite(ir)
         copied_match = _resolve(new_ir, option)
         if copied_match is None:
-            raise AssertionError(f"DecomposeBroadcastSubtract option disappeared after deepcopy: {option}")
+            raise AssertionError(f"broadcast-subtraction option disappeared after deepcopy: {option}")
         _rewrite(new_ir, copied_match)
         return new_ir
 

@@ -112,6 +112,17 @@ class Transform(Generic[_OptionT]):
     ``ir``'s.
     """
 
+    SPLIT_PREPARATION_DEPTH = 0
+
+    def split_preparation_applicable(self, ir: KernelIR) -> bool:
+        """Return whether legal splits may expose this transform."""
+        _ = ir
+        return self.SPLIT_PREPARATION_DEPTH > 0
+
+    def split_preparation_ready(self, ir: KernelIR) -> bool:
+        """Return whether the current state completes a useful split path."""
+        return bool(self.analyze(ir))
+
     def analyze(self, ir: KernelIR) -> list[_OptionT]:
         """Return every legal option for this transform on ``ir``."""
         raise NotImplementedError

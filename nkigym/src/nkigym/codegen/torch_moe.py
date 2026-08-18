@@ -34,13 +34,12 @@ def emit_moe(
     total: TorchValue | None = None
     for route in range(8):
         affinity = emit_slice(affinities, route, 1, f"sbuf_{stem}_affinity_{route}", "", body, imports)
-        index = emit_slice(indices, route, 1, f"sbuf_{stem}_index_{route}", "", body, imports)
         affinity_vector = TorchValue(f"{affinity.name}_vector", (1,))
         body.append(f'{affinity_vector.name} = NKIActivationReduce(op="copy", reduce_op="add")(data={affinity.name})')
         gate_up = TorchValue(f"sbuf_{stem}_gate_up_weight_{route}", (hidden_width, 2 * intermediate))
         body.append(
             f"{gate_up.name} = NKIHBMScalarRowSlice(rows={hidden_width}, width={2 * intermediate})"
-            f"(src={gate_up_weights.name}, indices={index.name})"
+            f"(src={gate_up_weights.name}, indices={indices.name}, index={route})"
         )
         gate_up_psum = f"psum_{stem}_gate_up_{route}"
         projected = TorchValue(f"sbuf_{stem}_gate_up_{route}", (1, 2 * intermediate))
@@ -69,7 +68,7 @@ def emit_moe(
             (
                 f"{stationary.name} = NKIDMATranspose()(src={intermediate_value.name})",
                 f"{down.name} = NKIHBMScalarRowSlice(rows={intermediate}, width={hidden_width})"
-                f"(src={down_weights.name}, indices={index.name})",
+                f"(src={down_weights.name}, indices={indices.name}, index={route})",
             )
         )
         down_psum = f"psum_{stem}_down_{route}"

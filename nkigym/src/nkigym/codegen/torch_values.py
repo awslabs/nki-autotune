@@ -12,6 +12,8 @@ class TorchValue:
     name: str
     shape: tuple[int, ...]
     transposed: bool = False
+    is_hbm: bool = False
+    storage_dtype: str | None = None
 
 
 @dataclass(frozen=True)
@@ -83,7 +85,8 @@ def _emit_exact_gelu(source: TorchValue, name: str, body: list[str], imports: se
 
 def emit_cast(source: TorchValue, class_name: str, name: str, body: list[str], imports: set[str]) -> TorchValue:
     """Emit one activation-backed dtype cast."""
-    target = TorchValue(name, source.shape, source.transposed)
+    storage_dtype = "float8_e4m3" if class_name == "NKIFloat8Cast" else None
+    target = TorchValue(name, source.shape, source.transposed, storage_dtype=storage_dtype)
     imports.add(class_name)
     body.append(f"{target.name} = {class_name}()(data={source.name})")
     return target
@@ -91,24 +94,20 @@ def emit_cast(source: TorchValue, class_name: str, name: str, body: list[str], i
 
 def emit_cumsum(source: TorchValue, name: str, body: list[str], imports: set[str]) -> TorchSegments:
     """Emit a numerically stable chunked FP32 prefix sum."""
-    width = min(256, source.shape[1])
+    width = min(2048, source.shape[1])
     if len(source.shape) != 2 or source.shape[1] % width:
         raise ValueError(f"Torch cumsum requires a rank-two uniformly chunked width, got {source.shape}")
-    imports.update(("NKIActivation", "NKIActivationReduce", "NKITensorScalar", "NKITensorSlice", "NKITensorTensorScan"))
+    slice_operation = "NKIHBMFreeSlice" if source.is_hbm else "NKITensorSlice"
+    imports.update(
+        ("NKIActivationReduce", "NKITensorScalar", "NKITensorScalarCumulative", "NKITensorSlice", slice_operation)
+    )
     outputs: list[TorchValue] = []
-    zero: TorchValue | None = None
     offset: TorchValue | None = None
     for index, start in enumerate(range(0, source.shape[1], width)):
         chunk = TorchValue(f"{name}_chunk_{index}", (source.shape[0], width))
-        body.append(f"{chunk.name} = NKITensorSlice(start={start}, width={width})(src={source.name})")
-        if zero is None:
-            zero = TorchValue(f"{name}_zero", chunk.shape)
-            body.append(f'{zero.name} = NKIActivation(op="copy", scale=0.0)(data={chunk.name})')
+        body.append(f"{chunk.name} = {slice_operation}(start={start}, width={width})(src={source.name})")
         scanned = TorchValue(f"{name}_scan_{index}", chunk.shape)
-        body.append(
-            f'{scanned.name} = NKITensorTensorScan(op0="add", op1="add", initial=0.0)'
-            f"(data0={chunk.name}, data1={zero.name})"
-        )
+        body.append(f'{scanned.name} = NKITensorScalarCumulative(op0="add", op1="add", imm0=0.0)(src={chunk.name})')
         adjusted = scanned
         if offset is not None:
             adjusted = TorchValue(f"{name}_adjusted_{index}", chunk.shape)
@@ -188,15 +187,3 @@ def emit_topk(
                 f"(data={prior}, vals=sbuf_{stem}_values_{offset})"
             )
     return TorchSegments(tuple(value_chunks)), TorchSegments(tuple(index_chunks))
-
-
-__all__ = [
-    "TorchSegments",
-    "TorchValue",
-    "emit_activation",
-    "emit_cast",
-    "emit_cumsum",
-    "emit_reduce",
-    "emit_slice",
-    "emit_topk",
-]

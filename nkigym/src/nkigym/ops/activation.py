@@ -57,6 +57,7 @@ class NKIActivation(NKIOp):
         "data": frozenset({"sbuf", "psum"}),
         "bias": frozenset({"sbuf"}),
     }
+    INPUT_STORAGE_DTYPES: ClassVar[dict[str, frozenset[str]]] = {"data": frozenset({"bfloat16", "float16", "float32"})}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"

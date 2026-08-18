@@ -137,8 +137,7 @@ def _clone_block(context: _Lowering, nid: int, remap: Mapping[str, str], output_
     chain = block_chain(tree, old_block_nid)
     if chain is None:
         raise ValueError(f"block {old_block_nid} is not a canonical chain")
-    old_block = tree.block(old_block_nid)
-    leaf = tree.isa(nid)
+    old_block, leaf = tree.block(old_block_nid), tree.isa(nid)
     contract = context.graph.contracts[nid]
     progress_vars: set[str] = set()
     values = list(old_block.iter_values)
@@ -152,7 +151,12 @@ def _clone_block(context: _Lowering, nid: int, remap: Mapping[str, str], output_
         if slot == contract.output_operand and output_override is not None:
             tensor = output_override
         bindings[slot] = _localized_region(context, region, tensor, loop_var, tile_size, trip_count)
-    reads, writes = _access_regions(leaf.op_cls, bindings, leaf.kwargs)
+    kwargs = dict(leaf.kwargs)
+    for abstract, (key, slot) in getattr(leaf.op_cls, "SPLIT_OFFSET_KWARGS", {}).items():
+        if old_block.axis_map.get(abstract) == context.match.progress_axis:
+            local = bindings[slot].ranges[leaf.op_cls.OPERAND_AXES[slot].index(abstract)][0]
+            kwargs[key] = Add(left=Mul(left=context.progress_index, right=Const(value=context.chunk_size)), right=local)
+    reads, writes = _access_regions(leaf.op_cls, bindings, kwargs)
     for index, iter_var in enumerate(old_block.iter_vars):
         if iter_var.axis == context.match.progress_axis:
             progress: Expr = context.progress_index
@@ -170,7 +174,7 @@ def _clone_block(context: _Lowering, nid: int, remap: Mapping[str, str], output_
                 parent = tree.add_node(replace(item, extent=trip_count), parent=parent)
         else:
             parent = tree.add_node(item, parent=parent)
-    tree.add_node(ISANode(op_cls=leaf.op_cls, operand_bindings=bindings, kwargs=dict(leaf.kwargs)), parent=parent)
+    tree.add_node(ISANode(op_cls=leaf.op_cls, operand_bindings=bindings, kwargs=kwargs), parent=parent)
 
 
 def _progress_tiling(context: _Lowering, leaf: ISANode, progress_vars: set[str]) -> tuple[str | None, int, int]:
@@ -409,8 +413,7 @@ def _derive(
     if selected is not None:
         leaves = tuple((nid for nid in leaves if nid in selected))
     for nid in leaves:
-        deferred = context.match.deferred_factor
-        if deferred is not None and nid == deferred.producer_leaf:
+        if (deferred := context.match.deferred_factor) is not None and nid == deferred.producer_leaf:
             continue
         if deferred is not None and nid == deferred.bypass_leaf:
             source = context.graph.inputs[nid][deferred.passthrough_operand]

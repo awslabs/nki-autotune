@@ -59,11 +59,11 @@ class NKIMatmul(NKIOp):
         return frozenset() if kwargs.get("accumulate") is False else cls.RMW_OPERANDS
 
     @classmethod
-    def with_first_write_overwrite(cls, operand: str, kwargs: Mapping[str, Any]) -> dict[str, Any]:
-        """Return an explicit first-matmul configuration."""
+    def with_first_write_overwrite(cls, operand: str, kwargs: Mapping[str, Any], reduction_axis: str) -> dict[str, Any]:
+        """Mark one logical reduction axis for dynamic first-write lowering."""
         if operand != "dst" or kwargs.get("accumulate") is True:
             raise ValueError(f"NKIMatmul.{operand} does not support first-write overwrite")
-        return {**kwargs, "accumulate": False}
+        return {**kwargs, "accumulate": (reduction_axis,)}
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``stationary`` and ``moving`` must be SBUF-resident."""

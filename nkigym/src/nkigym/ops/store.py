@@ -21,6 +21,7 @@ class NKIStore(NKIOp):
     OUTPUT_ROLE: ClassVar[str] = "stored"
     OUTPUT_LOCATION: ClassVar[str] = "shared_hbm"
     INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"src": frozenset({"sbuf"})}
+    CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"program_ownership"})
 
     @classmethod
     def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> CopyContract:

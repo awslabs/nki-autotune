@@ -18,7 +18,6 @@ from nkigym.transforms.helper.canonical_rewrite import (
     finalize_rewrite,
     fresh_name,
     is_canonical_block,
-    remove_buffers,
     replace_input_binding,
     required_spec,
     single_leaf,
@@ -38,9 +37,11 @@ class InsertTransposePairOption(TransformOption):
 
 @dataclass(frozen=True)
 class CancelTransposePairOption(TransformOption):
-    """Cancel the adjacent pair beginning at ``first_transpose_nid``."""
+    """Bypass one pair consumer, or remove an unused adjacent pair."""
 
     first_transpose_nid: int
+    consumer_nid: int | None
+    operand: str | None
 
 
 TransposePairOption = InsertTransposePairOption | CancelTransposePairOption
@@ -112,11 +113,11 @@ class TransposePair(Transform[TransposePairOption]):
                     option = InsertTransposePairOption(consumer_nid=leaf_nid, operand=operand, source=region.tensor)
                     if _match_insert(ir, option, pair_edges, facts) is not None:
                         options.append(option)
-        options.extend(
-            CancelTransposePairOption(first_transpose_nid=block_nid)
-            for block_nid in facts.root_children
-            if block_nid in cancel_matches
-        )
+        for block_nid, match in cancel_matches.items():
+            options.extend(
+                CancelTransposePairOption(first_transpose_nid=block_nid, consumer_nid=consumer_nid, operand=operand)
+                for consumer_nid, operand in match.consumers
+            )
         return options
 
     def apply(self, ir: KernelIR, option: TransposePairOption) -> KernelIR:
@@ -138,7 +139,12 @@ class TransposePair(Transform[TransposePairOption]):
             if match is None:
                 raise TransformLegalityError(f"illegal transpose-pair cancellation at {option.first_transpose_nid}")
             new_ir = copy_for_rewrite(ir)
-            _apply_cancel(new_ir, match)
+            selected = (option.consumer_nid, option.operand)
+            if selected in match.consumers:
+                assert option.consumer_nid is not None and option.operand is not None
+                replace_input_binding(new_ir, option.consumer_nid, option.operand, match.first.source)
+            else:
+                raise TransformLegalityError(f"illegal transpose-pair cancellation option: {option}")
         finalize_rewrite(new_ir)
         return new_ir
 
@@ -199,7 +205,9 @@ def _identity_pair_edges(ir: KernelIR) -> set[tuple[int, str, str]]:
     """Return edges on which another transpose pair would be redundant."""
     pair_edges: set[tuple[int, str, str]] = set()
     for block_nid in ir.tree.children(ir.tree.root):
-        match = _match_cancel(ir, CancelTransposePairOption(first_transpose_nid=block_nid))
+        match = _match_cancel(
+            ir, CancelTransposePairOption(first_transpose_nid=block_nid, consumer_nid=None, operand=None)
+        )
         if match is not None:
             pair_edges.add((match.first.input_leaf, match.first.input_operand, match.first.source))
             pair_edges.add((match.second.input_leaf, match.second.input_operand, match.second.source))
@@ -367,14 +375,7 @@ def _match_cancel_from_facts(
                 facts.last_writer_positions.get(first.source, -1) <= facts.preorder_positions[first.input_leaf]
             )
             consumers_compatible = _consumers_accept_source(ir, consumers, first.source, facts.buffers)
-            if (
-                consumers
-                and exact_middle
-                and exact_output
-                and restored_shape
-                and source_stable
-                and consumers_compatible
-            ):
+            if exact_middle and exact_output and restored_shape and source_stable and consumers_compatible:
                 result = _CancelMatch(first=first, second=second, consumers=consumers)
     return result
 
@@ -508,14 +509,7 @@ def _match_cancel(ir: KernelIR, option: CancelTransposePairOption) -> _CancelMat
                 restored_shape = ir.buffer(second.output).shape == ir.buffer(first.source).shape
                 source_stable = _source_is_stable(ir, first.source, first.input_leaf)
                 consumers_compatible = _consumers_accept_source(ir, consumers, first.source, ir.all_buffers())
-                if (
-                    consumers
-                    and exact_middle
-                    and exact_output
-                    and restored_shape
-                    and source_stable
-                    and consumers_compatible
-                ):
+                if exact_middle and exact_output and restored_shape and source_stable and consumers_compatible:
                     result = _CancelMatch(first=first, second=second, consumers=consumers)
     return result
 
@@ -550,26 +544,6 @@ def _source_is_stable(ir: KernelIR, tensor: str, first_transpose_leaf: int) -> b
             stable = False
             break
     return stable
-
-
-def _apply_cancel(ir: KernelIR, match: _CancelMatch) -> None:
-    """Remove a matched pair and reconnect its readers."""
-    for leaf_nid, operand in match.consumers:
-        replace_input_binding(ir, leaf_nid, operand, match.first.source)
-    blocks = [*match.first.blocks, *match.second.blocks]
-    removed_buffers = set(match.first.removable_buffers) | set(match.second.removable_buffers)
-    preserved_buffers = tuple(
-        buffer
-        for block_nid in blocks
-        for buffer in ir.tree.block(block_nid).alloc_buffers
-        if buffer.name not in removed_buffers
-    )
-    remove_buffers(ir, removed_buffers)
-    if preserved_buffers:
-        append_root_buffers(ir, preserved_buffers)
-    _replace_in_parent_children(ir.tree, ir.tree.root, blocks, [])
-    for block_nid in blocks:
-        ir.tree.graph.remove_nodes_from({block_nid, *ir.tree.descendants(block_nid)})
 
 
 __all__ = ["CancelTransposePairOption", "InsertTransposePairOption", "TransposePair", "TransposePairOption"]

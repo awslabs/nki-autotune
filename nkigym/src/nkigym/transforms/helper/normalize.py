@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from math import prod
 
 from nkigym.ir.arith.expr import Const, Expr, Mul, Var, from_affine, substitute, to_affine
@@ -23,13 +24,6 @@ def normalize_block(tree: KernelTree, block_nid: int) -> None:
     _drop_trip1(tree, block_nid)
     _rename_dense(tree, block_nid)
     _recompute_bindings(tree, block_nid)
-
-
-def normalize_selected_tensor_regions(tree: KernelTree, tensors: frozenset[str]) -> None:
-    """Recompute regions for ``tensors`` in one traversal of every block."""
-    buffers = {buffer.name: buffer for nid in tree.blocks() for buffer in tree.block(nid).alloc_buffers}
-    for block_nid in tree.blocks():
-        _recompute_bindings(tree, block_nid, tensors=tensors, buffers=buffers)
 
 
 def _drop_trip1(tree: KernelTree, block_nid: int) -> None:
@@ -127,64 +121,69 @@ def _substitute_block_regions(tree: KernelTree, block_nid: int, substitutions: d
             tree.graph.nodes[nid]["data"] = ISANode(
                 op_cls=node.op_cls,
                 operand_bindings={slot: rewrite(region) for slot, region in node.operand_bindings.items()},
-                kwargs=dict(node.kwargs),
+                kwargs={
+                    key: substitute(value, substitutions) if isinstance(value, Expr) else value
+                    for key, value in node.kwargs.items()
+                },
                 access_patterns={slot: rewrite_pattern(pattern) for slot, pattern in node.access_patterns.items()},
             )
 
 
 def _recompute_bindings(
-    tree: KernelTree, block_nid: int, tensors: frozenset[str] | None = None, buffers: dict[str, Buffer] | None = None
+    tree: KernelTree,
+    block_nid: int,
+    tensor_axes: dict[str, int] | None = None,
+    buffers: dict[str, Buffer] | None = None,
 ) -> None:
     """Recompute iteration bindings and selected regions from dense loops."""
     block = tree.data(block_nid)
     assert isinstance(block, BlockNode)
-    buffer_map = (
-        {buffer.name: buffer for nid in tree.blocks() for buffer in tree.block(nid).alloc_buffers}
-        if buffers is None
-        else buffers
-    )
+    buffer_map = buffers
+    if buffer_map is None:
+        buffer_map = {buffer.name: buffer for nid in tree.blocks() for buffer in tree.block(nid).alloc_buffers}
     dim_loops = _dim_loops(tree, block_nid, block)
-    tensor_axes = _tensor_to_axes(tree, block_nid)
-    new_iter_values = (
-        block.iter_values if tensors is not None else tuple(_iter_value(iv.axis, dim_loops) for iv in block.iter_vars)
-    )
-
-    def recompute(region: BufferRegion) -> BufferRegion:
-        """Recompute ``region`` when it belongs to the selected tensors."""
-        result = region
-        if tensors is None or region.tensor in tensors:
-            result = _recompute_region(region, tensor_axes, block.axis_map, dim_loops, buffer_map)
-        return result
-
-    new_block = BlockNode(
-        iter_vars=block.iter_vars,
-        iter_values=new_iter_values,
-        reads=tuple(recompute(region) for region in block.reads),
-        writes=tuple(recompute(region) for region in block.writes),
-        alloc_buffers=block.alloc_buffers,
-        annotations=dict(block.annotations),
-        axis_map=block.axis_map,
-    )
-    tree.graph.nodes[block_nid]["data"] = new_block
-    for nid in _block_local_descendants(tree, block_nid):
-        data = tree.data(nid)
-        if not isinstance(data, ISANode):
-            continue
-        op_axes = data.op_cls.OPERAND_AXES
-        new_bindings = {
-            slot: (
-                _recompute_region(region, {region.tensor: op_axes[slot]}, block.axis_map, dim_loops, buffer_map)
-                if tensors is None or region.tensor in tensors
-                else region
+    new_iter_values = block.iter_values
+    if tensor_axes is None:
+        new_iter_values = tuple(_iter_value(iv.axis, dim_loops) for iv in block.iter_vars)
+    leaves = [
+        (nid, data)
+        for nid in _block_local_descendants(tree, block_nid)
+        if isinstance((data := tree.data(nid)), ISANode)
+    ]
+    if not leaves:
+        tree.graph.nodes[block_nid]["data"] = replace(block, iter_values=new_iter_values)
+        return
+    if len(leaves) != 1:
+        raise ValueError(f"block {block_nid} owns {len(leaves)} ISA leaves")
+    leaf_nid, leaf = leaves[0]
+    bindings = {
+        slot: (
+            _recompute_region(
+                region,
+                leaf.op_cls.operand_axis_groups(slot),
+                block.axis_map,
+                dim_loops,
+                buffer_map,
+                None if tensor_axes is None else tensor_axes[region.tensor],
             )
-            for slot, region in data.operand_bindings.items()
-        }
-        tree.graph.nodes[nid]["data"] = ISANode(
-            op_cls=data.op_cls,
-            operand_bindings=new_bindings,
-            kwargs=dict(data.kwargs),
-            access_patterns=dict(data.access_patterns),
+            if tensor_axes is None or region.tensor in tensor_axes
+            else region
         )
+        for slot, region in leaf.operand_bindings.items()
+    }
+    rmw = leaf.op_cls.rmw_operands(leaf.kwargs)
+    reads = tuple(
+        bindings[slot]
+        for slot in leaf.op_cls.OPERAND_AXES
+        if slot in bindings and (slot in leaf.op_cls.INPUT_OPERANDS or slot in rmw)
+    )
+    writes = tuple(
+        bindings[slot]
+        for slot in leaf.op_cls.OPERAND_AXES
+        if slot in bindings and slot not in leaf.op_cls.INPUT_OPERANDS
+    )
+    tree.graph.nodes[block_nid]["data"] = replace(block, iter_values=new_iter_values, reads=reads, writes=writes)
+    tree.graph.nodes[leaf_nid]["data"] = replace(leaf, operand_bindings=bindings)
 
 
 def _dim_loops(tree: KernelTree, block_nid: int, block: BlockNode) -> dict[str, list[tuple[str, int]]]:
@@ -234,26 +233,29 @@ def _fit_loops(loops: list[tuple[str, int]], capacity: int) -> list[tuple[str, i
 
 def _recompute_region(
     region: BufferRegion,
-    tensor_axes: dict[str, tuple[str, ...]],
+    axis_groups: tuple[tuple[str, ...], ...],
     axis_map: dict[str, str],
     dim_loops: dict[str, list[tuple[str, int]]],
     buffers: dict[str, Buffer],
+    selected_axis: int | None = None,
 ) -> BufferRegion:
     """Rebuild region offsets from dense loops while retaining access widths."""
-    abstract_axes = tensor_axes.get(region.tensor)
-    if abstract_axes is None:
-        return region
-    present = [a for a in abstract_axes if a in axis_map]
+    present = tuple(group for group in axis_groups if all(axis in axis_map for axis in group))
     buf = buffers.get(region.tensor)
     location = "shared_hbm" if buf is None else buf.location
     new_ranges: list[tuple[Expr, Expr]] = []
     for axis_index, (old_lo, width) in enumerate(region.ranges):
         assert isinstance(width, Const), f"region width must be Const; got {width!r}"
-        if axis_index >= len(present):
+        if axis_index >= len(present) or selected_axis is not None and axis_index != selected_axis:
             new_ranges.append((old_lo, width))
             continue
-        dim = axis_map.get(present[axis_index])
-        loops = dim_loops.get(dim, []) if dim is not None else []
+        loops: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for abstract in present[axis_index]:
+            for loop in dim_loops.get(axis_map[abstract], []):
+                if loop[0] not in seen:
+                    loops.append(loop)
+                    seen.add(loop[0])
         loops = _fit_loops(loops, _axis_capacity(buf, axis_index, location, width.value))
         affine = _tile_space_affine(loops)
         is_partition = axis_index == 0 and location in ("sbuf", "psum")
@@ -288,18 +290,6 @@ def _is_zero(expr: Expr) -> bool:
     return isinstance(expr, Const) and expr.value == 0
 
 
-def _tensor_to_axes(tree: KernelTree, block_nid: int) -> dict[str, tuple[str, ...]]:
-    """Map each operand tensor to its operation's abstract axes."""
-    out: dict[str, tuple[str, ...]] = {}
-    for nid in _block_local_descendants(tree, block_nid):
-        data = tree.data(nid)
-        if not isinstance(data, ISANode):
-            continue
-        for slot, region in data.operand_bindings.items():
-            out[region.tensor] = data.op_cls.OPERAND_AXES[slot]
-    return out
-
-
 def _loopvar_to_dim(tree: KernelTree, block_nid: int, block: BlockNode) -> dict[str, str]:
     """Map each local loop variable to the concrete dimension it binds."""
     out: dict[str, str] = {}
@@ -323,4 +313,4 @@ def _dim_from_loopvar(loop_var: str) -> str:
     return parts[0]
 
 
-__all__ = ["normalize_block", "normalize_selected_tensor_regions"]
+__all__ = ["normalize_block"]

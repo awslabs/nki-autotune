@@ -37,6 +37,11 @@ the codegen renderer, the interval/overlap analysis, and
 distinct from any per-op ``MIN_TILE_SIZE``/``MAX_TILE_SIZE`` cap."""
 
 
+def partition_extent(leading: int) -> int:
+    """Return the largest legal partition tile dividing ``leading``."""
+    return next(size for size in range(min(leading, PARTITION_DIM), 0, -1) if leading % size == 0)
+
+
 @dataclass(frozen=True, kw_only=True)
 class ForNode:
     """Loop binding to one (or part of one) :class:`BlockNode` iter_var.
@@ -125,6 +130,7 @@ class Buffer:
     dtype: str
     location: str
     storage_dtype: str | None = None
+    partition_size: int | None = None
     versions: int = 1
     """Pipeline buffer-version count. 1 = single instance (renders
     byte-identically to today). >1 multiplies the tile (middle) dim of
@@ -149,15 +155,15 @@ class Buffer:
             leading, free = self.shape
         else:
             raise AssertionError(f"{self.name}: SBUF/PSUM buffer expects a 1D or 2D logical shape; got {self.shape}")
-        partition = min(leading, PARTITION_DIM)
-        if leading % partition != 0:
-            raise AssertionError(f"{self.name}: leading extent {leading} cannot use partition extent {partition}")
         return leading, free
 
     def partition_extent(self) -> int:
         """Return the physical partition width of one on-chip tile."""
         leading, _free = self._on_chip_shape()
-        return min(leading, PARTITION_DIM)
+        extent = partition_extent(leading) if self.partition_size is None else self.partition_size
+        if extent < 1 or extent > PARTITION_DIM or leading % extent:
+            raise AssertionError(f"{self.name}: partition size {extent} must divide leading extent {leading}")
+        return extent
 
     def logical_tile_count(self) -> int:
         """Return the number of logical partition tiles before versioning."""

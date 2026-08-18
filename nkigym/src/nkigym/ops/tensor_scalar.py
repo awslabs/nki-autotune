@@ -7,7 +7,7 @@ form to multiply ``(d0, d1)`` lhs tiles by the 1D rsqrt result.
 """
 
 from collections.abc import Mapping
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol, TypeVar, cast
 
 import numpy as np
 
@@ -28,21 +28,55 @@ _OPS: dict[str, Any] = {
 }
 
 
+class _ShapedValue(Protocol):
+    """Structural type for frontend values with a logical shape."""
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+
+
+_Shaped = TypeVar("_Shaped", bound=_ShapedValue)
+
+
+def _vector_broadcast(left: _Shaped, right: _Shaped) -> tuple[_Shaped, _Shaped, bool, bool] | None:
+    """Identify a matrix and one row- or free-axis vector operand."""
+    for matrix, vector, reverse in ((left, right, False), (right, left, True)):
+        if len(matrix.shape) != 2:
+            continue
+        row = vector.shape in {(matrix.shape[0],), (matrix.shape[0], 1)}
+        free = vector.shape in {(matrix.shape[1],), (1, matrix.shape[1])}
+        if row and free:
+            raise ValueError(f"ambiguous vector broadcast for square matrix {matrix.shape}")
+        if row or free:
+            return matrix, vector, reverse, free
+    return None
+
+
+def _tensor_scalar_operands(left: _Shaped | float, right: _Shaped | float) -> tuple[_Shaped, float, bool]:
+    """Normalize exactly one tensor and one scalar binary operand."""
+    tensor, scalar, reverse = (right, left, True) if isinstance(left, float) else (left, right, False)
+    if isinstance(tensor, float) or not isinstance(scalar, float):
+        raise ValueError("pointwise scalar lowering requires exactly one tensor and one scalar")
+    return cast(_Shaped, tensor), scalar, reverse
+
+
 class NKITensorScalar(NKIOp):
     """Elementwise ``output = data <op> operand0`` with broadcast operand.
 
     ``operand0`` may be a compile-time literal (not captured as a
-    tensor input) or a 1D ``(P,)`` vector that broadcasts across the
-    free axis of ``data``.
+    tensor input), a 1D ``(P,)`` vector, or a ``(P, 1)`` column that
+    broadcasts across the free axis of ``data``.
     """
 
     NAME: ClassVar[str] = "tensor_scalar"
-    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "operand0": ("P",), "dst": ("P", "F")}
+    OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "operand0": ("P", "B"), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data", "operand0"})
+    FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {"B": 1}
     INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {
         "data": frozenset({"sbuf", "psum"}),
         "operand0": frozenset({"sbuf", "psum"}),
     }
+    INPUT_STORAGE_DTYPES: ClassVar[dict[str, frozenset[str]]] = {"data": frozenset({"bfloat16", "float16", "float32"})}
     REQUIRED_INPUT_STORAGE_DTYPES: ClassVar[dict[str, str]] = {"operand0": "float32"}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from math import isqrt
 
@@ -12,6 +12,7 @@ from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var
 from nkigym.ir.dependency_rebind import rebind_exact_retile
 from nkigym.ir.tree import BlockNode, Buffer, ForNode, ISANode, KernelTree
 from nkigym.ops.base import ReductionContract
+from nkigym.search.program_sharding import program_sharded_loops
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -21,7 +22,13 @@ from nkigym.transforms.base import (
     software_pipeline_overlap_nodes,
 )
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
-from nkigym.transforms.helper.normalize import _substitute_block_regions, normalize_block
+from nkigym.transforms.helper.normalize import (
+    _dim_loops,
+    _iter_value,
+    _recompute_bindings,
+    _rename_dense,
+    _substitute_block_regions,
+)
 from nkigym.transforms.helper.tile_region import retile_region
 from nkigym.transforms.helper.tree_ops import _block_local_descendants, _replace_in_parent_children
 
@@ -53,9 +60,10 @@ class Split(Transform[SplitOption]):
         options: list[SplitOption] = []
         buffers = ir.all_buffers()
         overlap_nodes = software_pipeline_overlap_nodes(ir)
+        sharded_loops = program_sharded_loops(ir)
         for nid in ir.tree.preorder():
             data = ir.tree.data(nid)
-            if nid in overlap_nodes:
+            if nid in overlap_nodes or nid in sharded_loops:
                 continue
             if isinstance(data, (ForNode, ISANode)) and subtree_has_access_patterns(ir.tree, nid):
                 continue
@@ -71,7 +79,11 @@ class Split(Transform[SplitOption]):
                 block_nid, block = _find_enclosing_block(ir.tree, nid)
                 for iv in block.iter_vars:
                     concrete = iv.axis
-                    if _is_static_axis(data, block, concrete) or _is_slot_reduction_axis(ir, nid, concrete):
+                    if (
+                        sum(axis == concrete for axis in block.axis_map.values()) != 1
+                        or _is_static_axis(data, block, concrete)
+                        or _is_slot_reduction_axis(ir, nid, concrete)
+                    ):
                         continue
                     """Tile width currently bound on the leaf (max_tile or full extent)."""
                     current = _current_tensorize_width(data, block, concrete)
@@ -105,6 +117,8 @@ class Split(Transform[SplitOption]):
         target = _resolve(ir.tree, option.target_nid)
         if intersects_software_pipeline(ir, (option.target_nid,)):
             raise TransformLegalityError("Split cannot alter an active software-pipeline scope")
+        if option.target_nid in program_sharded_loops(ir):
+            raise TransformLegalityError("Split cannot replace a loop assigned to logical NeuronCores")
         if subtree_has_access_patterns(ir.tree, option.target_nid):
             raise TransformLegalityError("Split cannot rewrite a loop or ISA operand with an explicit access pattern")
         if option.target_axis is None:
@@ -131,6 +145,10 @@ class Split(Transform[SplitOption]):
                 raise TransformLegalityError(
                     f"Split.target_axis={option.target_axis!r} not declared by enclosing block"
                 )
+            if sum(axis == option.target_axis for axis in block.axis_map.values()) != 1:
+                raise TransformLegalityError(
+                    f"Split.target_axis={option.target_axis!r} maps multiple abstract operation axes"
+                )
             current = _current_tensorize_width(target, block, option.target_axis)
             if current is None:
                 raise TransformLegalityError(
@@ -155,9 +173,9 @@ class Split(Transform[SplitOption]):
     def _do_outer_trip(self, ir: KernelIR, option: SplitOption) -> None:
         """Outer-trip Split: replace the target ForNode with a chain of factor ForNodes.
 
-        Only the loop topology changes (the access tile width is unchanged);
-        :func:`normalize_block` then assigns dense names and rebuilds the
-        iter_values + region offsets from the new loop structure.
+        Only the loop topology changes (the access tile width is unchanged).
+        Existing affine coordinates are preserved through direct substitution;
+        only the generated loop names are re-densified.
         """
         target_nid = option.target_nid
         target = ir.tree.data(target_nid)
@@ -165,6 +183,7 @@ class Split(Transform[SplitOption]):
         parent_nid = ir.tree.parent(target_nid)
         assert parent_nid is not None
         original_children = ir.tree.children(target_nid)
+        nested_blocks = [nid for nid in ir.tree.descendants(target_nid) if isinstance(ir.tree.data(nid), BlockNode)]
         block_nid, _block = _find_enclosing_block(ir.tree, target_nid)
 
         new_top_nid, new_bottom_nid = _build_for_chain(ir.tree, target.loop_var, option.factors)
@@ -178,7 +197,8 @@ class Split(Transform[SplitOption]):
         composed = Add(
             left=Mul(left=Var(name=outer.loop_var), right=Const(value=inner.extent)), right=Var(name=inner.loop_var)
         )
-        _substitute_block_regions(ir.tree, block_nid, {target.loop_var: composed})
+        for affected_block in (block_nid, *nested_blocks):
+            _substitute_block_regions(ir.tree, affected_block, {target.loop_var: composed})
         _normalize_split_block(ir.tree, block_nid)
 
     def _do_tensorize(self, ir: KernelIR, option: SplitOption) -> int:
@@ -260,6 +280,33 @@ class Split(Transform[SplitOption]):
         ir.tree.graph.nodes[block_nid]["data"] = new_block
 
         _normalize_split_block(ir.tree, block_nid)
+        current_block = ir.tree.block(block_nid)
+        dim_loops = _dim_loops(ir.tree, block_nid, current_block)
+        iter_values = tuple(
+            _iter_value(iter_var.axis, dim_loops) if iter_var.axis == option.target_axis else value
+            for iter_var, value in zip(current_block.iter_vars, current_block.iter_values)
+        )
+        ir.tree.graph.nodes[block_nid]["data"] = replace(current_block, iter_values=iter_values)
+        current_leaf = ir.tree.isa(leaf_nid)
+        tensor_axes = {
+            region.tensor: current_leaf.op_cls.OPERAND_AXES[slot].index(abstract_axis)
+            for slot, region in current_leaf.operand_bindings.items()
+            if abstract_axis in current_leaf.op_cls.OPERAND_AXES[slot]
+        }
+        _recompute_bindings(ir.tree, block_nid, tensor_axes=tensor_axes)
+        offset_spec = getattr(leaf.op_cls, "SPLIT_OFFSET_KWARGS", {}).get(abstract_axis)
+        if offset_spec is not None:
+            offset_key, output_slot = offset_spec
+            current = ir.tree.isa(leaf_nid)
+            kwargs = dict(current.kwargs)
+            output_axis = current.op_cls.OPERAND_AXES[output_slot].index(abstract_axis)
+            kwargs[offset_key] = current.operand_bindings[output_slot].ranges[output_axis][0]
+            ir.tree.graph.nodes[leaf_nid]["data"] = ISANode(
+                op_cls=current.op_cls,
+                operand_bindings=current.operand_bindings,
+                kwargs=kwargs,
+                access_patterns=current.access_patterns,
+            )
         return top_nid
 
 
@@ -277,7 +324,7 @@ def _normalize_split_block(tree: KernelTree, block_nid: int) -> None:
         if isinstance((node := tree.data(nid)), ForNode)
     }
     nested_blocks = [nid for nid in tree.descendants(block_nid) if isinstance(tree.data(nid), BlockNode)]
-    normalize_block(tree, block_nid)
+    _rename_dense(tree, block_nid)
     for nested_block in nested_blocks:
         ancestors = set(tree.ancestors(nested_block))
         substitutions: dict[str, Expr] = {}

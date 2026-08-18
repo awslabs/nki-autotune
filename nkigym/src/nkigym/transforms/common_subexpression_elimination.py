@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
+from nkigym.ir.arith.expr import Expr, Var, substitute
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import PointwiseContract
 from nkigym.search.state_facts import operation_facts
@@ -16,25 +17,28 @@ from nkigym.transforms.base import (
     intersects_software_pipeline,
     software_pipeline_overlap_nodes,
 )
-from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, single_leaf
+from nkigym.transforms.helper.canonical_rewrite import block_chain, finalize_rewrite, single_leaf
 from nkigym.transforms.helper.value_graph import contract_input_operands
 
 
 @dataclass(frozen=True)
 class CommonSubexpressionEliminationOption(TransformOption):
-    """Identify one canonical and one redundant pointwise block."""
+    """Redirect one reader of a redundant pointwise block."""
 
     canonical_block_nid: int
     redundant_block_nid: int
+    consumer_nid: int
+    consumer_operand: str
 
 
 @dataclass(frozen=True)
 class _CommonSubexpressionMatch:
-    """Resolved duplicate outputs and owning leaves."""
+    """Resolved duplicate outputs and one concrete reader."""
 
     option: CommonSubexpressionEliminationOption
     canonical_leaf_nid: int
     redundant_leaf_nid: int
+    consumer_nid: int
     canonical_output: BufferRegion
     redundant_output: BufferRegion
 
@@ -58,11 +62,15 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
             for pointwise_blocks in groups.values():
                 for index, canonical_nid in enumerate(pointwise_blocks):
                     for redundant_nid in pointwise_blocks[index + 1 :]:
-                        option = CommonSubexpressionEliminationOption(
-                            canonical_block_nid=canonical_nid, redundant_block_nid=redundant_nid
-                        )
-                        if self._resolve(ir, option, overlap_nodes) is not None:
-                            options.append(option)
+                        for consumer_nid, consumer_operand in self._reader_operands(ir, redundant_nid):
+                            option = CommonSubexpressionEliminationOption(
+                                canonical_block_nid=canonical_nid,
+                                redundant_block_nid=redundant_nid,
+                                consumer_nid=consumer_nid,
+                                consumer_operand=consumer_operand,
+                            )
+                            if self._resolve(ir, option, overlap_nodes) is not None:
+                                options.append(option)
         return options
 
     def _candidate_key(self, ir: KernelIR, block_nid: int) -> str | None:
@@ -74,28 +82,25 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
             contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
             if isinstance(contract, PointwiseContract):
                 block = ir.tree.block(block_nid)
-                loops = tuple(
-                    (node.loop_var, node.extent)
+                loop_extents = tuple(
+                    node.extent
                     for nid in ir.tree.preorder(block_nid)
                     if isinstance((node := ir.tree.data(nid)), ForNode)
                 )
-                inputs = tuple((slot, leaf.operand_bindings.get(slot)) for slot in contract_input_operands(contract))
                 key = repr(
                     (
                         leaf.op_cls,
                         tuple(sorted((name, repr(value)) for name, value in leaf.kwargs.items())),
                         contract,
                         block.iter_vars,
-                        block.iter_values,
                         tuple(sorted(block.axis_map.items())),
-                        loops,
-                        inputs,
+                        loop_extents,
                     )
                 )
         return key
 
     def apply(self, ir: KernelIR, option: CommonSubexpressionEliminationOption) -> KernelIR:
-        """Recheck, copy, and redirect readers to the canonical expression."""
+        """Recheck, copy, and redirect one reader to the canonical expression."""
         match = self._resolve(ir, option)
         if match is None:
             raise TransformLegalityError(f"illegal CommonSubexpressionElimination option: {option}")
@@ -113,13 +118,13 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
         result: _CommonSubexpressionMatch | None = None
         canonical_nid = option.canonical_block_nid
         redundant_nid = option.redundant_block_nid
-        if canonical_nid not in ir.tree.graph or redundant_nid not in ir.tree.graph:
+        if any(nid not in ir.tree.graph for nid in (canonical_nid, redundant_nid, option.consumer_nid)):
             return result
         if not isinstance(ir.tree.data(canonical_nid), BlockNode) or not isinstance(
             ir.tree.data(redundant_nid), BlockNode
         ):
             return result
-        if intersects_software_pipeline(ir, (canonical_nid, redundant_nid), overlap_nodes):
+        if intersects_software_pipeline(ir, (canonical_nid, redundant_nid, option.consumer_nid), overlap_nodes):
             return result
         parent = ir.tree.parent(canonical_nid)
         siblings = ir.tree.children(parent) if parent is not None else []
@@ -133,7 +138,8 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
             return result
         canonical_leaf_nid = single_leaf(ir.tree, canonical_nid)
         redundant_leaf_nid = single_leaf(ir.tree, redundant_nid)
-        if canonical_leaf_nid is None or redundant_leaf_nid is None:
+        consumer = ir.tree.data(option.consumer_nid)
+        if canonical_leaf_nid is None or redundant_leaf_nid is None or not isinstance(consumer, ISANode):
             return result
         canonical_leaf = ir.tree.isa(canonical_leaf_nid)
         redundant_leaf = ir.tree.isa(redundant_leaf_nid)
@@ -151,17 +157,30 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
             return result
         inputs = contract_input_operands(canonical_contract)
         if any(
-            canonical_leaf.operand_bindings.get(slot) != redundant_leaf.operand_bindings.get(slot) for slot in inputs
+            not self._same_operand(ir, canonical_nid, redundant_nid, canonical_leaf, redundant_leaf, slot)
+            for slot in inputs
         ):
             return result
         canonical_output = canonical_leaf.operand_bindings.get(canonical_contract.output_operand)
         redundant_output = redundant_leaf.operand_bindings.get(canonical_contract.output_operand)
         if canonical_output is None or redundant_output is None or canonical_output.tensor == redundant_output.tensor:
             return result
+        consumed = consumer.operand_bindings.get(option.consumer_operand)
+        if option.consumer_operand not in consumer.op_cls.INPUT_OPERANDS or consumed is None:
+            return result
+        if consumed.tensor != redundant_output.tensor:
+            return result
         canonical_buffer = ir.buffer(canonical_output.tensor)
         redundant_buffer = ir.buffer(redundant_output.tensor)
+        declarations = [
+            nid
+            for nid in ir.tree.blocks()
+            if any(buffer.name == canonical_output.tensor for buffer in ir.tree.block(nid).alloc_buffers)
+        ]
         if (
-            canonical_output.ranges != redundant_output.ranges
+            not self._same_ranges(ir, canonical_nid, redundant_nid, canonical_output, redundant_output)
+            or len(declarations) != 1
+            or declarations[0] not in ir.tree.ancestors(option.consumer_nid)
             or canonical_buffer.shape != redundant_buffer.shape
             or canonical_buffer.location != redundant_buffer.location
             or canonical_buffer.physical_dtype() != redundant_buffer.physical_dtype()
@@ -185,31 +204,89 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
             option=option,
             canonical_leaf_nid=canonical_leaf_nid,
             redundant_leaf_nid=redundant_leaf_nid,
+            consumer_nid=option.consumer_nid,
             canonical_output=canonical_output,
             redundant_output=redundant_output,
         )
         return result
 
+    def _reader_operands(self, ir: KernelIR, redundant_nid: int) -> tuple[tuple[int, str], ...]:
+        """Return ISA reader operands of one candidate redundant output."""
+        leaf_nid = single_leaf(ir.tree, redundant_nid)
+        if leaf_nid is None:
+            return ()
+        leaf = ir.tree.isa(leaf_nid)
+        contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
+        if not isinstance(contract, PointwiseContract):
+            return ()
+        output = leaf.operand_bindings.get(contract.output_operand)
+        if output is None:
+            return ()
+        return tuple(
+            (nid, slot)
+            for nid in ir.dependency.touches_by_tensor.get(output.tensor, ())
+            if nid != leaf_nid
+            for slot, region in ir.tree.isa(nid).operand_bindings.items()
+            if slot in ir.tree.isa(nid).op_cls.INPUT_OPERANDS and region.tensor == output.tensor
+        )
+
     def _same_execution(self, ir: KernelIR, canonical_nid: int, redundant_nid: int) -> bool:
         """Return whether two blocks bind identical axes and local loops."""
         canonical = ir.tree.block(canonical_nid)
         redundant = ir.tree.block(redundant_nid)
-        canonical_loops = tuple(
-            (node.loop_var, node.extent)
-            for nid in ir.tree.preorder(canonical_nid)
-            if isinstance((node := ir.tree.data(nid)), ForNode)
-        )
-        redundant_loops = tuple(
-            (node.loop_var, node.extent)
-            for nid in ir.tree.preorder(redundant_nid)
-            if isinstance((node := ir.tree.data(nid)), ForNode)
-        )
+        canonical_loops, canonical_substitutions = self._local_loop_form(ir, canonical_nid)
+        redundant_loops, redundant_substitutions = self._local_loop_form(ir, redundant_nid)
         return (
             canonical.iter_vars == redundant.iter_vars
-            and canonical.iter_values == redundant.iter_values
             and canonical.axis_map == redundant.axis_map
             and canonical_loops == redundant_loops
+            and tuple(substitute(value, canonical_substitutions) for value in canonical.iter_values)
+            == tuple(substitute(value, redundant_substitutions) for value in redundant.iter_values)
         )
+
+    def _local_loop_form(self, ir: KernelIR, block_nid: int) -> tuple[tuple[int, ...], dict[str, Expr]]:
+        """Return local loop extents and an alpha-normalizing substitution."""
+        chain = block_chain(ir.tree, block_nid)
+        loops = () if chain is None else tuple(node for node in chain if isinstance(node, ForNode))
+        substitutions: dict[str, Expr] = {
+            loop.loop_var: Var(name=f"_cse_loop_{index}") for index, loop in enumerate(loops)
+        }
+        return tuple(loop.extent for loop in loops), substitutions
+
+    def _same_operand(
+        self,
+        ir: KernelIR,
+        canonical_nid: int,
+        redundant_nid: int,
+        canonical_leaf: ISANode,
+        redundant_leaf: ISANode,
+        slot: str,
+    ) -> bool:
+        """Return whether one input slot is alpha-equivalent in both blocks."""
+        canonical = canonical_leaf.operand_bindings.get(slot)
+        redundant = redundant_leaf.operand_bindings.get(slot)
+        return (
+            canonical is not None
+            and redundant is not None
+            and canonical.tensor == redundant.tensor
+            and self._same_ranges(ir, canonical_nid, redundant_nid, canonical, redundant)
+        )
+
+    def _same_ranges(
+        self, ir: KernelIR, canonical_nid: int, redundant_nid: int, canonical: BufferRegion, redundant: BufferRegion
+    ) -> bool:
+        """Return whether two region ranges are equal after local alpha-renaming."""
+        _canonical_loops, canonical_substitutions = self._local_loop_form(ir, canonical_nid)
+        _redundant_loops, redundant_substitutions = self._local_loop_form(ir, redundant_nid)
+        canonical_ranges = tuple(
+            (substitute(lower, canonical_substitutions), substitute(width, canonical_substitutions))
+            for lower, width in canonical.ranges
+        )
+        redundant_ranges = tuple(
+            (substitute(lower, redundant_substitutions), substitute(width, redundant_substitutions))
+            for lower, width in redundant.ranges
+        )
+        return canonical_ranges == redundant_ranges
 
     def _definitions_and_uses_are_compatible(
         self,
@@ -260,37 +337,30 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
         return False
 
     def _rewrite(self, ir: KernelIR, match: _CommonSubexpressionMatch) -> None:
-        """Redirect all redundant readers while retaining the now-dead producer."""
-        redundant_descendants = {
-            match.option.redundant_block_nid,
-            *ir.tree.descendants(match.option.redundant_block_nid),
+        """Redirect one redundant reader while retaining the producer."""
+        consumer = ir.tree.isa(match.consumer_nid)
+        operand = match.option.consumer_operand
+        old_region = consumer.operand_bindings[operand]
+        bindings = {
+            slot: (replace(region, tensor=match.canonical_output.tensor) if slot == operand else region)
+            for slot, region in consumer.operand_bindings.items()
         }
-        for nid in ir.tree.preorder():
-            if nid in redundant_descendants:
-                continue
-            node = ir.tree.data(nid)
-            if isinstance(node, ISANode):
-                bindings = {
-                    slot: (
-                        replace(region, tensor=match.canonical_output.tensor)
-                        if region.tensor == match.redundant_output.tensor
-                        else region
-                    )
-                    for slot, region in node.operand_bindings.items()
-                }
-                if bindings != node.operand_bindings:
-                    ir.tree.graph.nodes[nid]["data"] = replace(node, operand_bindings=bindings)
-            elif isinstance(node, BlockNode):
-                reads = tuple(
-                    (
-                        replace(region, tensor=match.canonical_output.tensor)
-                        if region.tensor == match.redundant_output.tensor
-                        else region
-                    )
-                    for region in node.reads
-                )
-                if reads != node.reads:
-                    ir.tree.graph.nodes[nid]["data"] = replace(node, reads=reads)
+        ir.tree.graph.nodes[match.consumer_nid]["data"] = replace(consumer, operand_bindings=bindings)
+        block_nid = next(
+            nid for nid in reversed(ir.tree.ancestors(match.consumer_nid)) if isinstance(ir.tree.data(nid), BlockNode)
+        )
+        block = ir.tree.block(block_nid)
+        replaced = False
+        reads: list[BufferRegion] = []
+        for region in block.reads:
+            if not replaced and region == old_region:
+                reads.append(replace(region, tensor=match.canonical_output.tensor))
+                replaced = True
+            else:
+                reads.append(region)
+        if not replaced:
+            raise AssertionError(f"CSE consumer block {block_nid} does not read operand {operand!r}")
+        ir.tree.graph.nodes[block_nid]["data"] = replace(block, reads=tuple(reads))
         finalize_rewrite(ir)
 
 

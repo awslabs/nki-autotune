@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Const, Expr, NonAffineError, Var, substitute, to_affine
+from nkigym.ir.arith.expr import Add, Const, Expr, Mul, NonAffineError, Var, substitute, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole, NKIOp, ReductionContract
@@ -44,6 +44,15 @@ def _role_of(block: BlockNode, axis: str) -> AxisRole:
     """Return the role ``block`` assigns to ``axis``, defaulting to parallel."""
     role = next((iter_var.role for iter_var in block.iter_vars if iter_var.axis == axis), AxisRole.PARALLEL)
     return role
+
+
+def _fresh_axis(ir: KernelIR) -> str:
+    """Return a fresh dense concrete axis name."""
+    axes = {iter_var.axis for block_nid in ir.tree.blocks() for iter_var in ir.tree.block(block_nid).iter_vars}
+    index = 0
+    while f"d{index}" in axes:
+        index += 1
+    return f"d{index}"
 
 
 @dataclass(frozen=True)
@@ -250,6 +259,13 @@ class _SlotRFactor:
         ir.tree.graph.add_edge(bottom_nid, match.leaf_nid)
         _replace_in_parent_children(ir.tree, parent_nid, [match.leaf_nid], [top_nid])
         normalize_block(ir.tree, match.block_nid)
+        offset_spec = getattr(leaf.op_cls, "SPLIT_OFFSET_KWARGS", {}).get(abstract_axis)
+        if offset_spec is not None:
+            offset_key, output_slot = offset_spec
+            current = ir.tree.isa(match.leaf_nid)
+            output_axis = current.op_cls.OPERAND_AXES[output_slot].index(abstract_axis)
+            kwargs = {**current.kwargs, offset_key: current.operand_bindings[output_slot].ranges[output_axis][0]}
+            ir.tree.graph.nodes[match.leaf_nid]["data"] = replace(current, kwargs=kwargs)
         return top_nid
 
     def _iter_value(self, block: BlockNode, axis: str | None) -> Expr | None:
@@ -302,7 +318,7 @@ class _SlotRFactor:
             for iter_var, value in zip(source_block.iter_vars, source_block.iter_values)
             if iter_var.axis == output_axis
         )
-        factor_axis = self._fresh_axis(ir)
+        factor_axis = _fresh_axis(ir)
         block = BlockNode(
             iter_vars=(
                 replace(output_iter_var, role=AxisRole.PARALLEL),
@@ -327,14 +343,6 @@ class _SlotRFactor:
             if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var in binding_vars
         )
         return block, loops, leaf
-
-    def _fresh_axis(self, ir: KernelIR) -> str:
-        """Return a fresh dense concrete axis name."""
-        axes = {iter_var.axis for block_nid in ir.tree.blocks() for iter_var in ir.tree.block(block_nid).iter_vars}
-        index = 0
-        while f"d{index}" in axes:
-            index += 1
-        return f"d{index}"
 
     def _insert_after_source(
         self, ir: KernelIR, source_block_nid: int, block: BlockNode, loops: tuple[ForNode, ...], leaf: ISANode
@@ -629,7 +637,7 @@ class RFactor(Transform[RFactorOption]):
         return loop_nid, init_block, drain_block
 
     def _emit_rmw(self, ir: KernelIR, option: RFactorOption) -> None:
-        """Emit the fused per-``ko`` PSUM partial and SBUF fold."""
+        """Emit one PSUM partial slot per ``ko`` and a final SBUF fold."""
         tree = ir.tree
         ko_loop = tree.data(option.target_loop_nid)
         assert isinstance(ko_loop, ForNode)
@@ -645,10 +653,13 @@ class RFactor(Transform[RFactorOption]):
         assert reducer is not None
 
         psum_name = matmul_node.operand_bindings["dst"].tensor
+        drain_leaf = self._reader_leaf(tree, psum_name, "tensor_copy")
         out_name = self._drain_out_tensor(ir, psum_name)
         staging_name = self._staging_buffer_name(ir)
         identity = float(reducer.identity)
         combiner = reducer.combiner
+        out_buffer = ir.buffer(out_name)
+        out_partition_tiles = out_buffer.shape[0] // (out_buffer.partition_size or PARTITION_DIM)
 
         ki_nid = self._ki_loop_nid(ir, option.target_loop_nid)
         footprint = self._footprint(ir, ki_nid, matmul_leaf)
@@ -657,30 +668,26 @@ class RFactor(Transform[RFactorOption]):
         assert free_footprint is not None
         free_lo, free_extent = free_footprint
 
-        self._add_rf_buffer(ir, psum_name, out_name, staging_name)
+        self._add_rf_buffer(ir, psum_name, out_name, staging_name, ko_loop.extent)
         self._flip_matmul_k_role(tree, matmul_block_nid)
         self._retarget_init(tree, psum_name, out_name)
-        self._remove_flat_block(tree, self._reader_leaf(tree, psum_name, "tensor_copy"))
         self._nest_memset(
             ir, matmul_leaf, ki_nid, psum_name, ko_var, footprint, part_lo, free_lo, free_extent, identity
         )
-        copy_block_nid = self._nest_copy(
-            ir, matmul_leaf, ki_nid, psum_name, staging_name, ko_var, footprint, part_lo, free_lo, free_extent
-        )
-        self._nest_combine(
+        self._nest_copy(
             ir,
             matmul_leaf,
             ki_nid,
-            copy_block_nid,
-            out_name,
+            psum_name,
             staging_name,
             ko_var,
             footprint,
             part_lo,
             free_lo,
             free_extent,
-            combiner,
+            out_partition_tiles,
         )
+        self._rewrite_drain_as_fold(ir, drain_leaf, staging_name, ko_loop.extent, out_partition_tiles, combiner)
 
         ir.dependency = Dependency(tree)
 
@@ -802,16 +809,19 @@ class RFactor(Transform[RFactorOption]):
             candidate = f"{_RMW_STAGING_BUFFER}_{suffix}"
         return candidate
 
-    def _add_rf_buffer(self, ir: KernelIR, psum_name: str, out_name: str, staging_name: str) -> None:
-        """Add the full-frame SBUF staging buffer beside the PSUM."""
+    def _add_rf_buffer(
+        self, ir: KernelIR, psum_name: str, out_name: str, staging_name: str, factor_extent: int
+    ) -> None:
+        """Add one full output frame per reduction factor beside the PSUM."""
         tree = ir.tree
         out_buf = ir.buffer(out_name)
         rf_buf = Buffer(
             name=staging_name,
-            shape=out_buf.shape,
+            shape=(out_buf.shape[0] * factor_extent, *out_buf.shape[1:]),
             dtype=out_buf.dtype,
             location="sbuf",
             storage_dtype=out_buf.storage_dtype,
+            partition_size=out_buf.partition_size,
         )
         for nid in tree.blocks():
             block = tree.data(nid)
@@ -890,61 +900,60 @@ class RFactor(Transform[RFactorOption]):
         part_lo: Expr,
         free_lo: Expr,
         free_extent: int,
+        out_partition_tiles: int,
     ) -> int:
         """Splice the PSUM-to-SBUF copy after ``ki``."""
         src = self._partition_region(psum_name, part_lo, free_lo, free_extent)
-        dst = self._partition_region(staging_name, part_lo, free_lo, free_extent)
+        slot_lo = Add(left=Mul(left=Var(name=ko_var), right=Const(value=out_partition_tiles)), right=part_lo)
+        dst = self._partition_region(staging_name, slot_lo, free_lo, free_extent)
         block = self._gadget_block(
             ir, matmul_leaf, ko_var, footprint, free_extent, AxisRole.PARALLEL, reads=(src,), writes=(dst,)
         )
         leaf = ISANode(op_cls=NKITensorCopy, operand_bindings={"src": src, "dst": dst}, kwargs={})
         return self._splice_beside_ki(ir.tree, ki_nid, block, footprint, leaf, insert_after=ki_nid)
 
-    def _nest_combine(
+    def _rewrite_drain_as_fold(
         self,
         ir: KernelIR,
-        matmul_leaf: int,
-        ki_nid: int,
-        copy_block_nid: int,
-        out_name: str,
+        drain_leaf: int,
         staging_name: str,
-        ko_var: str,
-        footprint: list[tuple[str, int]],
-        part_lo: Expr,
-        free_lo: Expr,
-        free_extent: int,
+        factor_extent: int,
+        out_partition_tiles: int,
         combiner: str,
     ) -> None:
-        """Splice the cross-``ko`` SBUF fold after the copy."""
-        out_region = self._partition_region(out_name, part_lo, free_lo, free_extent)
-        rf_region = self._partition_region(staging_name, part_lo, free_lo, free_extent)
-        block = self._gadget_block(
-            ir,
-            matmul_leaf,
-            ko_var,
-            footprint,
-            free_extent,
-            AxisRole.ACCUMULATION,
-            reads=(out_region, rf_region),
+        """Replace the flat PSUM drain with one fold over materialized slots."""
+        tree = ir.tree
+        drain = tree.isa(drain_leaf)
+        block_nid = self._enclosing_block_nid(tree, drain_leaf)
+        block = tree.block(block_nid)
+        parent_nid = tree.parent(drain_leaf)
+        if parent_nid is None:
+            raise AssertionError(f"RFactor drain leaf {drain_leaf} has no parent")
+        out_region = drain.operand_bindings["dst"]
+        factor_axis = _fresh_axis(ir)
+        loop_var = f"i_{factor_axis}_rfactor"
+        slot_lo = Add(
+            left=Mul(left=Var(name=loop_var), right=Const(value=out_partition_tiles)), right=out_region.ranges[0][0]
+        )
+        slot_region = BufferRegion(
+            tensor=staging_name, ranges=((slot_lo, out_region.ranges[0][1]), out_region.ranges[1])
+        )
+        factor_loop = tree.add_node(ForNode(loop_var=loop_var, extent=factor_extent))
+        tree.graph.add_edge(factor_loop, drain_leaf)
+        _replace_in_parent_children(tree, parent_nid, [drain_leaf], [factor_loop])
+        tree.graph.nodes[block_nid]["data"] = replace(
+            block,
+            iter_vars=(*block.iter_vars, IterVar(axis=factor_axis, dom=(0, factor_extent), role=AxisRole.ACCUMULATION)),
+            iter_values=(*block.iter_values, Var(name=loop_var)),
+            reads=(out_region, slot_region),
             writes=(out_region,),
         )
         leaf = ISANode(
             op_cls=NKITensorTensor,
-            operand_bindings={"data1": out_region, "data2": rf_region, "dst": out_region},
+            operand_bindings={"data1": out_region, "data2": slot_region, "dst": out_region},
             kwargs={"op": combiner},
         )
-        self._splice_beside_ki(ir.tree, ki_nid, block, footprint, leaf, insert_after=copy_block_nid)
-
-    def _remove_flat_block(self, tree: KernelTree, leaf_nid: int) -> None:
-        """Delete the canonical flat block owning ``leaf_nid``."""
-        block_nid = self._enclosing_block_nid(tree, leaf_nid)
-        parent = tree.parent(block_nid)
-        assert parent is not None
-        remaining = [c for c in tree.children(parent) if c != block_nid]
-        _replace_in_parent_children(tree, parent, [block_nid], [])
-        assert tree.children(parent) == remaining
-        for nid in tree.descendants(block_nid) | {block_nid}:
-            tree.graph.remove_node(nid)
+        tree.graph.nodes[drain_leaf]["data"] = leaf
 
     def _partition_region(self, tensor: str, part_lo: Expr, free_lo: Expr, free_extent: int) -> BufferRegion:
         """Build the canonical partition/free-axis region."""

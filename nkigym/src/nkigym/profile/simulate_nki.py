@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from typing import ParamSpec, TypeVar, cast
 
@@ -27,7 +28,6 @@ _R = TypeVar("_R")
 _SSH_WORKER_OPTIONS = (*_SSH_OPTIONS, "-n", "-o", "ControlMaster=no", "-o", "ControlPath=none")
 _REMOTE_PYTHON = '"$HOME"/venvs/kernel-env/bin/python'
 _REMOTE_RUN_ROOT = ".cache/nkigym-simulate/runs"
-_REMOTE_RESULT_POLL_SECONDS = 5.0
 _WORKER_SOURCE = Path(__file__).with_name("simulate_nki_worker.py")
 ArrayResult = np.ndarray | tuple[np.ndarray, ...]
 _SerializedCase = tuple[int, str, str, str, dict[str, np.ndarray], ArrayResult]
@@ -42,9 +42,6 @@ class FP32SimulationCase:
     func_name: str
     inputs: dict[str, np.ndarray]
     expected: ArrayResult
-
-
-_IndexedCase = tuple[int, FP32SimulationCase]
 
 
 @dataclass(frozen=True)
@@ -116,18 +113,16 @@ def batch_simulate_fp32(
         The number of successfully validated cases.
     """
     _validate_batch(hosts, cases, atol, rtol, timeout_s)
-    completed = len(cases)
     if cases:
-        _require_command("ssh")
-        _require_command("rsync")
+        for command in ("ssh", "rsync"):
+            _require_command(command)
         unique_cases = _deduplicate_cases(cases)
         with ThreadPoolExecutor(max_workers=len(hosts)) as executor:
-            futures = [executor.submit(_detect_host_cpu_count, host, timeout_s) for host in hosts]
+            futures = [executor.submit(_detect_host_cpu_count, host) for host in hosts]
             host_capacities = [(host, future.result()) for host, future in zip(hosts, futures, strict=True)]
         partitions = _partition_cases(host_capacities, unique_cases)
         with tempfile.TemporaryDirectory(prefix="nkigym-simulate-") as raw_directory:
-            directory = Path(raw_directory)
-            requests = _write_requests(directory, partitions, atol, rtol)
+            requests = _write_requests(Path(raw_directory), partitions, atol, rtol)
             with ThreadPoolExecutor(max_workers=len(requests)) as executor:
                 futures = [
                     executor.submit(_run_remote_batch, host, request_path, result_path, timeout_s)
@@ -137,7 +132,7 @@ def batch_simulate_fp32(
         _raise_batch_failure(results)
         if (unique_completed := sum(result.completed for result in results)) != len(unique_cases):
             raise RuntimeError(f"remote simulation completed {unique_completed} of {len(unique_cases)} distinct cases")
-    return completed
+    return len(cases)
 
 
 def _fp32_value(value: object) -> object:
@@ -167,7 +162,8 @@ def _validate_batch(
             raise ValueError(f"{case.label}: invalid kernel function name {case.func_name!r}")
 
 
-def _detect_host_cpu_count(host: str, timeout_s: int) -> int:
+@cache
+def _detect_host_cpu_count(host: str) -> int:
     """Return the logical CPUs available to the remote simulation process."""
     source = (
         'import os; print(len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1)'
@@ -176,7 +172,7 @@ def _detect_host_cpu_count(host: str, timeout_s: int) -> int:
         ["ssh", *_SSH_WORKER_OPTIONS, host, f"{_REMOTE_PYTHON} -c {shlex.quote(source)}"],
         text=True,
         capture_output=True,
-        timeout=timeout_s,
+        timeout=30,
         check=False,
     )
     if completed.returncode != 0:
@@ -192,9 +188,9 @@ def _detect_host_cpu_count(host: str, timeout_s: int) -> int:
     return cpu_count
 
 
-def _deduplicate_cases(cases: list[FP32SimulationCase]) -> list[_IndexedCase]:
+def _deduplicate_cases(cases: list[FP32SimulationCase]) -> list[tuple[int, FP32SimulationCase]]:
     """Keep the earliest state for each exact kernel and shared input set."""
-    unique: list[_IndexedCase] = []
+    unique: list[tuple[int, FP32SimulationCase]] = []
     seen: set[tuple[str, str, int, int]] = set()
     for index, case in enumerate(cases):
         identity = (case.kernel, case.func_name, id(case.inputs), id(case.expected))
@@ -205,20 +201,25 @@ def _deduplicate_cases(cases: list[FP32SimulationCase]) -> list[_IndexedCase]:
 
 
 def _partition_cases(
-    host_capacities: list[tuple[str, int]], cases: list[_IndexedCase]
+    host_capacities: list[tuple[str, int]], cases: list[tuple[int, FP32SimulationCase]]
 ) -> list[tuple[str, int, list[_SerializedCase]]]:
-    """Balance cases across remote CPU capacity by rendered source size."""
+    """Balance cases across remote CPU capacity by source and input volume."""
+
+    def case_weight(case: FP32SimulationCase) -> int:
+        """Estimate remote work from rendered code and copied tensor bytes."""
+        return len(case.kernel) + sum(value.nbytes for value in case.inputs.values()) // 1024
+
     ranked_hosts = sorted(enumerate(host_capacities), key=lambda item: (-item[1][1], item[0]))
     active_hosts = [capacity for _index, capacity in ranked_hosts[: min(len(host_capacities), len(cases))]]
-    assigned: list[list[_IndexedCase]] = [[] for _host in active_hosts]
+    assigned: list[list[tuple[int, FP32SimulationCase]]] = [[] for _host in active_hosts]
     weights = [0 for _host in active_hosts]
-    weighted_cases = sorted(cases, key=lambda item: (-len(item[1].kernel), item[0]))
+    weighted_cases = sorted(cases, key=lambda item: (-case_weight(item[1]), item[0]))
     for indexed_case in weighted_cases:
         host_index = min(
             range(len(active_hosts)), key=lambda index: (weights[index] / active_hosts[index][1], weights[index], index)
         )
         assigned[host_index].append(indexed_case)
-        weights[host_index] += len(indexed_case[1].kernel)
+        weights[host_index] += case_weight(indexed_case[1])
     partitions = []
     for (host, cpu_count), host_cases in zip(active_hosts, assigned, strict=True):
         serialized = [
@@ -361,7 +362,7 @@ def _wait_for_remote_result(host: str, remote_run: str, runner: _CommandRunner) 
             )
         if state != "pending":
             raise SSHTransportError(f"remote simulation worker returned malformed state {state!r}", runner.log)
-        time.sleep(min(_REMOTE_RESULT_POLL_SECONDS, remaining_s))
+        time.sleep(min(5.0, remaining_s))
 
 
 def _read_host_result(host: str, result_path: Path) -> _HostResult:
@@ -376,8 +377,7 @@ def _read_host_result(host: str, result_path: Path) -> _HostResult:
         raise RuntimeError(f"SSH batch simulation returned invalid assigned count for {host}")
     if not isinstance(completed, int) or isinstance(completed, bool) or completed < 0 or completed > assigned:
         raise RuntimeError(f"SSH batch simulation returned invalid completed count for {host}")
-    failure = _parse_failure(host, raw_failure)
-    if failure is None and completed != assigned:
+    if (failure := _parse_failure(host, raw_failure)) is None and completed != assigned:
         raise RuntimeError(f"SSH batch simulation on {host} stopped without reporting a failure")
     return _HostResult(host=host, assigned=assigned, completed=completed, failure=failure)
 

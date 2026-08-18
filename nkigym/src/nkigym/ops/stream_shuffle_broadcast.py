@@ -6,6 +6,18 @@ import numpy as np
 
 from nkigym.ops.base import NKIOp, _operand_role
 
+_POINTWISE_OPERATIONS = frozenset({"add", "maximum", "multiply", "subtract"})
+
+
+def _supports_free_broadcast(matrix_shape: tuple[int, ...], vector_shape: tuple[int, ...], operation: str) -> bool:
+    """Return whether one free-axis broadcast fits a stream-shuffle quadrant."""
+    return len(vector_shape) == 2 and matrix_shape[0] <= 32 and operation in _POINTWISE_OPERATIONS
+
+
+def _stream_shuffle_source(target: str, source: str, partitions: int) -> str:
+    """Render one frontend stream-shuffle call."""
+    return f"{target} = NKIStreamShuffleBroadcast(partitions={partitions})(src={source})"
+
 
 class NKIStreamShuffleBroadcast(NKIOp):
     """Broadcast one SBUF partition to at most one 32-partition quadrant."""

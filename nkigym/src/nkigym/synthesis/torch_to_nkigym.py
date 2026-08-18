@@ -1,7 +1,5 @@
 """Programmatic Torch-to-nkigym synthesis through Torch FX."""
 
-from __future__ import annotations
-
 import inspect
 import operator
 from collections.abc import Callable
@@ -39,11 +37,18 @@ from nkigym.codegen.torch_values import TorchValue as _Value
 from nkigym.codegen.torch_values import emit_activation, emit_cast, emit_cumsum, emit_reduce, emit_slice, emit_topk
 from nkigym.codegen.torch_wide_topk import emit_wide_topk
 from nkigym.ir import build_initial_ir
-from nkigym.ir.canonical_build import CanonicalTileError
 from nkigym.ir.dimension_analysis import _DIMENSION_TRACE_LOCK, analyze_dimensions
 from nkigym.ops import _OP_MODULES
+from nkigym.ops.dma_transpose import emit_oriented_value
+from nkigym.ops.gather import emit_routed_gather
+from nkigym.ops.grouped_load import emit_output_stores, emit_rotational_topk
+from nkigym.ops.index_iota import emit_packed_topk_indices
+from nkigym.ops.stream_shuffle_broadcast import _stream_shuffle_source, _supports_free_broadcast
+from nkigym.ops.tensor_scalar import _tensor_scalar_operands, _vector_broadcast
+from nkigym.ops.tiled_grouped_matmul import lower_grouped_attention
 from nkigym.profile import InputSpecs
 from nkigym.profile.abi import adapt_inputs, adapt_output, kernel_adapters, reference_graph
+from nkigym.search.axis_groups import CanonicalTileError
 from nkigym.synthesis.artifact import ArrayResult, SynthesizedKernel, _exec_nkigym_source, _results_match
 
 _UNARY_OPERATIONS = {name: name for name in "exp log reciprocal rsqrt sqrt square tanh sigmoid silu".split()}
@@ -54,7 +59,8 @@ _BINARY_OPERATIONS = {
 }
 _DIRECT_LOWERINGS = frozenset(
     "argsort bincount cat cross_entropy cross_entropy_backward cumsum logsumexp moe_experts nonzero_compact "
-    "packed_attention routed_gather sparse_topk_affinity stable_softmax topk".split()
+    "grouped_attention packed_attention routed_gather sparse_topk_affinity "
+    "stable_softmax topk".split()
 )
 _TORCH_TRACE_LOCK = Lock()
 
@@ -104,12 +110,7 @@ class _Lowerer:
                 raise ValueError(f"Torch synthesis does not support FX node kind {node.op!r}")
         if not self.outputs:
             raise ValueError("Torch synthesis graph has no tensor output")
-        stored = tuple(f"hbm_output_{index}" for index in range(len(self.outputs)))
-        self.body.extend(
-            f"{name} = NKIStore()(src={value.name})" for name, value in zip(stored, self.outputs, strict=True)
-        )
-        returned = stored[0] if len(stored) == 1 else ", ".join(stored)
-        self.body.append(f"return {returned}")
+        emit_output_stores(self.outputs, self.body)
         imports = ["from nkigym.ops import nkigym_kernel"]
         imports.extend(
             f"from nkigym.ops.{_OP_MODULES[class_name]} import {class_name}" for class_name in sorted(self.imports)
@@ -125,9 +126,8 @@ class _Lowerer:
 
     def _lower_placeholder(self, node: Node) -> None:
         """Emit one HBM-to-SBUF load for an input placeholder."""
-        name = str(node.target)
-        direct = direct_hbm_placeholder(node)
-        self.values[node] = value = _Value(name=name if direct else f"sbuf_{name}", shape=self.input_specs[name][0])
+        name, direct = str(node.target), direct_hbm_placeholder(node)
+        self.values[node] = value = _Value(name if direct else f"sbuf_{name}", self.input_specs[name][0], is_hbm=direct)
         if not direct:
             self.body.append(f"{value.name} = NKILoad()(src={name})")
 
@@ -163,11 +163,9 @@ class _Lowerer:
         elif operation in {"clamp", "clip"}:
             self._lower_clip(node)
         else:
-            unary = _UNARY_OPERATIONS.get(operation)
-            binary = _BINARY_OPERATIONS.get(operation)
-            if unary is not None:
+            if (unary := _UNARY_OPERATIONS.get(operation)) is not None:
                 self._lower_unary(node, unary)
-            elif binary == "matmul":
+            elif (binary := _BINARY_OPERATIONS.get(operation)) == "matmul":
                 self._lower_matmul(node)
             elif binary is not None:
                 self._lower_binary(node, binary)
@@ -273,8 +271,7 @@ class _Lowerer:
 
     def _lower_reduce(self, node: Node, reduction: str) -> None:
         """Lower a rank-two last-axis mean or maximum reduction."""
-        source_node = cast(Node, node.args[0])
-        source = self._value(source_node)
+        source = self._value(source_node := cast(Node, node.args[0]))
         dimension = node.kwargs.get("dim", node.kwargs.get("axis"))
         keepdim = node.kwargs.get("keepdim", node.kwargs.get("keepdims"))
         if len(source.shape) != 2 or dimension not in {-1, 1} or not keepdim:
@@ -397,9 +394,11 @@ class _Lowerer:
     ) -> _Value:
         """Emit one non-segmented tensor binary operation."""
         if operation == "divide":
-            if isinstance(left, _Value) and isinstance(right, _Value) and left.shape == right.shape:
+            if isinstance(left, _Value) and isinstance(right, _Value):
                 operation = "multiply"
                 right = self._activate(right, "reciprocal", f"sbuf_{node.name}_reciprocal")
+            elif isinstance(left, _Value) and isinstance(right, float):
+                operation, right = "multiply", 1.0 / right
             elif not isinstance(left, _Value) or not isinstance(right, (_Value, float)):
                 raise ValueError("Torch division requires a tensor numerator")
         if isinstance(left, _Value) and isinstance(right, _Value) and left.shape == right.shape:
@@ -416,6 +415,15 @@ class _Lowerer:
                 if broadcast is None:
                     raise ValueError(f"Torch {operation} tensor broadcast is unsupported: {left.shape}, {right.shape}")
                 matrix, vector, reverse, transposed = broadcast
+                if transposed and _supports_free_broadcast(matrix.shape, vector.shape, operation):
+                    matrix, vector = self._orient(matrix, False, node, "_data"), self._orient(
+                        vector, False, node, "_operand"
+                    )
+                    broadcasted = _Value(f"{target_name}_broadcast", matrix.shape)
+                    self.imports.add("NKIStreamShuffleBroadcast")
+                    self.body.append(_stream_shuffle_source(broadcasted.name, vector.name, matrix.shape[0]))
+                    operands = (broadcasted, matrix) if reverse else (matrix, broadcasted)
+                    return self._emit_binary(*operands, operation, target_name, node)
                 tensor = self._orient(matrix, transposed, node, "_data")
                 operand = vector.name
             else:
@@ -444,8 +452,8 @@ class _Lowerer:
         target_shape = (left.shape[0], right.shape[1])
         if left.shape[1] != right.shape[0]:
             raise ValueError(f"Torch matmul dimensions are inconsistent: {left.shape} @ {right.shape}")
-        stationary = self._orient(left, True, node, "_stationary")
-        right = self._orient(right, False, node, "_moving")
+        stationary = self._orient(left, True, node, f"{suffix}_stationary")
+        right = self._orient(right, False, node, f"{suffix}_moving")
         psum_name = f"psum_{node.name}{suffix}"
         target = _Value(name=f"sbuf_{node.name}{suffix}", shape=target_shape)
         self.imports.update(("NKIMatmul", "NKITensorCopy"))
@@ -504,26 +512,24 @@ class _Lowerer:
         weights = self._softmax(masked, node, f"sbuf_{node.name}")
         self.values[node] = self._emit_matmul(weights, v, node, "_output")
 
+    def _lower_grouped_attention(self, node: Node) -> None:
+        """Lower grouped token-generation attention."""
+        self.values[node] = lower_grouped_attention(node, self.values, self.body, self.imports)
+
     def _lower_stable_softmax(self, node: Node) -> None:
         """Lower stable last-axis softmax."""
-        source = self._value(cast(Node, node.args[0]))
-        self.values[node] = self._softmax(source, node, f"sbuf_{node.name}")
+        self.values[node] = self._softmax(self._value(cast(Node, node.args[0])), node, f"sbuf_{node.name}")
 
     def _lower_routed_gather(self, node: Node) -> None:
         """Gather HBM rows for each physical sorted-index segment."""
         source, indices = cast(Node, node.args[0]), self.values[cast(Node, node.args[1])]
         while _operation_name(source.target) == "getitem":
             source = cast(Node, source.args[0])
-        if source.op != "placeholder" or not isinstance(indices, _Segments):
-            raise ValueError("routed gather requires one HBM placeholder and segmented indices")
-        chunks: list[_Value] = []
-        self.imports.add("NKIGather")
-        for index, values in enumerate(indices.values):
-            offsets = self._orient(_transpose_view(values), False, node, f"_indices_{index}")
-            target = _Value(f"sbuf_{node.name}_{index}", (offsets.shape[0], _node_shape(node)[1]))
-            self.body.append(f"{target.name} = NKIGather()(src={source.target}, indices={offsets.name})")
-            chunks.append(target)
-        self.values[node] = _Segments(tuple(chunks), axis=0)
+        if source.op != "placeholder" or not isinstance(indices, (_Value, _Segments)):
+            raise ValueError("routed gather requires one HBM placeholder and sorted indices")
+        self.values[node] = emit_routed_gather(
+            str(source.target), indices, _node_shape(node)[1], node.name, self.body, self.imports
+        )
 
     def _emit_logsumexp(self, source: _Value, node: Node) -> _Value:
         """Emit max-shifted exponential reduction and logarithm."""
@@ -646,6 +652,12 @@ class _Lowerer:
         """Lower an exact descending top-k selection."""
         source = self._value(cast(Node, node.args[0]))
         k = node.kwargs.get("k", node.args[1] if len(node.args) > 1 else None)
+        if isinstance(config := node.kwargs.get("rotational_config"), tuple) and isinstance(k, int):
+            layout = cast(tuple[int, int, int, int, int], config)
+            self.values[node] = emit_rotational_topk(
+                source, k, layout, node.name, self.body, self.imports, self.input_specs
+            )
+            return
         if "wide_width" in node.kwargs:
             self.values[node] = emit_wide_topk(
                 source, int(k), int(node.kwargs["wide_width"]), node.name, self.body, self.imports
@@ -733,10 +745,14 @@ class _Lowerer:
         }
         if None in widths or len(widths) != 1 or len(widths) != len(node.users):
             raise ValueError("Torch argsort requires one static prefix width")
-        width = widths.pop()
-        if not isinstance(width, int) or width < 1 or width > source.shape[1]:
+        if not isinstance(width := widths.pop(), int) or width < 1 or width > source.shape[1]:
             raise ValueError("Torch argsort prefix width is invalid")
-        self.values[node] = self._emit_topk(source, width, node)[1]
+        routed = any(c.target is routed_gather for u in node.users for c in u.users)
+        self.values[node] = (
+            emit_packed_topk_indices(source, width, node.name, self.body, self.imports)
+            if routed and len(source_node.users) == 1 and source.shape[0] <= 128 and width % 8 == 0
+            else self._emit_topk(source, width, node)[1]
+        )
 
     def _emit_topk(self, source: _Value, k: int, node: Node) -> tuple[_Segments, _Segments]:
         """Emit repeated native top-eight selection rounds."""
@@ -753,9 +769,8 @@ class _Lowerer:
         """Materialize one requested physical orientation."""
         if source.transposed == transposed:
             return source
-        target = _Value(name=f"sbuf_{node.name}{suffix}", shape=source.shape, transposed=transposed)
-        self.imports.add("NKIDMATranspose")
-        self.body.append(f"{target.name} = NKIDMATranspose()(src={source.name})")
+        target = _Value(f"sbuf_{node.name}{suffix}", source.shape, transposed, False, source.storage_dtype)
+        emit_oriented_value(source, target, f"psum_{node.name}{suffix}", self.body, self.imports)
         return target
 
     def _lower_output(self, node: Node) -> None:
@@ -800,13 +815,26 @@ def synthesize_torch_to_nkigym(
     if list(inspect.signature(f_torch).parameters) != list(input_specs):
         raise ValueError("f_torch parameters must match input_specs")
     graph_module = _trace_torch(f_torch, input_specs)
-    flatten_scan = _has_operation(graph_module, {"cumsum"})
-    has_topk = _has_operation(graph_module, {"argsort", "nonzero_compact", "topk"}) and not _has_operation(
-        graph_module, {"moe_experts"}
-    )
-    has_convolution = _has_operation(graph_module, {"conv1d", "conv2d", "conv3d"})
+    operations = {_operation_name(node.target) for node in graph_module.graph.nodes}
+    flatten_scan, has_convolution = "cumsum" in operations, bool(operations & {"conv1d", "conv2d", "conv3d"})
+    has_topk = bool(operations & {"argsort", "nonzero_compact", "topk"}) and "moe_experts" not in operations
     input_layouts = discover_input_layouts(graph_module)
-    preserve_vectors = flatten_scan or has_topk or any(t[0] == "one_hot" for t, _ in input_layouts.values())
+    small_free_widths = frozenset(
+        shape[1]
+        for node in graph_module.graph.nodes
+        if node.op == "call_function"
+        and len(shape := getattr(node.meta.get("tensor_meta", node.meta.get("example_value")), "shape", ())) == 2
+        and shape[0] <= 32
+    )
+    preserve_vectors = (
+        frozenset(input_specs)
+        if flatten_scan or has_topk or any(t[0] == "one_hot" for t, _ in input_layouts.values())
+        else frozenset(
+            name
+            for name, (shape, _dtype) in input_specs.items()
+            if len(shape) == 2 and shape[0] == 1 and shape[1] in small_free_widths
+        )
+    )
     layout_names = (str(transform[0]) for transform, _shape in input_layouts.values())
     output_layout = next((name for name in layout_names if any(map(name.startswith, OUTPUT_LAYOUTS))), None)
     if output_layout is not None and output_layout.startswith("head_grouped"):
@@ -826,20 +854,15 @@ def synthesize_torch_to_nkigym(
         has_convolution,
         output_layout,
     )
-    artifact = SynthesizedKernel(
-        source=program.source,
-        function=program.function,
-        input_specs=program.input_specs,
-        adapt_inputs=input_adapter,
-        adapt_output=output_adapter,
-    )
+    artifact = SynthesizedKernel(program.source, program.function, program.input_specs, input_adapter, output_adapter)
     has_input_permutation = any(
         len(transform) == len(input_specs[name][0])
         and all(type(axis) is int for axis in transform)
         and tuple(sorted(cast(tuple[int, ...], transform))) == tuple(range(len(transform)))
         for name, (transform, _shape) in input_layouts.items()
     )
-    validation_specs = input_specs if has_input_permutation or has_topk else _validation_specs(input_specs)
+    has_input_permutation = has_topk or output_layout in {"grouped_context", "token_attention"} or has_input_permutation
+    validation_specs = input_specs if has_input_permutation else _validation_specs(input_specs)
     validation_graph = _trace_torch(f_torch, validation_specs)
     validation_layouts = discover_input_layouts(validation_graph)
     normalized_validation_specs = _normalize_specs(validation_specs, preserve_vectors, validation_layouts)
@@ -862,7 +885,7 @@ def synthesize_torch_to_nkigym(
         validation_program.sort_topk_output,
         has_convolution,
         output_layout,
-        next(iter(adapted.values())),
+        next(iter(reference_inputs.values())).float().numpy() if has_topk else None,
     )
     with _DIMENSION_TRACE_LOCK:
         actual = validation_program.function(**adapted)
@@ -974,8 +997,7 @@ def _named_wrapper(function: Callable[..., object], parameters: tuple[str, ...])
 
 def _node_shape(node: Node) -> tuple[int, ...]:
     """Return one shape produced by FX shape propagation."""
-    shape = getattr(node.meta.get("tensor_meta", node.meta.get("example_value")), "shape", None)
-    if shape is None:
+    if (shape := getattr(node.meta.get("tensor_meta", node.meta.get("example_value")), "shape", None)) is None:
         raise ValueError(f"FX node {node.name!r} has no tensor shape")
     return tuple(int(extent) for extent in shape)
 
@@ -983,11 +1005,6 @@ def _node_shape(node: Node) -> tuple[int, ...]:
 def _operation_name(target: object) -> str:
     """Return one normalized FX call name."""
     return str(getattr(target, "__name__", target)).removeprefix("wrapped_")
-
-
-def _has_operation(graph_module: GraphModule, operations: set[str]) -> bool:
-    """Return whether one FX graph contains any named operation."""
-    return any(_operation_name(node.target) in operations for node in graph_module.graph.nodes)
 
 
 def _static_prefix_width(index: object) -> int | None:
@@ -1030,7 +1047,7 @@ def _transpose_view(value: _Value) -> _Value:
     """Return a metadata-only rank-two transpose."""
     if len(value.shape) != 2:
         raise ValueError(f"Torch transpose requires rank two, got {value.shape}")
-    return _Value(value.name, tuple(reversed(value.shape)), not value.transposed)
+    return _Value(value.name, tuple(reversed(value.shape)), not value.transposed, value.is_hbm, value.storage_dtype)
 
 
 def _reshape_view(value: _Value, shape: tuple[int, ...]) -> _Value:
@@ -1038,42 +1055,18 @@ def _reshape_view(value: _Value, shape: tuple[int, ...]) -> _Value:
     if len(shape) != 2 or int(np.prod(value.shape)) != int(np.prod(shape)):
         raise ValueError(f"Torch reshape {value.shape} -> {shape} is unsupported")
     if len(value.shape) == 1 and shape == (1, value.shape[0]):
-        return _Value(value.name, shape, transposed=True)
+        return _Value(value.name, shape, transposed=True, is_hbm=value.is_hbm, storage_dtype=value.storage_dtype)
     physical_shape = tuple(reversed(value.shape)) if value.transposed else value.shape
     if physical_shape == shape:
-        return _Value(value.name, shape)
+        return _Value(value.name, shape, is_hbm=value.is_hbm, storage_dtype=value.storage_dtype)
     if physical_shape == tuple(reversed(shape)):
-        return _Value(value.name, shape, transposed=True)
+        return _Value(value.name, shape, transposed=True, is_hbm=value.is_hbm, storage_dtype=value.storage_dtype)
     raise ValueError(f"Torch reshape {value.shape} -> {shape} changes non-singleton layout")
-
-
-def _vector_broadcast(left: _Value, right: _Value) -> tuple[_Value, _Value, bool, bool] | None:
-    """Identify a matrix and one row- or free-axis vector operand."""
-    for matrix, vector, reverse in ((left, right, False), (right, left, True)):
-        if len(matrix.shape) != 2:
-            continue
-        row = vector.shape in {(matrix.shape[0],), (matrix.shape[0], 1)}
-        free = vector.shape in {(matrix.shape[1],), (1, matrix.shape[1])}
-        if row and free:
-            raise ValueError(f"ambiguous vector broadcast for square matrix {matrix.shape}")
-        if row or free:
-            return matrix, vector, reverse, free
-    return None
-
-
-def _tensor_scalar_operands(left: _Value | float, right: _Value | float) -> tuple[_Value, float, bool]:
-    """Normalize exactly one tensor and one scalar binary operand."""
-    if isinstance(left, _Value) and isinstance(right, float):
-        return (left, right, False)
-    if isinstance(left, float) and isinstance(right, _Value):
-        return (right, left, True)
-    raise ValueError("pointwise scalar lowering requires exactly one tensor and one scalar")
 
 
 def _torch_dtype(dtype: str) -> torch.dtype:
     """Map one input specification dtype to a shape-propagation dtype."""
-    special = {"bool": torch.bool, "uint32": torch.int32}
-    return special.get(
+    return {"bool": torch.bool, "uint32": torch.int32}.get(
         dtype,
         cast(torch.dtype, getattr(torch, dtype)) if dtype.startswith("int") or dtype == "uint8" else torch.float32,
     )
@@ -1103,7 +1096,7 @@ def _validation_specs(input_specs: InputSpecs) -> InputSpecs:
     }
 
 
-def _normalize_specs(input_specs: InputSpecs, preserve_matrix_vectors: bool, layouts: _Layouts) -> InputSpecs:
+def _normalize_specs(input_specs: InputSpecs, preserve_matrix_vectors: frozenset[str], layouts: _Layouts) -> InputSpecs:
     """Flatten leading dimensions and represent broadcast vectors as rank one."""
     normalized: InputSpecs = {}
     for name, (shape, dtype) in input_specs.items():
@@ -1113,7 +1106,7 @@ def _normalize_specs(input_specs: InputSpecs, preserve_matrix_vectors: bool, lay
             dtype = "float32" if float_layout or transform[:2] == ("token_attention", "mask") else dtype
         elif len(shape) > 2:
             shape = (int(np.prod(shape[:-1])), shape[-1])
-        elif len(shape) == 2 and 1 in shape and not preserve_matrix_vectors:
+        elif len(shape) == 2 and 1 in shape and name not in preserve_matrix_vectors:
             shape = (max(shape),)
         normalized[name] = (shape, dtype)
     return normalized

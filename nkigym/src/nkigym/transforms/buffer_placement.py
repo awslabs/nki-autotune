@@ -10,7 +10,6 @@ from nkigym.ir.tree import BlockNode, KernelTree
 from nkigym.search.buffer_placement import buffer_placement_targets, place_buffer
 from nkigym.search.serialization import inherit_analysis_result
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
-from nkigym.transforms.helper.access_pattern import tensor_has_access_pattern
 
 
 @dataclass(frozen=True)
@@ -29,11 +28,7 @@ class BufferPlacement(Transform[BufferPlacementOption]):
 
     def analyze(self, ir: KernelIR) -> list[BufferPlacementOption]:
         """Offer on-chip buffers whose declaration would move."""
-        tensors = tuple(
-            name
-            for name, buffer in ir.all_buffers().items()
-            if buffer.location in ("sbuf", "psum") and not tensor_has_access_pattern(ir.tree, name)
-        )
+        tensors = tuple(name for name, buffer in ir.all_buffers().items() if buffer.location in ("sbuf", "psum"))
         changed = self._would_change_many(ir.tree, tensors)
         return [BufferPlacementOption(tensor=tensor) for tensor in tensors if tensor in changed]
 
@@ -53,8 +48,6 @@ class BufferPlacement(Transform[BufferPlacementOption]):
             raise TransformLegalityError(f"BufferPlacement: no buffer named {option.tensor!r}")
         if buffers[option.tensor].location == "shared_hbm":
             raise TransformLegalityError(f"BufferPlacement: {option.tensor} is shared_hbm (must remain at root)")
-        if tensor_has_access_pattern(ir.tree, option.tensor):
-            raise TransformLegalityError(f"BufferPlacement: {option.tensor} participates in an explicit access pattern")
         if option.tensor not in self._would_change_many(ir.tree, (option.tensor,)):
             raise TransformLegalityError(f"BufferPlacement: {option.tensor} is already at its target scope (no-op)")
 
