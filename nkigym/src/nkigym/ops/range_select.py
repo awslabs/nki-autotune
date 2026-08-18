@@ -26,11 +26,19 @@ class NKIRangeSelect(NKIOp):
         "dst": ("P", "F"),
     }
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"on_true_tile", "bound0", "bound1"})
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {
+        "on_true_tile": frozenset({"sbuf", "psum"}),
+        "bound0": frozenset({"sbuf", "psum"}),
+        "bound1": frozenset({"sbuf", "psum"}),
+    }
+    INPUT_STORAGE_DTYPES: ClassVar[dict[str, frozenset[str]]] = {"on_true_tile": frozenset({"float32"})}
     REQUIRED_INPUT_STORAGE_DTYPES: ClassVar[dict[str, str]] = {"bound0": "float32", "bound1": "float32"}
-    FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {"F": "width"}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 1, "F": 1}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+    PREFERRED_TILE_SIZE: ClassVar[dict[str, int]] = {"F": 512}
     CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"width"})
+    SPLIT_OFFSET_KWARGS: ClassVar[dict[str, tuple[str, str]]] = {"F": ("range_start", "dst")}
+    SUPPORTED_REDUCERS: ClassVar[frozenset[str]] = frozenset({"maximum"})
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def __init__(self, width: int, **kwargs: Any) -> None:

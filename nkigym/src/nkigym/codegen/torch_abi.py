@@ -11,9 +11,15 @@ import numpy as np
 import torch
 from torch.fx import GraphModule, Node
 
+from nkigym.ops.folded_load import grouped_context_input
+from nkigym.ops.folded_store import grouped_context_attention_graph
+from nkigym.ops.grouped_store import rotational_topk_config
+from nkigym.ops.grouped_tensor_copy import grouped_attention
+
 InputSpecs = dict[str, tuple[tuple[int, ...], str]]
 OUTPUT_LAYOUTS = (
-    "block_diagonal head_grouped metadata_groups nonzero_flat rope_data routed_tokens token_attention".split()
+    "block_diagonal grouped_context head_grouped metadata_groups nonzero_flat rope_data routed_tokens "
+    "token_attention".split()
 )
 
 
@@ -248,26 +254,20 @@ def token_attention_input(
     if kind in {"k", "v"} and active is None:
         raise ValueError(f"token-attention {kind} layout requires active cache values")
     if kind == "q":
-        values = array.reshape(width, batch, queries).transpose(1, 2, 0)
-        result = np.zeros(shape, dtype=array.dtype).reshape(batch, queries, batch, width)
-        indices = np.arange(batch)
-        result[indices, :, indices, :] = values
+        result = array.reshape(width, batch * queries)
     elif kind == "k":
         assert active is not None
-        result = array.reshape(batch, width, sequence).copy()
-        result[:, :, -queries:] = active.reshape(width, batch, queries).transpose(1, 0, 2)
+        values = array.reshape(batch, width, sequence).copy()
+        values[:, :, -queries:] = active.reshape(width, batch, queries).transpose(1, 0, 2)
+        result = values.transpose(1, 0, 2).reshape(width, -1)
     elif kind == "v":
         assert active is not None
         values = array.reshape(batch, sequence, width).copy()
         values[:, -queries:, :] = active.reshape(batch, queries, width)
-        result = values.transpose(1, 0, 2)
+        result = values.reshape(batch, sequence // width, width, width).transpose(2, 0, 1, 3).reshape(width, -1)
     elif kind == "mask":
-        valid = array.transpose(1, 2, 3, 0).reshape(batch * queries, sequence).astype(np.bool_)
-        score_mask = np.where(valid, 0.0, np.finfo(np.float32).min)
-        output_mask = np.zeros((batch, queries, batch, width), dtype=np.float32)
-        indices = np.arange(batch)
-        output_mask[indices, :, indices, :] = 1.0
-        result = np.concatenate((score_mask, output_mask.reshape(batch * queries, batch * width)), axis=1)
+        valid = array.reshape(sequence // width, width, batch, 1, queries).transpose(1, 0, 2, 3, 4)
+        result = np.where(valid.reshape(width, -1), 0.0, np.finfo(np.float32).min)
     else:
         raise ValueError(f"unknown token-attention input layout {kind!r}")
     return result.reshape(shape)
@@ -302,8 +302,8 @@ def sparse_topk_affinity(
     raise RuntimeError("sparse_topk_affinity is a trace-only marker")
 
 
-def topk(data: torch.Tensor, k: int, wide_width: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mark hierarchical top-k over a partitioned wide row."""
+def topk(data: torch.Tensor, k: int, **_kwargs: object) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mark structured top-k over a packed input."""
     raise RuntimeError("topk is a trace-only marker")
 
 
@@ -327,14 +327,15 @@ def moe_gate_up_input(array: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
 
 def direct_hbm_placeholder(node: Node) -> bool:
     """Return whether one routed placeholder is consumed directly from HBM."""
-    if str(node.target) == "expert_down_weights":
+    cumsum_users = node.users and all(user.target is torch.cumsum for user in node.users)
+    if str(node.target) == "expert_down_weights" or cumsum_users:
         return True
     return any(
         str(getattr(user.target, "__name__", user.target)).removeprefix("wrapped_") == "getitem"
         and isinstance(user.args[1], tuple)
         and (
             user.args[1][:2] in {("routed_tokens", "data"), ("routed_tokens", "hidden")}
-            or user.args[1][:1] == ("moe_gate_up",)
+            or user.args[1][:1] in {("grouped_context",), ("moe_gate_up",), ("rotational_topk",)}
         )
         for user in node.users
     )
@@ -376,14 +377,14 @@ def routed_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | None
     indices = call(operator.getitem, (ordered, (Ellipsis, slice(None, routes))), (1, routes))
     hidden_sorted = call(routed_gather, (values["hidden_input"], indices), (routes, hidden))
     data_sorted = call(routed_gather, (values["expert_affinities_masked"], indices), (routes, 2))
-    affinity = call(operator.getitem, (data_sorted, (Ellipsis, slice(0, 1))), (routes, 1))
-    token_indices = call(operator.getitem, (data_sorted, (Ellipsis, slice(1, 2))), (routes, 1))
-    graph.output([hidden_sorted, affinity, token_indices])
+    graph.output([hidden_sorted, data_sorted])
     return GraphModule(torch.nn.Module(), graph)
 
 
 def attention_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | None:
     """Build one static sequence-packed attention graph."""
+    if grouped := grouped_context_attention_graph(f_torch, input_specs):
+        return grouped
     target, bound = getattr(f_torch, "function", f_torch), getattr(f_torch, "bound_kwargs", {})
     if getattr(target, "__name__", "") != "attention_cte_torch_ref":
         return None
@@ -410,26 +411,31 @@ def token_attention_graph(f_torch: object, input_specs: InputSpecs) -> GraphModu
     graph, inputs, call = synthetic_graph(input_specs)
     batch, _, width, sequence = input_specs["k_prior"][0]
     queries = input_specs["q"][0][1] // batch
-    score_shape, output_shape = (batch * queries, sequence), (batch * queries, batch * width)
+    tiles = min(32, sequence // width)
+    if width != 128 or tiles < 1 or sequence % (width * tiles):
+        raise ValueError("token attention requires width 128 and a sequence divisible by its tile group")
+    chunks = sequence // (width * tiles)
     dimensions = (batch, queries, width, sequence)
     layouts = {
-        "q": (("token_attention", "q", *dimensions), (batch * queries, batch * width)),
-        "k_prior": (("token_attention", "k", *dimensions), (batch * width, sequence)),
-        "v_prior": (("token_attention", "v", *dimensions), (sequence, batch * width)),
-        "mask": (("token_attention", "mask", *dimensions), (batch * queries, sequence + batch * width)),
+        "q": (("token_attention", "q", *dimensions), (width, batch * queries)),
+        "k_prior": (("token_attention", "k", *dimensions), (width, batch * sequence)),
+        "v_prior": (("token_attention", "v", *dimensions), (width, batch * sequence)),
+        "mask": (("token_attention", "mask", *dimensions), (width, sequence // width * batch * queries)),
     }
     values = {
         name: call(operator.getitem, (inputs[name], transform), shape) for name, (transform, shape) in layouts.items()
     }
-    values["q"] = call(astype, (values["q"], "physical_bfloat16"), values["q"].meta["example_value"].shape)
-    scores = call(operator.matmul, (values["q"], values["k_prior"]), score_shape)
-    score_mask = call(operator.getitem, (values["mask"], (Ellipsis, slice(None, sequence))), score_shape)
-    output_mask = call(operator.getitem, (values["mask"], (Ellipsis, slice(sequence, None))), output_shape)
-    masked = call(operator.add, (scores, score_mask), score_shape)
-    weights = call(stable_softmax, (masked,), score_shape)
-    weights = call(astype, (weights, "physical_bfloat16"), score_shape)
-    output = call(operator.matmul, (weights, values["v_prior"]), output_shape)
-    graph.output([call(operator.mul, (output, output_mask), output_shape)])
+    output = call(
+        grouped_attention,
+        tuple(values[name] for name in ("q", "k_prior", "v_prior", "mask")),
+        (width, batch * queries),
+        chunks=chunks,
+        groups=batch,
+        tiles=tiles,
+        width=width,
+        queries=queries,
+    )
+    graph.output([output])
     return GraphModule(torch.nn.Module(), graph)
 
 
@@ -437,16 +443,24 @@ def special_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | Non
     """Build a static graph for wide top-k or token-generation MoE."""
     target, bound = getattr(f_torch, "function", f_torch), getattr(f_torch, "bound_kwargs", {})
     name = getattr(target, "__name__", "")
-    if name == "topk_torch_ref" and input_specs["inp"][0][-1] > 16384:
-        width, k = input_specs["inp"][0][-1], int(bound["topk_k"])
-        if input_specs["inp"][0] != (1, width) or width % 16 or not bool(bound["topk_sorted"]):
-            raise ValueError("wide top-k requires one divisible sorted input row")
+    if name == "topk_torch_ref":
+        rows, width = input_specs["inp"][0]
+        k, sorted_output = int(bound["topk_k"]), bool(bound["topk_sorted"])
+        config = rotational_topk_config(rows, width, k) if sorted_output else None
+        if config is not None:
+            stages, stage_width, local_k = config[2:]
+            transform, shape = ("rotational_topk", *config), (rows, stages * (stage_width + stages * local_k))
+            kwargs = {"k": k, "rotational_config": config}
+        elif width > 16384:
+            if rows != 1 or width % 16 or not sorted_output:
+                raise ValueError("wide top-k requires one divisible sorted input row")
+            transform, shape, kwargs = ("wide_topk",), (16, width // 16), {"k": k, "wide_width": width}
+        else:
+            return None
         graph, inputs, call = synthetic_graph(input_specs)
-        data = call(operator.getitem, (inputs["inp"], ("wide_topk",)), (16, width // 16))
-        selected = graph.call_function(topk, (data,), {"k": k, "wide_width": width})
-        values = call(operator.getitem, (selected, 0), (1, k))
-        indices = call(operator.getitem, (selected, 1), (1, k))
-        graph.output([values, indices])
+        data = call(operator.getitem, (inputs["inp"], transform), shape)
+        selected = graph.call_function(topk, (data,), kwargs)
+        graph.output([call(operator.getitem, (selected, index), (rows, k)) for index in range(2)])
         return GraphModule(torch.nn.Module(), graph)
     if name != "moe_block_tkg_torch_ref":
         return None
@@ -497,6 +511,8 @@ __all__ = [
     "attention_graph",
     "block_diagonal",
     "direct_hbm_placeholder",
+    "grouped_context_attention_graph",
+    "grouped_context_input",
     "moe_gate_up_input",
     "moe_experts",
     "normalize_topk_output",

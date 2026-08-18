@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from nkigym.ir import KernelIR, to_affine
-from nkigym.ir.tree import BlockNode, ForNode
+from nkigym.ir import Expr, KernelIR, Var, substitute, to_affine
+from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import BilinearReductionContract, InitializerContract, ReductionContract
 from nkigym.search.state_facts import operation_facts
 from nkigym.transforms.base import (
@@ -27,17 +27,19 @@ class EliminateIdentityInitializerOption(TransformOption):
     initializer_block_nid: int
     reduction_block_nid: int
     tensor: str
+    initializer_leaf_nid: int | None = None
 
 
 @dataclass(frozen=True)
 class _InitializerMatch:
-    """Resolved leaves and reset loop for one elimination option."""
+    """Resolved leaves and execution subtree for one elimination option."""
 
     option: EliminateIdentityInitializerOption
     initializer_leaf_nid: int
     reduction_leaf_nid: int
-    reset_loop_nid: int
+    initializer_execution_nid: int
     output_operand: str
+    reduction_axis: str
 
 
 class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]):
@@ -50,8 +52,10 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             return []
         options: list[EliminateIdentityInitializerOption] = []
         overlap_nodes = software_pipeline_overlap_nodes(ir)
-        for initializer_block_nid in ir.tree.blocks():
-            option = self._candidate_option(ir, initializer_block_nid)
+        for initializer_leaf_nid in ir.tree.preorder():
+            if not isinstance(ir.tree.data(initializer_leaf_nid), ISANode):
+                continue
+            option = self._candidate_option(ir, initializer_leaf_nid)
             if option is not None and self._resolve(ir, option, explicit=True, overlap_nodes=overlap_nodes) is not None:
                 options.append(option)
         return options
@@ -68,11 +72,10 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
         self._remove_initializer(new_ir, copied_match)
         return new_ir
 
-    def _candidate_option(self, ir: KernelIR, initializer_block_nid: int) -> EliminateIdentityInitializerOption | None:
+    def _candidate_option(self, ir: KernelIR, initializer_leaf_nid: int) -> EliminateIdentityInitializerOption | None:
         """Construct an option when the next tensor touch is a reduction."""
         option: EliminateIdentityInitializerOption | None = None
-        initializer_leaf_nid = single_leaf(ir.tree, initializer_block_nid)
-        if initializer_leaf_nid is not None:
+        if initializer_leaf_nid in ir.tree.graph and isinstance(ir.tree.data(initializer_leaf_nid), ISANode):
             initializer = ir.tree.isa(initializer_leaf_nid)
             contract = initializer.op_cls.algebraic_contract(initializer.kwargs)
             if isinstance(contract, InitializerContract):
@@ -84,9 +87,10 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
                         if index + 1 < len(ordered):
                             reduction_leaf_nid = ordered[index + 1]
                             option = EliminateIdentityInitializerOption(
-                                initializer_block_nid=initializer_block_nid,
+                                initializer_block_nid=owning_block(ir.tree, initializer_leaf_nid),
                                 reduction_block_nid=owning_block(ir.tree, reduction_leaf_nid),
                                 tensor=region.tensor,
+                                initializer_leaf_nid=initializer_leaf_nid,
                             )
         return option
 
@@ -109,9 +113,16 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             return result
         if intersects_software_pipeline(ir, (initializer_block_nid, reduction_block_nid), overlap_nodes):
             return result
-        initializer_leaf_nid = single_leaf(ir.tree, initializer_block_nid)
+        initializer_leaf_nid = option.initializer_leaf_nid
+        if initializer_leaf_nid is None:
+            initializer_leaf_nid = single_leaf(ir.tree, initializer_block_nid)
         reduction_leaf_nid = single_leaf(ir.tree, reduction_block_nid)
-        if initializer_leaf_nid is None or reduction_leaf_nid is None:
+        if (
+            initializer_leaf_nid is None
+            or initializer_leaf_nid not in ir.tree.graph
+            or owning_block(ir.tree, initializer_leaf_nid) != initializer_block_nid
+            or reduction_leaf_nid is None
+        ):
             return result
         initializer = ir.tree.isa(initializer_leaf_nid)
         reduction = ir.tree.isa(reduction_leaf_nid)
@@ -123,13 +134,6 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
         output_operand, reduction_axis, identity = reduction_fields
         initializer_region = initializer.operand_bindings.get(initializer_contract.output_operand)
         reduction_region = reduction.operand_bindings.get(output_operand)
-        reduction_block = ir.tree.block(reduction_block_nid)
-        rmw = output_operand in reduction.op_cls.rmw_operands(reduction.kwargs)
-        state_matches = (
-            (not rmw and reduction_region not in reduction_block.reads)
-            if explicit
-            else (rmw and reduction_region in reduction_block.reads)
-        )
         if (
             initializer_region is None
             or reduction_region is None
@@ -137,32 +141,37 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             or reduction_region != initializer_region
             or initializer_contract.value != identity
             or not reduction.op_cls.first_write_overwrites(output_operand, reduction.kwargs)
-            or not state_matches
         ):
             return result
-        reset_loop_nid = ir.tree.parent(initializer_block_nid)
-        allocation_block_nid = ir.tree.parent(reset_loop_nid) if reset_loop_nid is not None else None
+        initializer_execution_nid = self._initializer_execution(ir, initializer_block_nid, initializer_leaf_nid)
+        buffer_owner = self._buffer_owner(ir, option.tensor)
         if (
-            reset_loop_nid is None
-            or not isinstance(ir.tree.data(reset_loop_nid), ForNode)
-            or reset_loop_nid not in ir.tree.ancestors(reduction_leaf_nid)
-            or self._has_reduction_loop(ir, reset_loop_nid, reduction_block_nid, reduction_leaf_nid, reduction_axis)
-            or set(ir.tree.descendants(initializer_block_nid)) != {initializer_leaf_nid}
-            or allocation_block_nid is None
-            or not isinstance(ir.tree.data(allocation_block_nid), BlockNode)
-            or self._buffer_owner(ir, option.tensor) != allocation_block_nid
-            or not self._initializer_precedes_reduction(ir, reset_loop_nid, initializer_block_nid, reduction_leaf_nid)
-            or not self._all_touches_are_scoped(
-                ir, option.tensor, reset_loop_nid, initializer_leaf_nid, reduction_leaf_nid
+            not self._matching_output_domains(
+                ir, initializer_leaf_nid, reduction_leaf_nid, initializer_region, reduction_axis
             )
+            or buffer_owner is None
+            or buffer_owner not in ir.tree.ancestors(initializer_leaf_nid)
+            or buffer_owner not in ir.tree.ancestors(reduction_leaf_nid)
+            or not self._first_touches_match(ir, option.tensor, initializer_leaf_nid, reduction_leaf_nid)
         ):
+            return result
+        reduction_block = ir.tree.block(reduction_block_nid)
+        rmw = output_operand in reduction.op_cls.rmw_operands(reduction.kwargs)
+        configured = reduction.kwargs.get("accumulate") == (reduction_axis,)
+        state_matches = (
+            (configured if explicit else "accumulate" not in reduction.kwargs)
+            and rmw
+            and reduction_region in reduction_block.reads
+        )
+        if not state_matches:
             return result
         result = _InitializerMatch(
             option=option,
             initializer_leaf_nid=initializer_leaf_nid,
             reduction_leaf_nid=reduction_leaf_nid,
-            reset_loop_nid=reset_loop_nid,
+            initializer_execution_nid=initializer_execution_nid,
             output_operand=output_operand,
+            reduction_axis=reduction_axis,
         )
         return result
 
@@ -173,24 +182,88 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             result = (contract.output_operand, contract.reduction_axis, contract.combinator.identity)
         return result
 
-    def _has_reduction_loop(
-        self, ir: KernelIR, reset_loop_nid: int, block_nid: int, leaf_nid: int, reduction_axis: str
+    def _enclosing_block(self, ir: KernelIR, nid: int) -> int | None:
+        """Return the nearest block above one loop."""
+        return next(
+            (
+                ancestor
+                for ancestor in reversed(ir.tree.ancestors(nid))
+                if isinstance(ir.tree.data(ancestor), BlockNode)
+            ),
+            None,
+        )
+
+    def _simple_initializer_loop_nest(self, ir: KernelIR, block_nid: int, leaf_nid: int) -> bool:
+        """Return whether one initializer is wrapped only by loops."""
+        return all(
+            descendant == leaf_nid or isinstance(ir.tree.data(descendant), ForNode)
+            for descendant in ir.tree.descendants(block_nid)
+        )
+
+    def _initializer_execution(self, ir: KernelIR, block_nid: int, leaf_nid: int) -> int:
+        """Return the loop child that executes only the selected initializer."""
+        return block_nid if self._simple_initializer_loop_nest(ir, block_nid, leaf_nid) else leaf_nid
+
+    def _matching_output_domains(
+        self,
+        ir: KernelIR,
+        initializer_leaf_nid: int,
+        reduction_leaf_nid: int,
+        region: BufferRegion,
+        reduction_axis: str,
     ) -> bool:
-        """Return whether one reset is followed by multiple reduction calls."""
-        block = ir.tree.block(block_nid)
-        concrete_axis = block.axis_map.get(reduction_axis)
-        binding_vars: set[str] = set()
-        if concrete_axis is not None:
-            values = [
-                value for iter_var, value in zip(block.iter_vars, block.iter_values) if iter_var.axis == concrete_axis
-            ]
-            if len(values) == 1:
-                binding_vars = {name for name in to_affine(values[0]) if name is not None}
-        ancestors = ir.tree.ancestors(leaf_nid)
-        reset_index = ancestors.index(reset_loop_nid)
+        """Return whether initializer and reduction cover the same output tiles."""
+        initializer_form = self._output_domain_form(ir, initializer_leaf_nid, region)
+        reduction_form = self._output_domain_form(ir, reduction_leaf_nid, region)
+        if initializer_form is None or initializer_form != reduction_form:
+            return False
+        initializer_loops = self._ancestor_loops(ir, initializer_leaf_nid)
+        reduction_loops = self._ancestor_loops(ir, reduction_leaf_nid)
+        output_variables = self._region_variables(region)
+        initializer_repeats = [loop for loop in initializer_loops.values() if loop.loop_var not in output_variables]
+        reduction_repeats = [loop for loop in reduction_loops.values() if loop.loop_var not in output_variables]
+        reduction_block = ir.tree.block(owning_block(ir.tree, reduction_leaf_nid))
+        concrete_axis = reduction_block.axis_map.get(reduction_axis, reduction_axis)
+        return not initializer_repeats and all(
+            self._loop_binds_axis(reduction_block, loop.loop_var, concrete_axis) for loop in reduction_repeats
+        )
+
+    def _output_domain_form(
+        self, ir: KernelIR, leaf_nid: int, region: BufferRegion
+    ) -> tuple[tuple[int, ...], tuple[tuple[Expr, Expr], ...]] | None:
+        """Return an alpha-normalized output iteration domain."""
+        loops = self._ancestor_loops(ir, leaf_nid)
+        variables = self._region_variables(region)
+        selected = [loop for loop in loops.values() if loop.loop_var in variables]
+        if len(selected) != len(variables):
+            return None
+        substitutions: dict[str, Expr] = {
+            loop.loop_var: Var(name=f"_output_loop_{index}") for index, loop in enumerate(selected)
+        }
+        ranges = tuple(
+            (substitute(lower, substitutions), substitute(width, substitutions)) for lower, width in region.ranges
+        )
+        return tuple(loop.extent for loop in selected), ranges
+
+    def _ancestor_loops(self, ir: KernelIR, leaf_nid: int) -> dict[int, ForNode]:
+        """Return materialized loops enclosing one ISA leaf in execution order."""
+        return {nid: loop for nid in ir.tree.ancestors(leaf_nid) if isinstance((loop := ir.tree.data(nid)), ForNode)}
+
+    def _region_variables(self, region: BufferRegion) -> frozenset[str]:
+        """Return loop variables used by one output region."""
+        return frozenset(
+            variable
+            for lower, width in region.ranges
+            for expression in (lower, width)
+            for variable in to_affine(expression)
+            if variable is not None
+        )
+
+    def _loop_binds_axis(self, block: BlockNode, loop_var: str, axis: str) -> bool:
+        """Return whether one materialized loop contributes to ``axis``."""
         return any(
-            isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var in binding_vars
-            for nid in ancestors[reset_index + 1 :]
+            iter_var.axis == axis and loop_var in to_affine(value)
+            for iter_var, value in zip(block.iter_vars, block.iter_values)
         )
 
     def _buffer_owner(self, ir: KernelIR, tensor: str) -> int | None:
@@ -202,43 +275,41 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
         ]
         return owners[0] if len(owners) == 1 else None
 
-    def _initializer_precedes_reduction(
-        self, ir: KernelIR, loop_nid: int, initializer_block_nid: int, reduction_leaf_nid: int
+    def _first_touches_match(
+        self, ir: KernelIR, tensor: str, initializer_leaf_nid: int, reduction_leaf_nid: int
     ) -> bool:
-        """Return whether the initializer is before the reduction path child."""
-        path_child = reduction_leaf_nid
-        for ancestor in reversed(ir.tree.ancestors(reduction_leaf_nid)):
-            if ancestor == loop_nid:
-                break
-            path_child = ancestor
-        children = ir.tree.children(loop_nid)
-        return (
-            initializer_block_nid in children
-            and path_child in children
-            and children.index(initializer_block_nid) < children.index(path_child)
-        )
-
-    def _all_touches_are_scoped(
-        self, ir: KernelIR, tensor: str, loop_nid: int, initializer_leaf_nid: int, reduction_leaf_nid: int
-    ) -> bool:
-        """Return whether the reduction becomes the first touch of each fresh tile."""
+        """Return whether the initializer and reduction are the first two touches."""
         touches = set(ir.dependency.touches_by_tensor.get(tensor, ()))
         preorder = [nid for nid in ir.tree.preorder() if nid in touches]
-        scoped = all(loop_nid in ir.tree.ancestors(nid) for nid in touches)
-        return (
-            scoped and len(preorder) >= 2 and preorder[0] == initializer_leaf_nid and preorder[1] == reduction_leaf_nid
-        )
+        return len(preorder) >= 2 and preorder[:2] == [initializer_leaf_nid, reduction_leaf_nid]
 
     def _remove_initializer(self, ir: KernelIR, match: _InitializerMatch) -> None:
         """Remove one identity fill already superseded by an explicit overwrite."""
         block_nid = match.option.initializer_block_nid
-        parent = ir.tree.parent(block_nid)
-        if parent != match.reset_loop_nid:
-            raise AssertionError(f"initializer block {block_nid} moved out of reset loop")
-        removed = {block_nid, *ir.tree.descendants(block_nid)}
-        _replace_in_parent_children(ir.tree, match.reset_loop_nid, [block_nid], [])
+        execution_nid = match.initializer_execution_nid
+        parent = ir.tree.parent(execution_nid)
+        if parent is None:
+            raise AssertionError(f"initializer execution {execution_nid} has no parent")
+        removed = {execution_nid, *ir.tree.descendants(execution_nid)}
+        _replace_in_parent_children(ir.tree, parent, [execution_nid], [])
         ir.tree.graph.remove_nodes_from(removed)
+        if execution_nid != block_nid:
+            self._prune_empty_loops(ir, parent, block_nid)
+            block = ir.tree.block(block_nid)
+            ir.tree.graph.nodes[block_nid]["data"] = replace(
+                block, iter_vars=(), iter_values=(), reads=(), writes=(), axis_map={}
+            )
         finalize_rewrite(ir)
+
+    def _prune_empty_loops(self, ir: KernelIR, nid: int, stop_nid: int) -> None:
+        """Remove empty initializer-only loops below the owning block."""
+        current = nid
+        while current != stop_nid and isinstance(ir.tree.data(current), ForNode) and not ir.tree.children(current):
+            parent = ir.tree.parent(current)
+            if parent is None:
+                raise AssertionError(f"empty initializer loop {current} has no parent")
+            ir.tree.graph.remove_node(current)
+            current = parent
 
 
 __all__ = ["EliminateIdentityInitializer", "EliminateIdentityInitializerOption"]

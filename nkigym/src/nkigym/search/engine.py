@@ -12,6 +12,7 @@ from typing import Any
 from nkigym.codegen import render
 from nkigym.ir import KernelIR
 from nkigym.profile import InputSpecs, ProfileMetrics, profile_metrics
+from nkigym.search.program_sharding import configured_program_shards
 from nkigym.search.types import Action, Policy, PolicyContext, SearchResult
 from nkigym.transforms import Transform
 
@@ -57,9 +58,11 @@ class IterativeRefinement:
         """Refine linearly until the policy or a process limit stops."""
         self._prepare_trace()
         state = self.initial_state
-        evaluations = [self._evaluate(state, (), 0)]
+        evaluations: list[ProfileMetrics] = []
+        compile_failures: list[str] = []
+        evaluation_attempts = 0
         transforms_applied = 0
-        finish_reason = self._stop_after_evaluation(evaluations)
+        finish_reason: str | None = None
 
         while finish_reason is None:
             legal_actions = self._legal_actions(state)
@@ -72,6 +75,8 @@ class IterativeRefinement:
                 transforms=self.transforms,
                 legal_actions=legal_actions,
                 evaluations=tuple(evaluations),
+                compile_failures=tuple(compile_failures),
+                evaluation_attempts=evaluation_attempts,
                 max_transforms=self.config.max_transforms_per_evaluation,
             )
             actions = self.policy.select_actions(context)
@@ -86,13 +91,26 @@ class IterativeRefinement:
 
             state = self._apply_actions(state, actions)
             transforms_applied += len(actions)
-            evaluations.append(self._evaluate(state, actions, len(evaluations)))
-            finish_reason = self._stop_after_evaluation(evaluations)
+            try:
+                metrics = self._evaluate(state, actions, evaluation_attempts)
+            except RuntimeError as error:
+                if not _is_resource_failure(str(error)):
+                    raise
+                compile_failures.append(str(error))
+            else:
+                evaluations.append(metrics)
+                compile_failures.clear()
+            evaluation_attempts += 1
+            finish_reason = self._stop_after_evaluation(evaluations, evaluation_attempts)
+
+        if not evaluations:
+            detail = compile_failures[-1] if compile_failures else finish_reason
+            raise RuntimeError(f"search produced no profileable transformed state: {detail}")
 
         result = SearchResult(
             best_latency_ms=_best_latency(evaluations),
             transforms_applied=transforms_applied,
-            evaluations_run=len(evaluations),
+            evaluations_run=evaluation_attempts,
             finish_reason=finish_reason,
         )
         self._write_result(result)
@@ -115,27 +133,31 @@ class IterativeRefinement:
     def _evaluate(self, state: KernelIR, actions: tuple[Action, ...], evaluation_id: int) -> ProfileMetrics:
         """Persist and profile one candidate."""
         directory = self.config.trace_dir / "evaluations" / f"evaluation_{evaluation_id:03d}"
-        metrics = profile_metrics(
-            host=self.config.profile_host,
-            kernel=render(state),
-            func_name=f"nki_{state.func_name}",
-            input_specs=self.config.input_specs,
-            cache_dir=directory,
-            neuronx_cc_args=self.config.neuronx_cc_args,
-            lnc=self.config.lnc,
-            timeout_s=self.config.profile_timeout_s,
-        )
-        payload = {"actions": [_action_description(action) for action in actions]}
-        (directory / "actions.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        lnc = max((self.config.lnc, *configured_program_shards(state).values()))
+        try:
+            metrics = profile_metrics(
+                host=self.config.profile_host,
+                kernel=render(state),
+                func_name=f"nki_{state.func_name}",
+                input_specs=self.config.input_specs,
+                cache_dir=directory,
+                neuronx_cc_args=self.config.neuronx_cc_args,
+                lnc=lnc,
+                timeout_s=self.config.profile_timeout_s,
+            )
+        finally:
+            directory.mkdir(parents=True, exist_ok=True)
+            payload = {"actions": [_action_description(action) for action in actions]}
+            (directory / "actions.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         return metrics
 
-    def _stop_after_evaluation(self, evaluations: list[ProfileMetrics]) -> str | None:
+    def _stop_after_evaluation(self, evaluations: list[ProfileMetrics], evaluation_attempts: int) -> str | None:
         """Return a target or budget stop reason."""
         finish_reason: str | None = None
         target = self.config.target_latency_ms
-        if target is not None and _best_latency(evaluations) <= target:
+        if target is not None and evaluations and _best_latency(evaluations) <= target:
             finish_reason = "target latency reached"
-        elif len(evaluations) >= self.config.max_evaluations:
+        elif evaluation_attempts >= self.config.max_evaluations:
             finish_reason = "evaluation budget exhausted"
         return finish_reason
 
@@ -164,6 +186,18 @@ def _action_description(action: Action) -> str:
 def _best_latency(evaluations: list[ProfileMetrics]) -> float:
     """Return the lowest measured latency."""
     return min(evaluation.latency_ms for evaluation in evaluations)
+
+
+def _is_resource_failure(message: str) -> bool:
+    """Return whether a compiler diagnostic describes a schedulable resource limit."""
+    markers = (
+        "Allocated memory out of bound",
+        "State buffer allocation failed",
+        "Out of memory",
+        "cannot write to multiple PSUM banks",
+        "tile size must be <=",
+    )
+    return any(marker in message for marker in markers)
 
 
 __all__ = ["IterativeRefinement", "SearchConfig"]

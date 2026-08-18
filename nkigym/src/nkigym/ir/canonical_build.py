@@ -18,21 +18,10 @@ from __future__ import annotations
 from dataclasses import replace
 
 from nkigym.ir.arith.expr import Const, Var
-from nkigym.ir.dimension_analysis import TensorDims, _AnalysisResult, _OpRecord
-from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
+from nkigym.ir.dimension_analysis import _AnalysisResult, _OpRecord
+from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole
 from nkigym.ops.memset import NKIMemset
-
-
-class CanonicalTileError(ValueError):
-    """A dimension cannot be divided into legal canonical tiles."""
-
-    def __init__(self, message: str, dimension: str, extent: int, minimum: int) -> None:
-        """Record the failed concrete dimension and minimum legal tile."""
-        super().__init__(message)
-        self.dimension = dimension
-        self.extent = extent
-        self.minimum = minimum
 
 
 def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
@@ -42,15 +31,15 @@ def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
     Build leaf blocks under it, seed all Buffers on the root, then run
     LCA placement to distribute them to their lifetime-dominating blocks.
     """
-    from nkigym.search.buffer_placement import place_buffers
+    from nkigym.search.buffer_placement import collect_buffers, place_buffers
 
     tree = KernelTree()
     op_records = list(analysis.ops)
-    buffers_by_name = _collect_buffers(analysis.tensors, analysis.param_names)
     for rec in op_records:
-        if rec.op_cls.rmw_operands(rec.kwargs):
+        if rec.op_cls.SYNTHESIZE_RMW_INITIALIZER and rec.op_cls.rmw_operands(rec.kwargs):
             _build_memset_subblock(tree, tree.root, rec, analysis)
         _build_subblock(tree, tree.root, rec, analysis)
+    buffers_by_name = collect_buffers(analysis.tensors, analysis.param_names, tree)
     """Seed every Buffer on the root block, then let place_buffers redistribute by LCA."""
     root_blk = tree.data(tree.root)
     tree.graph.nodes[tree.root]["data"] = replace(root_blk, alloc_buffers=tuple(buffers_by_name.values()))
@@ -58,48 +47,10 @@ def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
     return tree
 
 
-def _collect_buffers(tensors: dict[str, "TensorDims"], param_names: list[str]) -> dict[str, Buffer]:
-    """Return one :class:`Buffer` per allocated tensor (excluding kernel parameters)."""
-    out: dict[str, Buffer] = {}
-    for name, td in tensors.items():
-        if name not in param_names:
-            out[name] = Buffer(
-                name=name, shape=tuple(td.shape), dtype=td.dtype, location=td.location, storage_dtype=td.storage_dtype
-            )
-    return out
-
-
-def _trip_count(rec: "_OpRecord", abstract: str, analysis: "_AnalysisResult") -> int:
-    """Number of loop trips for ``abstract`` axis of ``rec`` (extent // tile).
-
-    A trip of 1 means the single tile spans the full axis extent, so the
-    axis is loopless: it keeps its iter_var + full-width region but emits
-    no ForNode.
-    """
-    extent = analysis.dim_sizes[rec.axis_map[abstract]]
-    tile = _tile_size(rec, abstract, analysis)
-    return extent // tile
-
-
-def _tile_size(rec: "_OpRecord", abstract: str, analysis: "_AnalysisResult") -> int:
-    """Return the canonical tile width for one operation axis."""
-    extent = analysis.dim_sizes[rec.axis_map[abstract]]
-    minimum = min(rec.op_cls.MIN_TILE_SIZE.get(abstract, 1), extent)
-    maximum = rec.op_cls.MAX_TILE_SIZE.get(abstract)
-    upper = extent if maximum is None else min(extent, maximum)
-    tile = next((candidate for candidate in range(upper, minimum - 1, -1) if extent % candidate == 0), None)
-    if tile is None:
-        raise CanonicalTileError(
-            f"{rec.op_cls.__name__}.{abstract} extent {extent} has no canonical tile between {minimum} and {upper}",
-            rec.axis_map[abstract],
-            extent,
-            minimum,
-        )
-    return tile
-
-
 def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysis: "_AnalysisResult") -> int:
     """Construct one :class:`BlockNode` + its loop chain + ISA leaf; return the block's nid."""
+    from nkigym.search.axis_groups import build_access_patterns, canonical_tile_size, canonical_trip_count
+
     iter_vars: list[IterVar] = []
     iter_values: list = []
     loop_var_names: dict[str, str] = {}
@@ -109,7 +60,7 @@ def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysi
         iter_vars.append(IterVar(axis=concrete, dom=(0, extent), role=role))
         loop_var = f"i_{concrete}_0"
         loop_var_names[abstract] = loop_var
-        if _trip_count(rec, abstract, analysis) > 1:
+        if canonical_trip_count(rec, abstract, analysis) > 1:
             iter_values.append(Var(name=loop_var))
         else:
             iter_values.append(Const(value=0))
@@ -125,15 +76,25 @@ def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysi
     block_nid = tree.add_node(block, parent=parent_nid)
     parent_for_loops: int = block_nid
     for abstract, concrete in rec.axis_map.items():
-        trip = _trip_count(rec, abstract, analysis)
+        trip = canonical_trip_count(rec, abstract, analysis)
         if trip > 1:
             loop_var = loop_var_names[abstract]
             for_nid = tree.add_node(ForNode(loop_var=loop_var, extent=trip), parent=parent_for_loops)
             parent_for_loops = for_nid
     operand_bindings = _operand_bindings(rec, loop_var_names, analysis)
+    access_patterns = build_access_patterns(rec, loop_var_names, analysis, canonical_tile_size, canonical_trip_count)
     op_kwargs = dict(rec.kwargs)
+    for abstract, (key, slot) in getattr(rec.op_cls, "SPLIT_OFFSET_KWARGS", {}).items():
+        groups = rec.op_cls.operand_axis_groups(slot)
+        dimension = next(i for i, group in enumerate(groups) if abstract in group)
+        op_kwargs[key] = operand_bindings[slot].ranges[dimension][0]
+    if rec.op_cls.FIRST_WRITE_AXES:
+        op_kwargs["accumulate"] = rec.op_cls.FIRST_WRITE_AXES
     tree.add_node(
-        ISANode(op_cls=rec.op_cls, operand_bindings=operand_bindings, kwargs=op_kwargs), parent=parent_for_loops
+        ISANode(
+            op_cls=rec.op_cls, operand_bindings=operand_bindings, kwargs=op_kwargs, access_patterns=access_patterns
+        ),
+        parent=parent_for_loops,
     )
     return block_nid
 
@@ -199,36 +160,11 @@ def _operand_bindings(
 def _build_region(
     rec: "_OpRecord", slot: str, axes: tuple[str, ...], loop_var_names: dict[str, str], analysis: "_AnalysisResult"
 ) -> BufferRegion:
-    """Construct a :class:`BufferRegion` for ``slot`` using its axes and per-tile widths.
+    """Construct one dependency region from the operation's physical axis groups."""
+    from nkigym.search.axis_groups import build_operand_region, canonical_tile_size, canonical_trip_count
 
-    SBUF/PSUM operands use 3D layout with a special partition axis: axis 0
-    uses the buffer's physical partition extent, and its lower bound is the
-    bare partition-coordinate Var rather than an element offset.
-    """
-    from nkigym.ir.arith.expr import Mul
-
-    tensor_name = rec.operand_names[slot]
-    tensor_location = analysis.tensors[tensor_name].location
-    present_axes = [a for a in axes if a in rec.axis_map]
-    ranges: list = []
-    for axis_index, abstract in enumerate(present_axes):
-        extent_per_tile = _tile_size(rec, abstract, analysis)
-        loop_var = loop_var_names.get(abstract)
-        looped = loop_var is not None and _trip_count(rec, abstract, analysis) > 1
-
-        """Partition-axis offsets are tile indices rather than element offsets."""
-        tensor_extent = analysis.tensors[tensor_name].shape[0]
-        partition_extent = min(tensor_extent, PARTITION_DIM)
-        if axis_index == 0 and tensor_location in ("sbuf", "psum") and extent_per_tile == partition_extent and looped:
-            assert loop_var is not None
-            ranges.append((Var(name=loop_var), Const(value=partition_extent)))
-        elif not looped:
-            ranges.append((Const(value=0), Const(value=extent_per_tile)))
-        else:
-            assert loop_var is not None
-            lo = Mul(left=Var(name=loop_var), right=Const(value=extent_per_tile))
-            ranges.append((lo, Const(value=extent_per_tile)))
-    return BufferRegion(tensor=tensor_name, ranges=tuple(ranges))
+    _ = axes
+    return build_operand_region(rec, slot, loop_var_names, analysis, canonical_tile_size, canonical_trip_count)
 
 
 __all__ = ["build_canonical_blocknode_tree"]

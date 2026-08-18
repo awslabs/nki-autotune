@@ -23,12 +23,8 @@ from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Const, Expr, Mul, Var, to_affine
 from nkigym.ir.recurrence import _build_match, _compatible_block, _evaluate, _Match, _Stage
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
-from nkigym.ops.activation import NKIActivation
-from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.base import AxisRole, BilinearReductionContract, ReductionContract
 from nkigym.ops.store import NKIStore
-from nkigym.ops.tensor_scalar import NKITensorScalar
-from nkigym.ops.tensor_scalar_reduce import NKITensorScalarReduce
 from nkigym.search.state_facts import operation_facts
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.canonical_rewrite import block_chain, finalize_rewrite, owning_block
@@ -84,7 +80,7 @@ def _detect_matches(ir: KernelIR, complete: bool) -> list[_Match]:
         if len(evaluation.stages) < 2:
             continue
         maximal = _build_match(ir, graph, axis, evaluation)
-        if maximal is None or maximal.deferred_factor is not None:
+        if maximal is None:
             continue
         selected = maximal
         if not complete and len(maximal.stages) > 2:
@@ -333,38 +329,49 @@ def _group_scopes(
 
 def _can_lower(ir: KernelIR, match: _Match, chunk_size: int, prefix: bool = False) -> bool:
     """Return whether ordinary-IR lowering supports one option."""
-    valid = chunk_size in match.chunk_sizes and len(match.external_outputs) == 1 and match.deferred_factor is None
+    states = {stage.state_tensor for stage in match.stages}
+    valid = (
+        chunk_size in match.chunk_sizes
+        and bool(match.external_outputs)
+        and match.external_outputs[0] == match.stages[-1].state_tensor
+        and set(match.external_outputs).issubset(states)
+        and match.deferred_factor is None
+    )
     valid = valid and bool(match.absorbed_blocks)
     valid = valid and all((ir.tree.parent(block) == ir.tree.root for block in match.absorbed_blocks))
+    graph = build_value_graph(ir)
+    valid = valid and all(
+        not isinstance((contract := graph.contracts[stage.reducer_leaf]), ReductionContract)
+        or contract.mapped_output_operand is None
+        or contract.mapped_op_cls is not None
+        for stage in match.stages
+    )
     if prefix:
         valid = valid and match.incremental_prefix and chunk_size < match.progress_extent
-        states = [ir.buffer(stage.state_tensor) for stage in match.stages]
+        state_buffers = [ir.buffer(stage.state_tensor) for stage in match.stages]
         valid = valid and all(
             (
                 buffer.location in {"sbuf", "psum"}
                 and len(buffer.shape) == 1
                 and buffer.shape[0] >= PARTITION_DIM
                 and buffer.shape[0] % PARTITION_DIM == 0
-                for buffer in states
+                for buffer in state_buffers
             )
         )
         return valid and _root_insertion(ir, match, retain_old=True) is not None
     names = [stage.state_tensor for stage in match.stages[:-1]] + [match.external_outputs[0]]
-    states = [ir.buffer(name) for name in names]
+    state_buffers = [ir.buffer(name) for name in names]
     valid = valid and all(
         (
             buffer.location in {"sbuf", "psum"}
             and len(buffer.shape) in {1, 2}
             and buffer.shape[0] >= PARTITION_DIM
             and buffer.shape[0] % PARTITION_DIM == 0
-            for buffer in states
+            for buffer in state_buffers
         )
     )
     valid = valid and all((len(ir.buffer(stage.state_tensor).shape) == 1 for stage in match.stages[:-1]))
-    graph = build_value_graph(ir)
-    if valid and chunk_size == match.progress_extent:
-        if not _mapped(match, ir):
-            return False
+    if valid and _mapped(match, ir):
         scopes = tuple((_stage_scope(ir, graph, stage, match.progress_axis) for stage in match.stages))
         valid = _group_scopes(ir, match, graph, scopes) is not None
     return valid and _root_insertion(ir, match) is not None
@@ -383,8 +390,8 @@ def _preserved_chunk_size(ir: KernelIR, match: _Match) -> int | None:
                     if not isinstance(width, Const):
                         return None
                     sizes.add(width.value)
-    size = next(iter(sizes)) if len(sizes) == 1 else None
-    return size if size in match.chunk_sizes else None
+    size = min(sizes, default=0)
+    return size if size in match.chunk_sizes and all(value % size == 0 for value in sizes) else None
 
 
 def _new_context(
@@ -413,10 +420,8 @@ def _lower_complete(ir: KernelIR, match: _Match, chunk_size: int) -> None:
     if _mapped(match, ir):
         scopes = tuple((_stage_scope(ir, graph, stage, match.progress_axis) for stage in match.stages))
         grouped = _group_scopes(ir, match, graph, scopes)
-        if grouped is not None:
-            _lower_grouped(ir, match, graph, grouped, chunk_size)
-        else:
-            _lower_hbm(ir, match, graph, scopes, chunk_size)
+        assert grouped is not None
+        _lower_grouped(ir, match, graph, grouped, chunk_size)
     else:
         _lower_tile(ir, match, graph, chunk_size)
 
@@ -442,60 +447,6 @@ def _lower_tile(ir: KernelIR, match: _Match, graph: ValueGraph, chunk_size: int)
         {},
         tuple((None for _stage in match.stages)),
         Var(name=f"i_{match.progress_axis}_online"),
-    )
-    _derive(context, plans)
-    roots.append(carrier)
-    insertion = _root_insertion(ir, match)
-    assert insertion is not None
-    old = match.absorbed_blocks
-    _set_root_children(ir.tree, old, tuple(roots), insertion)
-    for block in old:
-        ir.tree.graph.remove_nodes_from({block, *ir.tree.descendants(block)})
-    _seed_buffers(ir, buffers, _match_tensors(match, graph))
-    finalize_rewrite(ir)
-
-
-def _lower_hbm(
-    ir: KernelIR, match: _Match, graph: ValueGraph, scopes: tuple[OperationScope, ...], chunk_size: int
-) -> None:
-    """Lower mapped states through an fp32 HBM carry."""
-    original = ir.all_buffers()
-    names = NameSupply(set(original))
-    plans, added = _plan_buffers(ir, match, graph, names, False, False)
-    buffers = _recurrence_buffers(ir, match, original)
-    buffers.update(added)
-    stage_regions = tuple((_stage_region(ir, graph, stage) for stage in match.stages))
-    regions = _stage_regions(plans, stage_regions)
-    output = ir.return_name
-    carry = names.fresh(f"{output}_online_carry")
-    buffers[carry] = replace(buffers[output], name=carry, dtype="float32", storage_dtype="float32")
-    regions[carry] = _hbm_region(stage_regions[-1], carry)
-    init = OperationBuilder(ir.tree, None, buffers, names, regions)
-    roots: list[int] = []
-    for index, (stage, plan) in enumerate(zip(match.stages[:-1], plans[:-1])):
-        init.scope = scopes[index]
-        roots.append(_emit_initializer(init, plan.state, stage.combinator.identity))
-    final_region = stage_regions[-1]
-    zero = names.fresh(f"{match.external_outputs[0]}_online_zero")
-    shape = _region_shape(final_region)
-    buffers[zero] = Buffer(name=zero, shape=shape, dtype="float32", location="sbuf", storage_dtype="float32")
-    regions[zero] = BufferRegion(tensor=zero, ranges=tuple(((Const(value=0), Const(value=extent)) for extent in shape)))
-    init.scope = scopes[-1]
-    roots.append(_emit_initializer(init, zero, 0.0))
-    roots.append(init.append(NKIStore, {"src": regions[zero], "dst": regions[carry]}, {}))
-    carrier, loop = _carrier(ir.tree, match, chunk_size, None)
-    context = _new_context(
-        ir,
-        match,
-        graph,
-        chunk_size,
-        loop,
-        buffers,
-        names,
-        regions,
-        scopes,
-        Var(name=f"i_{match.progress_axis}_online"),
-        carry,
     )
     _derive(context, plans)
     roots.append(carrier)
@@ -550,19 +501,16 @@ def _rewrite_reducer_as_map(ir: KernelIR, stage: _Stage, contract: ReductionCont
     """Retain a dual-output reducer's mapped pointwise result."""
     leaf = ir.tree.isa(stage.reducer_leaf)
     mapped = contract.mapped_output_operand
-    if mapped is None:
-        raise ValueError("mapped reducer has no mapped output")
-    if leaf.op_cls is NKIActivationReduce:
-        op_cls = NKIActivation
-        inputs = ("data", "bias")
-    elif leaf.op_cls is NKITensorScalarReduce:
-        op_cls = NKITensorScalar
-        inputs = ("data", "operand0")
-    else:
-        raise ValueError(f"unsupported dual-output reducer {leaf.op_cls.__name__}")
-    bindings = {slot: region for slot, region in leaf.operand_bindings.items() if slot in inputs or slot == mapped}
-    bindings["dst"] = bindings.pop(mapped)
-    kwargs = {name: value for name, value in leaf.kwargs.items() if name != "reduce_op"}
+    op_cls = contract.mapped_op_cls
+    if mapped is None or op_cls is None:
+        raise ValueError("mapped reducer has no mapped-output lowering")
+    bindings = {
+        slot: region
+        for slot, region in leaf.operand_bindings.items()
+        if slot in contract.mapped_input_operands or slot == mapped
+    }
+    bindings[contract.mapped_op_output_operand] = bindings.pop(mapped)
+    kwargs = {name: value for name, value in leaf.kwargs.items() if name not in contract.mapped_excluded_kwargs}
     reads, writes = _access_regions(op_cls, bindings, kwargs)
     block = ir.tree.block(stage.reducer_block)
     axis = block.axis_map[contract.reduction_axis]
@@ -897,7 +845,7 @@ def _incremental_intact(ir: KernelIR, state: _Incremental) -> bool:
 
 @dataclass(frozen=True)
 class OnlineFusionOption(TransformOption):
-    """One proven recurrence to rewrite without changing its tile width."""
+    """One proven recurrence fusion."""
 
     match_id: tuple[str, tuple[int, ...]]
 
@@ -907,16 +855,16 @@ class OnlineFusion(Transform[OnlineFusionOption]):
 
     def analyze(self, ir: KernelIR) -> list[OnlineFusionOption]:
         """Enumerate contract-proven and lowering-supported options."""
-        facts = operation_facts(ir)
-        if len(ir.return_names) != 1 or facts.has_unknown_contract:
+        state = _incremental_state(ir)
+        if len(ir.return_names) != 1:
             options = []
-        elif (state := _incremental_state(ir)) is not None:
+        elif state is not None:
             options = (
                 [OnlineFusionOption(state.remaining[0].match_id)]
                 if state.remaining and _incremental_intact(ir, state)
                 else []
             )
-        elif not facts.has_reduction:
+        elif (facts := operation_facts(ir)).has_unknown_contract or not facts.has_reduction:
             options = []
         else:
             options = [

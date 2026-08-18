@@ -81,22 +81,22 @@ def _coefficient(node: ast.AST, variable: str) -> int | None:
     return None
 
 
-class _ZeroLoop(ast.NodeTransformer):
-    """Replace one collapsed loop variable with zero."""
+class _ZeroLoops(ast.NodeTransformer):
+    """Replace collapsed loop variables with zero."""
 
-    def __init__(self, name: str) -> None:
-        """Store the loop variable removed by coalescing."""
-        self.name = name
+    def __init__(self, names: set[str]) -> None:
+        """Store the loop variables removed by coalescing."""
+        self.names = names
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
-        """Replace the collapsed loop variable."""
-        return ast.copy_location(ast.Constant(value=0), node) if node.id == self.name else node
+        """Replace one collapsed loop variable."""
+        return ast.copy_location(ast.Constant(value=0), node) if node.id in self.names else node
 
 
-def _coalesced_operand(node: ast.expr, loop: tuple[str, int]) -> ast.expr | None:
-    """Collapse one proven contiguous slice across one loop."""
-    result, (name, extent) = copy.deepcopy(node), loop
-    candidates = [item for item in ast.walk(result) if isinstance(item, ast.Slice) and name in _node_names(item)]
+def _coalesced_operand(node: ast.expr, loops: tuple[tuple[str, int], ...]) -> tuple[ast.expr, int] | None:
+    """Collapse one proven contiguous slice across a perfect loop nest."""
+    result, names = copy.deepcopy(node), {name for name, _ in loops}
+    candidates = [item for item in ast.walk(result) if isinstance(item, ast.Slice) and names & _node_names(item)]
     if len(candidates) != 1:
         return None
     target, upper = candidates[0], candidates[0].upper
@@ -106,13 +106,23 @@ def _coalesced_operand(node: ast.expr, loop: tuple[str, int]) -> ast.expr | None
         return None
     if not isinstance(upper.right, ast.Constant) or not isinstance(upper.right.value, int) or upper.right.value <= 0:
         return None
-    lower, expected = target.lower, int(upper.right.value)
-    if _coefficient(lower, name) != expected or name in _node_names(result) - _node_names(target):
+    lower, width = target.lower, int(upper.right.value)
+    if names & (_node_names(result) - _node_names(target)):
         return None
-    expected *= extent
-    target.lower = cast(ast.expr, _ZeroLoop(name).visit(lower))
-    target.upper = ast.BinOp(left=copy.deepcopy(target.lower), op=ast.Add(), right=ast.Constant(value=expected))
-    return result
+    coefficients = [_coefficient(lower, name) for name, _ in loops]
+    if any(value is None or value <= 0 or value % width for value in coefficients):
+        return None
+    digits = sorted(
+        (cast(int, coefficient) // width, extent) for coefficient, (_, extent) in zip(coefficients, loops, strict=True)
+    )
+    span = 1
+    for stride, extent in digits:
+        if stride != span:
+            return None
+        span *= extent
+    target.lower = cast(ast.expr, _ZeroLoops(names).visit(target.lower))
+    target.upper = ast.BinOp(left=copy.deepcopy(target.lower), op=ast.Add(), right=ast.Constant(value=width * span))
+    return result, width * span
 
 
 def _loop_info(node: ast.For) -> tuple[str, int] | None:
@@ -128,35 +138,45 @@ def _loop_info(node: ast.For) -> tuple[str, int] | None:
     return node.target.id, int(argument.value)
 
 
-def _dma_copy(node: ast.stmt) -> ast.Call | None:
-    """Return one direct NKI DMA-copy call."""
+def _coalescible_call(node: ast.stmt) -> tuple[ast.Call, tuple[str, ...]] | None:
+    """Return one direct NKI call and its contiguous tensor operands."""
     call = node.value if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) else None
     function = None if call is None else call.func
-    if isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name):
-        return call if function.value.id == "nisa" and function.attr == "dma_copy" else None
+    if isinstance(call, ast.Call) and isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name):
+        operands = {"dma_copy": ("src", "dst"), "memset": ("dst",)}.get(function.attr)
+        if function.value.id == "nisa" and operands is not None:
+            return call, operands
     return None
+
+
+def _coalesced_call(node: ast.For) -> ast.stmt | None:
+    """Collapse one perfect tensor-call loop nest with contiguous tile coverage."""
+    loops, statement = [], cast(ast.stmt, node)
+    while isinstance(statement, ast.For) and (loop := _loop_info(statement)) is not None:
+        loops.append(loop)
+        statement = statement.body[0]
+    if (info := _coalescible_call(statement)) is None:
+        return None
+    result, (_call, operand_names) = copy.deepcopy(statement), info
+    bindings = {keyword.arg: keyword for keyword in cast(ast.Call, cast(ast.Expr, result).value).keywords}
+    names = {name for name, _ in loops}
+    if any(names & _node_names(keyword.value) for name, keyword in bindings.items() if name not in operand_names):
+        return None
+    operands = {name: _coalesced_operand(bindings[name].value, tuple(loops)) for name in operand_names}
+    if any(value is None for value in operands.values()):
+        return None
+    for name, value in operands.items():
+        bindings[name].value = cast(tuple[ast.expr, int], value)[0]
+    return ast.copy_location(result, node)
 
 
 class _CoalesceDMACopies(ast.NodeTransformer):
     """Collapse contiguous DMA-only loop nests for CPU simulation."""
 
     def visit_For(self, node: ast.For) -> ast.AST:
-        """Replace one proven contiguous DMA loop nest."""
+        """Replace one proven contiguous tensor-call loop nest."""
         node = cast(ast.For, self.generic_visit(node))
-        loop, call = _loop_info(node), _dma_copy(node.body[0])
-        if loop is None or call is None:
-            return node
-        bindings = {keyword.arg: keyword for keyword in call.keywords}
-        if any(
-            loop[0] in _node_names(keyword.value) for name, keyword in bindings.items() if name not in {"src", "dst"}
-        ):
-            return node
-        source = _coalesced_operand(bindings["src"].value, loop) if "src" in bindings else None
-        destination = _coalesced_operand(bindings["dst"].value, loop) if "dst" in bindings else None
-        if source is None or destination is None:
-            return node
-        bindings["src"].value, bindings["dst"].value = source, destination
-        return ast.copy_location(node.body[0], node)
+        return _coalesced_call(node) or node
 
 
 def _coalesce_dma_copies(source: str) -> str:
@@ -168,10 +188,10 @@ def _coalesce_dma_copies(source: str) -> str:
 
 def _view_key(view: Any) -> tuple[object, ...]:
     """Return the simulator's identity for one PSUM view."""
-    storage = view.tensor.__array_interface__["data"][0]
-    if view._is_identity():
-        return (view.tensor_id, storage)
-    return (view.tensor_id, storage, view.offset, tuple(tuple(pattern) for pattern in view.pattern))
+    identity = (view.tensor_id, view.tensor.__array_interface__["data"][0])
+    return (
+        identity if view._is_identity() else identity + (view.offset, tuple(tuple(pattern) for pattern in view.pattern))
+    )
 
 
 def _outer_fma(left: np.ndarray, right: np.ndarray, addend: np.ndarray) -> np.ndarray:
@@ -219,18 +239,12 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
     from nki._backends.simulator.tensor_view import SimulatorTensorView
     from nki.language import _ops as language_ops
 
-    original_matmul, original_copy, original_tensor_tensor, original_get, original_set, original_reduce_op = (
-        simulator.nc_matmul,
-        simulator.tensor_copy,
-        simulator.tensor_tensor_arith,
-        SimulatorTensorView.get_data,
-        SimulatorTensorView.set_data,
-        language_ops.get_numpy_reduce_op,
-    )
-    pending: _ProvenanceStore = {}
-    symbolic: _ProvenanceStore = {}
+    original_matmul, original_copy = simulator.nc_matmul, simulator.tensor_copy
+    original_tensor_tensor, original_reduce_op = simulator.tensor_tensor_arith, language_ops.get_numpy_reduce_op
+    original_get, original_set = SimulatorTensorView.get_data, SimulatorTensorView.set_data
+    pending, symbolic = cast(tuple[_ProvenanceStore, _ProvenanceStore], ({}, {}))
     materializing: set[tuple[object, ...]] = set()
-    position_cache: dict[tuple[object, ...], tuple[np.ndarray, np.ndarray]] = {}
+    inverse_cache: dict[tuple[object, ...], tuple[np.ndarray, np.ndarray, np.ndarray] | None] = {}
 
     def allocation(items: _ProvenanceStore, view: Any) -> _Provenance:
         """Return provenance views belonging to one allocation."""
@@ -250,11 +264,23 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
     def remap_positions(view: Any, absolute: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Map storage indices to positions in one target view."""
         key = _view_key(view)
-        if key not in position_cache:
-            indices = view_indices(view)
-            order = np.argsort(indices, kind="stable")
-            position_cache[key] = indices[order], order
-        indices, order = position_cache[key]
+        if key not in inverse_cache:
+            pattern = np.asarray(view._get_pattern(), dtype=np.int64)
+            order = np.argsort(pattern[:, 0])
+            steps, counts = pattern[order].T
+            strides = np.asarray([np.prod(pattern[dim + 1 :, 1]) for dim in order], dtype=np.int64)
+            valid = view.scalar_offset is None and view.vector_offset is None and np.all(steps > 0)
+            valid &= np.all(steps[1:] % (steps[:-1] * counts[:-1]) == 0)
+            inverse_cache[key] = (steps, counts, strides) if valid else None
+        if (inverse := inverse_cache[key]) is not None:
+            steps, counts, strides = inverse
+            relative = absolute - int(view.offset)
+            coordinates = relative[:, None] // steps % counts
+            selected = (relative >= 0) & (coordinates @ steps == relative)
+            positions = coordinates @ strides
+            return selected, np.where(selected, positions, 0)
+        order = np.argsort(indices := view_indices(view), kind="stable")
+        indices = indices[order]
         locations = np.searchsorted(indices, absolute, side="right") - 1
         safe = np.maximum(locations, 0)
         selected = (locations >= 0) & (indices[safe] == absolute)
@@ -267,12 +293,12 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
 
     def grouped_result(stationary: list[np.ndarray], moving: list[np.ndarray]) -> np.ndarray:
         """Evaluate one logical contraction using the reference grouping."""
-        result, count = np.zeros((stationary[0].shape[1], moving[0].shape[1]), dtype=np.float32), len(stationary)
-        widths = stationary[0].shape[1], moving[0].shape[1]
+        count, widths = len(stationary), (stationary[0].shape[1], moving[0].shape[1])
         if count == 32 and min(widths) == 1 and max(widths) % 16 == 0:
             return _mkl_gemv_result(stationary, moving)
         group = {4: 4, 8: 3, 64: 1 + 2 * (widths[0] >= 128), 128: 2}.get(count, 1)
-        for start in range(0, len(stationary), group):
+        result = np.zeros(widths, dtype=np.float32)
+        for start in range(0, count, group):
             left, right = (np.concatenate(parts[start : start + group], axis=0) for parts in (stationary, moving))
             result += np.matmul(left.T, right)
         return result
@@ -285,10 +311,10 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
             result = grouped_result(item["stationary"], item["moving"])
             if item["base"] is not None:
                 result = item["base"] + result
-            view = item["view"]
+            target = item["view"]
             materializing.add(key)
             try:
-                original_set(view, result.reshape(view.view_shape).astype(to_numpy_dtype(view.dtype)))
+                original_set(target, result.reshape(target.view_shape).astype(to_numpy_dtype(target.dtype)))
             finally:
                 materializing.remove(key)
             item["dirty"] = False
@@ -331,10 +357,10 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
         panels: list[dict[str, Any]] = []
         for key, item in matches:
             item_indices = view_indices(item["view"])
+            item_selected, item_remapped = remap_positions(view, item_indices)
             remaining = []
             for panel in item["panels"]:
-                absolute = item_indices[panel["positions"]]
-                selected, remapped = remap_positions(view, absolute)
+                selected, remapped = (values[panel["positions"]] for values in (item_selected, item_remapped))
                 if not np.any(selected):
                     remaining.append(panel)
                     continue
@@ -369,9 +395,9 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
             ]
             if candidates:
                 flush(view)
-                overwritten = set(view_indices(view))
                 for pending_key, item in candidates:
-                    if not overwritten.isdisjoint(view_indices(item["view"])):
+                    selected, _positions = remap_positions(view, view_indices(item["view"]))
+                    if np.any(selected):
                         del allocation(pending, view)[pending_key]
             allocation(symbolic, view).pop(key, None)
         original_set(view, value)
@@ -449,7 +475,7 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
         if str(operation) != "add":
             return fallback
 
-        def reduce(values: np.ndarray, axis: tuple[int, ...], keepdims: bool) -> np.ndarray:
+        def reduce(values: np.ndarray, axis: tuple[int, ...], keepdims: bool = False) -> np.ndarray:
             width = values.size // values.shape[0]
             if axis != tuple(range(1, values.ndim)) or width % 32:
                 return cast(np.ndarray, fallback(values, axis=axis, keepdims=keepdims))
@@ -466,11 +492,8 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
             yield
         finally:
             language_ops.get_numpy_reduce_op = original_reduce_op
-            simulator.nc_matmul, simulator.tensor_copy, simulator.tensor_tensor_arith = (
-                original_matmul,
-                original_copy,
-                original_tensor_tensor,
-            )
+            simulator.nc_matmul, simulator.tensor_copy = original_matmul, original_copy
+            simulator.tensor_tensor_arith = original_tensor_tensor
             SimulatorTensorView.get_data, SimulatorTensorView.set_data = original_get, original_set
 
 
@@ -480,18 +503,11 @@ def _simulate_kernel_fp32(kernel: object, call: tuple[tuple[object, ...], dict[s
         return nki.simulate(kernel)(*call[0], **call[1])
 
 
-def _simulate_source_fp32(source: str, func_name: str, inputs: dict[str, np.ndarray], grouped: bool) -> ArrayResult:
+def _simulate_source_fp32(source: str, func_name: str, inputs: dict[str, np.ndarray]) -> ArrayResult:
     """Execute one standalone rendered kernel through the fp32 simulator."""
     namespace: dict = {}
     exec(compile(_fp32_source(source), f"<batch-case-{func_name}>", "exec"), namespace)  # noqa: S102
-    kernel = namespace.get(func_name)
-    if kernel is None:
-        raise AttributeError(f"rendered kernel has no function {func_name!r}")
-    result = (
-        _simulate_kernel_fp32(kernel, ((), cast(dict[str, object], inputs)))
-        if grouped
-        else nki.simulate(kernel)(**inputs)
-    )
+    result = _simulate_kernel_fp32(namespace[func_name], ((), cast(dict[str, object], inputs)))
     return tuple(np.asarray(value) for value in result) if isinstance(result, tuple) else np.asarray(result)
 
 
@@ -508,10 +524,7 @@ def _simulate_case(position: int) -> _FailurePayload | None:
     """Simulate one globally initialized case and return its failure."""
     case_index, label, source, func_name, inputs, expected = _WORKER_CASES[position]
     try:
-        try:
-            _assert_outputs(label, _simulate_source_fp32(source, func_name, inputs, False), expected)
-        except AssertionError:
-            _assert_outputs(label, _simulate_source_fp32(source, func_name, inputs, True), expected)
+        _assert_outputs(label, _simulate_source_fp32(source, func_name, inputs), expected)
     except Exception as error:
         return {
             "case_index": case_index,
@@ -525,13 +538,7 @@ def _simulate_case(position: int) -> _FailurePayload | None:
 def _read_worker_request(request_path: Path) -> tuple[list[_SerializedCase], float, float, int]:
     """Load one trusted controller-generated worker request."""
     with request_path.open("rb") as request_file:
-        payload = cast(tuple[list[_SerializedCase], float, float, int], pickle.load(request_file))
-    if not isinstance(payload, tuple) or len(payload) != 4:
-        raise ValueError("malformed batch simulation request")
-    cases, atol, rtol, worker_count = payload
-    if not isinstance(worker_count, int) or isinstance(worker_count, bool) or worker_count <= 0:
-        raise ValueError("batch simulation worker count must be positive")
-    return cases, atol, rtol, worker_count
+        return cast(tuple[list[_SerializedCase], float, float, int], pickle.load(request_file))
 
 
 def _worker_result(
@@ -541,10 +548,8 @@ def _worker_result(
     global _WORKER_ATOL, _WORKER_CASES, _WORKER_RTOL
     input_bytes = max((sum(value.nbytes for value in case[4].values()) for case in cases), default=0)
     for inputs in {id(case[4]): case[4] for case in cases}.values():
-        for name, value in inputs.items():
-            if value.dtype.kind == "f":
-                inputs[name] = value.astype(np.float32)
-    cases.sort(key=lambda case: len(case[2]), reverse=True)
+        inputs.update({name: value.astype(np.float32) for name, value in inputs.items() if value.dtype.kind == "f"})
+    cases.sort(key=lambda case: len(case[2]) + sum(value.nbytes for value in case[4].values()) // 1024, reverse=True)
     _WORKER_CASES, _WORKER_ATOL, _WORKER_RTOL = cases, atol, rtol
     failures: list[_FailurePayload | None] = []
     if cases:
@@ -570,20 +575,12 @@ def _run_worker(request_path: Path, result_path: Path) -> None:
 def _parse_args() -> argparse.Namespace:
     """Parse the private remote-worker command line."""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--worker", action="store_true", required=True)
     parser.add_argument("request", type=Path)
     parser.add_argument("result", type=Path)
     return parser.parse_args()
 
 
-def _main() -> int:
-    """Run the private remote-worker entry point."""
-    args = _parse_args()
-    if not args.worker:
-        raise ValueError("simulate_nki_worker.py is only executable in worker mode")
-    _run_worker(args.request, args.result)
-    return 0
-
-
 if __name__ == "__main__":
-    raise SystemExit(_main())
+    args = _parse_args()
+    _run_worker(args.request, args.result)

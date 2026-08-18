@@ -9,6 +9,7 @@ from nkigym.ir.arith.expr import Expr, Var, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, KernelTree, role_of
 from nkigym.ops.base import AxisRole
+from nkigym.search.program_sharding import configured_program_shards
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -18,7 +19,7 @@ from nkigym.transforms.base import (
     software_pipeline_overlap_nodes,
 )
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
-from nkigym.transforms.helper.normalize import _substitute_block_regions, normalize_block
+from nkigym.transforms.helper.normalize import _substitute_block_regions
 
 
 @dataclass(frozen=True)
@@ -63,21 +64,15 @@ class Reorder(Transform[ReorderOption]):
         return new_ir
 
     def _renormalize_same_axis_swap(self, ir: KernelIR, option: ReorderOption, same_axis: bool) -> None:
-        """Restore the dense-name / stride invariant when the swap interchanges two
-        loops of the SAME dim.
+        """Preserve existing regions when interchanging two loops of one axis.
 
         A pure payload swap leaves the loop names in physical order that no longer
         matches their dense ordinal (the physically-outer loop may now be named
         ``i_d0_1`` while ``i_d0_0`` sits inside it). The enclosing block keeps its
-        pre-swap tile-linearization binding, so a LATER transform that
-        renormalizes a co-located block (e.g. CodeMotion sinking a load) recomputes
-        that block's stride from physical order and disagrees with this block on
-        which tile is which -> wrong offset / OOB. Re-normalizing the swapped
-        loops' enclosing block (and its nested sub-blocks) here re-derives names +
-        bindings from physical order immediately, so every block shares one
-        convention. A cross-dim swap (each dim has a single loop) leaves
-        name-order == physical-order, so this is a no-op — the byte-exact ladder
-        (whose only Reorders are cross-dim) is unaffected.
+        pre-swap regions, so swapping the two loop variables in those regions
+        preserves the same logical tiles under the new traversal order. Full
+        normalization is intentionally excluded because localized buffers may
+        omit unrelated outer-loop coordinates.
         """
         if not same_axis:
             return
@@ -93,8 +88,6 @@ class Reorder(Transform[ReorderOption]):
         affected_blocks = (block_nid, *ir.tree.blocks(option.outer_nid))
         for nid in affected_blocks:
             _substitute_block_regions(ir.tree, nid, substitutions)
-        for nid in affected_blocks:
-            normalize_block(ir.tree, nid)
 
     def _is_legal(self, ir: KernelIR, option: ReorderOption, overlap_nodes: frozenset[int] | None = None) -> bool:
         try:
@@ -109,6 +102,9 @@ class Reorder(Transform[ReorderOption]):
                 raise TransformLegalityError(f"Reorder: nid {nid} not in tree")
         if intersects_software_pipeline(ir, (option.outer_nid, option.inner_nid), overlap_nodes):
             raise TransformLegalityError("Reorder cannot alter an active software-pipeline scope")
+        shards = configured_program_shards(ir)
+        if option.outer_nid in shards or option.inner_nid in shards:
+            raise TransformLegalityError("Reorder cannot alter a program-sharded loop")
         outer = ir.tree.data(option.outer_nid)
         inner = ir.tree.data(option.inner_nid)
         if not isinstance(outer, ForNode) or not isinstance(inner, ForNode):
@@ -122,26 +118,24 @@ class Reorder(Transform[ReorderOption]):
             raise TransformLegalityError("Reorder cannot rewrite loops containing an explicit access pattern")
         outer_loop_var = outer.loop_var
         inner_loop_var = inner.loop_var
-        for descendant in ir.tree.blocks(option.inner_nid):
-            block = ir.tree.data(descendant)
-            assert isinstance(block, BlockNode)
-            for loop_var in (outer_loop_var, inner_loop_var):
-                axis = _axis_for_loop_var(block, loop_var)
-                if axis is None:
-                    continue
-                if role_of(block, axis) == AxisRole.SEQUENTIAL:
+        affected_blocks = {_enclosing_block_nid(ir.tree, option.outer_nid), *ir.tree.blocks(option.inner_nid)}
+        for block_nid in affected_blocks:
+            block = ir.tree.block(block_nid)
+            loop_vars = (outer_loop_var, inner_loop_var)
+            axes_by_loop = tuple(_axes_for_loop_var(block, loop_var) for loop_var in loop_vars)
+            for loop_var, axes in zip(loop_vars, axes_by_loop):
+                if any(role_of(block, axis) == AxisRole.SEQUENTIAL for axis in axes):
                     raise TransformLegalityError(
-                        f"Reorder rejected: descendant block has SEQUENTIAL role on loop_var {loop_var!r}"
+                        f"Reorder rejected: affected block has SEQUENTIAL role on loop_var {loop_var!r}"
                     )
+            if all(any(role_of(block, axis) == AxisRole.ACCUMULATION for axis in axes) for axes in axes_by_loop):
+                raise TransformLegalityError("Reorder cannot change floating-point accumulation order")
         _check_internal_dependency_accesses(ir, option, outer_loop_var, inner_loop_var)
 
 
-def _axis_for_loop_var(block: BlockNode, loop_var: str) -> str | None:
-    """Return the iter_var axis bound by ``loop_var``, if any."""
-    for iv, value in zip(block.iter_vars, block.iter_values):
-        if isinstance(value, Var) and value.name == loop_var:
-            return iv.axis
-    return None
+def _axes_for_loop_var(block: BlockNode, loop_var: str) -> tuple[str, ...]:
+    """Return every block axis whose affine binding uses ``loop_var``."""
+    return tuple(iv.axis for iv, value in zip(block.iter_vars, block.iter_values) if loop_var in to_affine(value))
 
 
 def _check_internal_dependency_accesses(
@@ -167,21 +161,39 @@ def _check_internal_dependency_accesses(
         consumer_side = "read" if kind == "RAW" else "write"
         producer_regions = ir.dependency._regions_for(producer, tensor, producer_side)
         consumer_regions = ir.dependency._regions_for(consumer, tensor, consumer_side)
-        for loop_var in (outer_loop_var, inner_loop_var):
-            producer_invariant = _regions_invariant(producer_regions, loop_var)
-            consumer_invariant = _regions_invariant(consumer_regions, loop_var)
-            if producer_invariant != consumer_invariant:
-                raise TransformLegalityError(
-                    f"Reorder rejected: dependency {producer}->{consumer} on tensor {tensor!r} "
-                    f"has different dependence on loop_var {loop_var!r} at its endpoints"
-                )
+        loop_vars = frozenset((outer_loop_var, inner_loop_var))
+        invariant = not _regions_depend_on(producer_regions, loop_vars) and not _regions_depend_on(
+            consumer_regions, loop_vars
+        )
+        if not invariant and _region_signatures(producer_regions) != _region_signatures(consumer_regions):
+            raise TransformLegalityError(
+                f"Reorder rejected: dependency {producer}->{consumer} on tensor {tensor!r} "
+                "is carried by a swapped loop"
+            )
 
 
-def _regions_invariant(regions: tuple[BufferRegion, ...], loop_var: str) -> bool:
-    """Return whether every region offset is invariant in ``loop_var``."""
-    return bool(regions) and not any(
-        loop_var in to_affine(lower) for region in regions for lower, _width in region.ranges
+def _regions_depend_on(regions: tuple[BufferRegion, ...], loop_vars: frozenset[str]) -> bool:
+    """Return whether any region bound depends on a swapped loop."""
+    return any(
+        bool(loop_vars & {name for expression in (lower, width) for name in to_affine(expression) if name is not None})
+        for region in regions
+        for lower, width in region.ranges
     )
+
+
+def _region_signatures(regions: tuple[BufferRegion, ...]) -> tuple[str, ...]:
+    """Return an order-independent exact affine signature for regions."""
+    signatures = []
+    for region in regions:
+        ranges = tuple(
+            (
+                tuple(sorted(to_affine(lower).items(), key=lambda item: str(item[0]))),
+                tuple(sorted(to_affine(width).items(), key=lambda item: str(item[0]))),
+            )
+            for lower, width in region.ranges
+        )
+        signatures.append(repr((region.tensor, ranges)))
+    return tuple(sorted(signatures))
 
 
 def _axis_of_loop(tree: KernelTree, loop_nid: int) -> str | None:

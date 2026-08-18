@@ -169,9 +169,9 @@ def canonical_spec(
         for abstract, concrete in axis_map.items():
             extent = extents[concrete]
             minimum = min(op_cls.MIN_TILE_SIZE.get(abstract, 1), extent)
-            maximum = op_cls.MAX_TILE_SIZE.get(abstract)
-            tile = extent if maximum is None else min(extent, maximum)
-            if tile <= 0 or tile < minimum or extent % tile != 0:
+            upper = extent if (maximum := op_cls.MAX_TILE_SIZE.get(abstract)) is None else min(extent, maximum)
+            tile = next((candidate for candidate in range(upper, minimum - 1, -1) if extent % candidate == 0), None)
+            if tile is None:
                 valid = False
                 break
             tiles[abstract] = tile

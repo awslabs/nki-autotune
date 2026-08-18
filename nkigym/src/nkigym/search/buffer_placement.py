@@ -16,10 +16,84 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+from math import gcd, lcm
 
-from nkigym.ir.arith.expr import to_affine
+from nkigym.ir.arith.expr import Const, to_affine
+from nkigym.ir.dimension_analysis import TensorDims
 from nkigym.ir.graph_index import ordered_tree_topology
-from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree, partition_extent
+
+_STORAGE_DTYPE_BYTES = {
+    "bfloat16": 2,
+    "float16": 2,
+    "float32": 4,
+    "float8_e4m3": 1,
+    "float8_e4m3fn": 1,
+    "float8_e5m2": 1,
+    "int8": 1,
+    "int32": 4,
+    "tfloat32": 4,
+    "uint8": 1,
+    "uint32": 4,
+}
+
+
+def layout_satisfies_output_alignment(tree: KernelTree, buffer: Buffer) -> bool:
+    """Return whether packed tiles satisfy every producer output alignment."""
+    alignment = 1
+    for nid in tree.preorder():
+        node = tree.data(nid)
+        if isinstance(node, ISANode):
+            for slot, required in node.op_cls.OUTPUT_TILE_ALIGNMENT_BYTES.items():
+                region = node.operand_bindings.get(slot)
+                if region is not None and region.tensor == buffer.name:
+                    alignment = lcm(alignment, required)
+    return layout_satisfies_alignment(buffer, alignment)
+
+
+def layout_satisfies_alignment(buffer: Buffer, alignment: int) -> bool:
+    """Return whether packed physical tiles satisfy one byte alignment."""
+    if alignment == 1 or buffer.tiles_per_list() * buffer.versions == 1:
+        return True
+    dtype = buffer.physical_dtype()
+    if dtype not in _STORAGE_DTYPE_BYTES:
+        raise AssertionError(f"{buffer.name}: unsupported physical dtype {dtype!r}")
+    return buffer.physical_shape()[2] * _STORAGE_DTYPE_BYTES[dtype] % alignment == 0
+
+
+def collect_buffers(tensors: dict[str, TensorDims], param_names: list[str], tree: KernelTree) -> dict[str, Buffer]:
+    """Return one allocation per intermediate tensor with a consistent partition width."""
+    out: dict[str, Buffer] = {}
+    for name, tensor in tensors.items():
+        if name in param_names:
+            continue
+        widths = {
+            width.value
+            for block_nid in tree.blocks()
+            for region in (*tree.block(block_nid).reads, *tree.block(block_nid).writes)
+            if region.tensor == name
+            for _lower, width in region.ranges[:1]
+            if isinstance(width, Const)
+        }
+        partition_size = None
+        if tensor.location != "shared_hbm":
+            partition_size = partition_extent(tensor.shape[0])
+            for width in widths:
+                partition_size = gcd(partition_size, width)
+        buffer = Buffer(
+            name=name,
+            shape=tuple(tensor.shape),
+            dtype=tensor.dtype,
+            location=tensor.location,
+            storage_dtype=tensor.storage_dtype,
+            partition_size=partition_size,
+        )
+        if buffer.location != "shared_hbm" and not layout_satisfies_output_alignment(tree, buffer):
+            buffer = replace(buffer, list_len=buffer.logical_tile_count())
+        if buffer.location != "shared_hbm" and not layout_satisfies_output_alignment(tree, buffer):
+            raise ValueError(f"{name}: no canonical allocation satisfies producer output alignment")
+        out[name] = buffer
+    return out
 
 
 def place_buffers(tree: KernelTree, anchor_loop_nids_by_tensor: Mapping[str, frozenset[int]] | None = None) -> None:
@@ -219,4 +293,11 @@ def _lca(nids: set[int], ancestors: dict[int, tuple[int, ...]]) -> int:
     return next(level[0] for level in reversed(tuple(zip(*paths))) if len(set(level)) == 1)
 
 
-__all__ = ["buffer_placement_targets", "place_buffer", "place_buffers"]
+__all__ = [
+    "buffer_placement_targets",
+    "collect_buffers",
+    "layout_satisfies_alignment",
+    "layout_satisfies_output_alignment",
+    "place_buffer",
+    "place_buffers",
+]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import prod
 
 from nkigym.ir import KernelIR
@@ -19,7 +19,7 @@ from nkigym.transforms.base import (
     software_pipeline_overlap_nodes,
 )
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
-from nkigym.transforms.helper.normalize import _substitute_block_regions, normalize_block
+from nkigym.transforms.helper.normalize import _rename_dense, _substitute_block_regions
 from nkigym.transforms.helper.tile_region import retile_region
 from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 from nkigym.transforms.split import _current_tensorize_width
@@ -105,6 +105,8 @@ class Fuse(Transform[FuseOption]):
         if subtree_has_access_patterns(ir.tree, option.target_nids[0]):
             raise TransformLegalityError("Fuse cannot rewrite a loop or ISA operand with an explicit access pattern")
         nodes = [ir.tree.data(nid) for nid in option.target_nids]
+        shards = ir.tree.block(ir.tree.root).annotations.get("program_shards", {})
+        sharded_targets = [nid for nid in option.target_nids if isinstance(shards, dict) and nid in shards]
         if option.target_axis is None:
             if not all(isinstance(n, ForNode) for n in nodes):
                 raise TransformLegalityError(
@@ -119,6 +121,8 @@ class Fuse(Transform[FuseOption]):
             axis = _axis_of_loop(ir.tree, option.target_nids[0])
             if axis is None or axis != _axis_of_loop(ir.tree, option.target_nids[1]):
                 raise TransformLegalityError("Fuse outer-trip loops must bind the same concrete block axis")
+            if len(sharded_targets) > 1:
+                raise TransformLegalityError("Fuse cannot merge multiple program-sharded loops")
             _check_no_partial_loop_dependence(ir.tree, option.target_nids)
         else:
             """Tensorize flavour: prefix is ForNodes; last is the ISA leaf."""
@@ -132,6 +136,8 @@ class Fuse(Transform[FuseOption]):
                     raise TransformLegalityError(
                         f"Fuse tensorize flavour: prefix must be all ForNodes; got {type(n).__name__}"
                     )
+            if sharded_targets:
+                raise TransformLegalityError("Fuse cannot absorb a program-sharded loop into an ISA tile")
             for parent_nid, child_nid in zip(option.target_nids, option.target_nids[1:]):
                 kids = ir.tree.children(parent_nid)
                 if kids != [child_nid]:
@@ -185,6 +191,11 @@ class Fuse(Transform[FuseOption]):
             for index, (lower, width) in enumerate(region.ranges):
                 if (loop_var in to_affine(lower) or loop_var in to_affine(width)) and index != target_index:
                     invalid_uses.append(f"operand {slot}[{index}]")
+                if index == target_index:
+                    coefficient = to_affine(lower).get(loop_var, 0)
+                    width_terms = to_affine(width)
+                    if coefficient and (set(width_terms) != {None} or coefficient != width_terms[None]):
+                        invalid_uses.append(f"non-contiguous operand {slot}[{index}]")
         if invalid_uses:
             uses = ", ".join(invalid_uses)
             raise TransformLegalityError(f"Fuse loop {loop_var!r} has uses outside target_axis={target_axis!r}: {uses}")
@@ -229,10 +240,8 @@ class Fuse(Transform[FuseOption]):
         """Outer-trip Fuse: merge two parent-child same-dim ForNodes into one loop.
 
         Only the loop topology changes: the chain is replaced by a single
-        ForNode whose extent is the product of the chain extents (the access
-        tile width is unchanged). :func:`normalize_block` then assigns the
-        dense name and rebuilds the iter_values + region offsets from the new
-        loop structure.
+        ForNode whose extent is the product of the chain extents. Existing
+        affine coordinates are preserved; only generated loop names change.
         """
         nids = option.target_nids
         first = ir.tree.data(nids[0])
@@ -248,6 +257,7 @@ class Fuse(Transform[FuseOption]):
         for child_nid in deepest_kids:
             ir.tree.graph.add_edge(new_nid, child_nid)
         _replace_in_parent_children(ir.tree, parent_nid, [nids[0]], [new_nid])
+        _retarget_program_shard(ir.tree, nids, new_nid)
         for nid in nids:
             ir.tree.graph.remove_node(nid)
 
@@ -255,6 +265,7 @@ class Fuse(Transform[FuseOption]):
         substitutions: dict[str, Expr] = {loop_var: Const(value=0) for loop_var in old_loop_vars}
         substitutions[old_loop_vars[-1]] = Var(name=ir.tree.loop(new_nid).loop_var)
         _normalize_block_hierarchy(ir.tree, block_nid, substitutions, nested_blocks)
+        _refresh_intrinsic_offsets(ir.tree, new_nid)
 
     def _do_tensorize(self, ir: KernelIR, option: FuseOption) -> None:
         """Tensorize Fuse: absorb one same-axis ForNode into an ISA tile.
@@ -275,6 +286,7 @@ class Fuse(Transform[FuseOption]):
         block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
 
         absorbed_extent = prod(ir.tree.loop(nid).extent for nid in for_chain)
+        substitutions: dict[str, Expr] = {ir.tree.loop(nid).loop_var: Const(value=0) for nid in for_chain}
         ir.tree.graph.remove_edge(for_chain[-1], leaf_nid)
         _replace_in_parent_children(ir.tree, chain_root_parent, [chain_root], [leaf_nid])
         for nid in for_chain:
@@ -285,8 +297,8 @@ class Fuse(Transform[FuseOption]):
         abstract_axis = inverse_axis_map.get(option.target_axis)
 
         def _widen(lo: Expr, width: int) -> tuple[Expr, int]:
-            """Keep the offset (normalize recomputes it); grow the tile width."""
-            return lo, width * absorbed_extent
+            """Remove absorbed-loop offsets and grow the selected tile width."""
+            return substitute(lo, substitutions), width * absorbed_extent
 
         new_bindings = {
             slot: retile_region(region, leaf.op_cls.OPERAND_AXES[slot], abstract_axis, _widen)
@@ -301,7 +313,7 @@ class Fuse(Transform[FuseOption]):
         tensor_to_axes = {leaf.operand_bindings[s].tensor: leaf.op_cls.OPERAND_AXES[s] for s in leaf.operand_bindings}
         new_block = BlockNode(
             iter_vars=block.iter_vars,
-            iter_values=block.iter_values,
+            iter_values=tuple(substitute(value, substitutions) for value in block.iter_values),
             reads=tuple(retile_region(r, tensor_to_axes.get(r.tensor, ()), abstract_axis, _widen) for r in block.reads),
             writes=tuple(
                 retile_region(w, tensor_to_axes.get(w.tensor, ()), abstract_axis, _widen) for w in block.writes
@@ -312,7 +324,13 @@ class Fuse(Transform[FuseOption]):
         )
         ir.tree.graph.nodes[block_nid]["data"] = new_block
 
-        normalize_block(ir.tree, block_nid)
+        offset_spec = getattr(leaf.op_cls, "SPLIT_OFFSET_KWARGS", {}).get(abstract_axis)
+        if offset_spec is not None:
+            offset_key, output_slot = offset_spec
+            current = ir.tree.isa(leaf_nid)
+            output_axis = current.op_cls.OPERAND_AXES[output_slot].index(abstract_axis)
+            kwargs = {**current.kwargs, offset_key: current.operand_bindings[output_slot].ranges[output_axis][0]}
+            ir.tree.graph.nodes[leaf_nid]["data"] = replace(current, kwargs=kwargs)
 
 
 def _maximum_tensorize_width(leaf: ISANode, abstract_axis: str | None, buffers: dict[str, Buffer]) -> int | None:
@@ -323,6 +341,35 @@ def _maximum_tensorize_width(leaf: ISANode, abstract_axis: str | None, buffers: 
         if buffers[source].location == "shared_hbm":
             maximum = NKIDMATranspose.HBM_SOURCE_MAX_TILE_SIZE[abstract_axis]
     return maximum
+
+
+def _refresh_intrinsic_offsets(tree: KernelTree, root_nid: int) -> None:
+    """Recompute implicit operation origins after loop-variable replacement."""
+    for leaf_nid in tree.preorder(root_nid):
+        node = tree.data(leaf_nid)
+        if not isinstance(node, ISANode):
+            continue
+        kwargs = dict(node.kwargs)
+        for abstract_axis, (key, output_slot) in getattr(node.op_cls, "SPLIT_OFFSET_KWARGS", {}).items():
+            output_axis = node.op_cls.OPERAND_AXES[output_slot].index(abstract_axis)
+            kwargs[key] = node.operand_bindings[output_slot].ranges[output_axis][0]
+        tree.graph.nodes[leaf_nid]["data"] = replace(node, kwargs=kwargs)
+
+
+def _retarget_program_shard(tree: KernelTree, old_nids: tuple[int, ...], new_nid: int) -> None:
+    """Move one loop shard annotation to its fused replacement."""
+    root = tree.block(tree.root)
+    shards = root.annotations.get("program_shards")
+    if not isinstance(shards, dict):
+        return
+    programs = [shards[nid] for nid in old_nids if nid in shards]
+    if not programs:
+        return
+    annotations = dict(root.annotations)
+    updated = {nid: count for nid, count in shards.items() if nid not in old_nids}
+    updated[new_nid] = programs[0]
+    annotations["program_shards"] = updated
+    tree.graph.nodes[tree.root]["data"] = replace(root, annotations=annotations)
 
 
 def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
@@ -350,7 +397,7 @@ def _axis_of_loop(tree: KernelTree, loop_nid: int) -> str | None:
 def _normalize_block_hierarchy(
     tree: KernelTree, block_nid: int, substitutions: dict[str, Expr], nested_scope: set[int]
 ) -> None:
-    """Normalize one block and propagate its loop rewrites into nested blocks."""
+    """Rename one block and propagate its loop rewrites into nested blocks."""
     nested_paths = {
         nested_block: _loop_path_names(tree, block_nid, nested_block)
         for nested_block in _immediate_nested_blocks(tree, block_nid)
@@ -358,7 +405,7 @@ def _normalize_block_hierarchy(
     }
     if substitutions:
         _substitute_block_regions(tree, block_nid, substitutions)
-    normalize_block(tree, block_nid)
+    _rename_dense(tree, block_nid)
 
     for nested_block, path_names in nested_paths.items():
         local_substitutions: dict[str, Expr] = {}

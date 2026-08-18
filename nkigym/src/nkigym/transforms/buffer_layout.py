@@ -12,11 +12,27 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
+from nkigym.ir.arith.expr import Add, Const, Mul, to_affine
 from nkigym.ir.dependency_rebind import rebind_unchanged_dependency
-from nkigym.ir.tree import BlockNode
+from nkigym.ir.tree import BlockNode, Buffer, ISANode
+from nkigym.search.buffer_placement import layout_satisfies_output_alignment
 from nkigym.search.serialization import inherit_analysis_result
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.access_pattern import tensor_has_access_pattern
+
+_DTYPE_BYTES = {
+    "bfloat16": 2,
+    "float16": 2,
+    "float32": 4,
+    "float8_e4m3": 1,
+    "float8_e4m3fn": 1,
+    "float8_e5m2": 1,
+    "int8": 1,
+    "int32": 4,
+    "tfloat32": 4,
+    "uint8": 1,
+    "uint32": 4,
+}
 
 
 @dataclass(frozen=True)
@@ -39,13 +55,14 @@ class BufferLayout(Transform[BufferLayoutOption]):
         """Return every logical-tile divisor relayout for each on-chip buffer."""
         options: list[BufferLayoutOption] = []
         for name, buf in ir.all_buffers().items():
-            if buf.location not in ("sbuf", "psum"):
+            if buf.location not in ("sbuf", "psum") or name not in ir.dependency.touches_by_tensor:
                 continue
             if tensor_has_access_pattern(ir.tree, name):
                 continue
             logical_tiles = buf.logical_tile_count()
             for b in range(1, logical_tiles + 1):
-                if logical_tiles % b == 0 and b != buf.list_len:
+                candidate = replace(buf, list_len=b)
+                if logical_tiles % b == 0 and b != buf.list_len and _layout_satisfies_output_alignment(ir, candidate):
                     options.append(BufferLayoutOption(tensor=name, list_len=b))
         return options
 
@@ -66,6 +83,8 @@ class BufferLayout(Transform[BufferLayoutOption]):
         buf = buffers[option.tensor]
         if buf.location == "shared_hbm":
             raise TransformLegalityError(f"BufferLayout: {option.tensor} is shared_hbm (no tile axis)")
+        if option.tensor not in ir.dependency.touches_by_tensor:
+            raise TransformLegalityError(f"BufferLayout: {option.tensor} has no ISA touches")
         if tensor_has_access_pattern(ir.tree, option.tensor):
             raise TransformLegalityError(f"BufferLayout: {option.tensor} participates in an explicit access pattern")
         logical_tiles = buf.logical_tile_count()
@@ -75,6 +94,8 @@ class BufferLayout(Transform[BufferLayoutOption]):
             )
         if option.list_len == buf.list_len:
             raise TransformLegalityError(f"BufferLayout: {option.tensor} already has list_len={option.list_len}")
+        if not _layout_satisfies_output_alignment(ir, replace(buf, list_len=option.list_len)):
+            raise TransformLegalityError(f"BufferLayout: {option.tensor} would violate producer output alignment")
 
     def _set_list_len(self, ir: KernelIR, name: str, list_len: int) -> None:
         """Replace the owning block's alloc entry for ``name`` with a list_len-updated copy."""
@@ -84,6 +105,32 @@ class BufferLayout(Transform[BufferLayoutOption]):
             new_allocs = tuple(replace(b, list_len=list_len) if b.name == name else b for b in block.alloc_buffers)
             if new_allocs != block.alloc_buffers:
                 ir.tree.graph.nodes[nid]["data"] = replace(block, alloc_buffers=new_allocs)
+
+
+def _layout_satisfies_output_alignment(ir: KernelIR, buffer: Buffer) -> bool:
+    """Accept coarse tile alignment or prove every actual list-of-one output start."""
+    if layout_satisfies_output_alignment(ir.tree, buffer):
+        return True
+    if buffer.list_len != 1:
+        return False
+    element_bytes = _DTYPE_BYTES[buffer.physical_dtype()]
+    free = Const(value=buffer.physical_shape()[2])
+    for nid in ir.tree.preorder():
+        node = ir.tree.data(nid)
+        if not isinstance(node, ISANode):
+            continue
+        for slot, alignment in node.op_cls.OUTPUT_TILE_ALIGNMENT_BYTES.items():
+            region = node.operand_bindings.get(slot)
+            if region is None or region.tensor != buffer.name:
+                continue
+            tile = region.ranges[0][0]
+            offset = region.ranges[1][0] if len(region.ranges) > 1 else Const(value=0)
+            if any(
+                coefficient * element_bytes % alignment
+                for coefficient in to_affine(Add(left=Mul(left=tile, right=free), right=offset)).values()
+            ):
+                return False
+    return True
 
 
 __all__ = ["BufferLayout", "BufferLayoutOption"]

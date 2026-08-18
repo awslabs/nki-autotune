@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
-from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ISANode
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import CopyContract
+from nkigym.ops.tensor_copy import NKITensorCopy
+from nkigym.search.program_sharding import owning_block
 from nkigym.search.state_facts import operation_facts
 from nkigym.transforms.base import (
     Transform,
@@ -16,12 +18,12 @@ from nkigym.transforms.base import (
     intersects_software_pipeline,
     software_pipeline_overlap_nodes,
 )
-from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, single_leaf
+from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite
 
 
 @dataclass(frozen=True)
 class CopyPropagationOption(TransformOption):
-    """Identify one adjacent copy and consumer input."""
+    """Identify one ordered copy and consumer input."""
 
     copy_block_nid: int
     consumer_block_nid: int
@@ -42,33 +44,33 @@ class _CopyPropagationMatch:
 class CopyPropagation(Transform[CopyPropagationOption]):
     """Substitute one value-preserving copy source into its consumer."""
 
+    SPLIT_PREPARATION_DEPTH = 1
+
+    def split_preparation_applicable(self, ir: KernelIR) -> bool:
+        """Return whether the kernel contains an on-chip tensor copy."""
+        return operation_facts(ir).has_ops(NKITensorCopy)
+
     def analyze(self, ir: KernelIR) -> list[CopyPropagationOption]:
-        """Return every adjacent copy-consumer pair accepted by storage contracts."""
+        """Return ordered copy-consumer pairs accepted by storage contracts."""
         if not operation_facts(ir).has_copy:
             return []
         options: list[CopyPropagationOption] = []
         buffers = ir.all_buffers()
         overlap_nodes = software_pipeline_overlap_nodes(ir)
         positions = {nid: index for index, nid in enumerate(ir.tree.preorder())}
-        for parent_nid in ir.tree.preorder():
-            children = ir.tree.children(parent_nid)
-            for copy_nid, consumer_nid in zip(children, children[1:]):
-                if not isinstance(ir.tree.data(copy_nid), BlockNode) or not isinstance(
-                    ir.tree.data(consumer_nid), BlockNode
-                ):
-                    continue
-                consumer_leaf_nid = single_leaf(ir.tree, consumer_nid)
-                if consumer_leaf_nid is None:
+        for copy_leaf_nid in ir.dependency.graph.nodes:
+            copy_leaf = ir.tree.isa(copy_leaf_nid)
+            if not isinstance(copy_leaf.op_cls.algebraic_contract(copy_leaf.kwargs), CopyContract):
+                continue
+            copy_nid = owning_block(ir, copy_leaf_nid)
+            for consumer_leaf_nid in ir.dependency.direct_consumers(copy_leaf_nid):
+                consumer_nid = owning_block(ir, consumer_leaf_nid)
+                if consumer_nid == copy_nid:
                     continue
                 consumer = ir.tree.isa(consumer_leaf_nid)
                 for operand in consumer.op_cls.INPUT_OPERANDS:
-                    option = CopyPropagationOption(
-                        copy_block_nid=copy_nid, consumer_block_nid=consumer_nid, consumer_operand=operand
-                    )
-                    if (
-                        self._resolve(ir, option, buffers, overlap_nodes, adjacent=True, positions=positions)
-                        is not None
-                    ):
+                    option = CopyPropagationOption(copy_nid, consumer_nid, operand)
+                    if self._resolve(ir, option, buffers, overlap_nodes, positions=positions):
                         options.append(option)
         return options
 
@@ -90,7 +92,7 @@ class CopyPropagation(Transform[CopyPropagationOption]):
         option: CopyPropagationOption,
         buffers: dict[str, Buffer],
         overlap_nodes: frozenset[int] | None = None,
-        adjacent: bool | None = None,
+        ordered: bool | None = None,
         positions: dict[int, int] | None = None,
     ) -> _CopyPropagationMatch | None:
         """Resolve an option when copy semantics, storage, and use-def all agree."""
@@ -103,20 +105,25 @@ class CopyPropagation(Transform[CopyPropagationOption]):
             return result
         if intersects_software_pipeline(ir, (copy_nid, consumer_nid), overlap_nodes):
             return result
-        if adjacent is None:
+        copy_leaf_nid = _owned_leaf(ir, copy_nid)
+        consumer_leaf_nid = _owned_leaf(ir, consumer_nid)
+        if copy_leaf_nid is None or consumer_leaf_nid is None:
+            return result
+        if ordered is None:
             parent = ir.tree.parent(copy_nid)
             siblings = ir.tree.children(parent) if parent is not None else []
-            adjacent = (
+            sibling_ordered = (
                 parent is not None
                 and ir.tree.parent(consumer_nid) == parent
                 and copy_nid in siblings
-                and siblings.index(consumer_nid) == siblings.index(copy_nid) + 1
+                and consumer_nid in siblings
+                and siblings.index(copy_nid) < siblings.index(consumer_nid)
             )
-        if not adjacent:
-            return result
-        copy_leaf_nid = single_leaf(ir.tree, copy_nid)
-        consumer_leaf_nid = single_leaf(ir.tree, consumer_nid)
-        if copy_leaf_nid is None or consumer_leaf_nid is None:
+            ordered = sibling_ordered or (
+                copy_leaf_nid in ir.dependency.direct_producers(consumer_leaf_nid)
+                and _loop_ancestors(ir, copy_leaf_nid) == _loop_ancestors(ir, consumer_leaf_nid)
+            )
+        if not ordered:
             return result
         copy_leaf = ir.tree.isa(copy_leaf_nid)
         consumer_leaf = ir.tree.isa(consumer_leaf_nid)
@@ -134,6 +141,7 @@ class CopyPropagation(Transform[CopyPropagationOption]):
             return result
         copied_buffer = buffers[copied.tensor]
         source_buffer = buffers[source.tensor]
+        accepted_locations = consumer_leaf.op_cls.INPUT_LOCATIONS.get(option.consumer_operand)
         locations = {
             operand: buffers[region.tensor].location
             for operand, region in consumer_leaf.operand_bindings.items()
@@ -147,11 +155,18 @@ class CopyPropagation(Transform[CopyPropagationOption]):
         }
         dtypes[option.consumer_operand] = source_buffer.physical_dtype()
         required_dtype = consumer_leaf.op_cls.REQUIRED_INPUT_STORAGE_DTYPES.get(option.consumer_operand)
+        accepted_dtypes = consumer_leaf.op_cls.INPUT_STORAGE_DTYPES.get(option.consumer_operand, frozenset())
+        storage_compatible = (
+            source_buffer.physical_dtype() == copied_buffer.physical_dtype()
+            or source_buffer.physical_dtype() in accepted_dtypes
+        )
         if (
             copied_buffer.location == "shared_hbm"
             or source_buffer.location not in {"sbuf", "psum"}
-            or (source_buffer.dtype, source_buffer.physical_dtype())
-            != (copied_buffer.dtype, copied_buffer.physical_dtype())
+            or accepted_locations is None
+            or source_buffer.location not in accepted_locations
+            or source_buffer.dtype != copied_buffer.dtype
+            or not storage_compatible
             or not consumer_leaf.op_cls.accepts_input_locations(locations)
             or not consumer_leaf.op_cls.accepts_input_storage_dtypes(dtypes)
             or (required_dtype is not None and source_buffer.physical_dtype() != required_dtype)
@@ -243,6 +258,21 @@ class CopyPropagation(Transform[CopyPropagationOption]):
             )
         ir.tree.graph.nodes[match.option.consumer_block_nid]["data"] = replace(consumer_block, reads=tuple(reads))
         finalize_rewrite(ir)
+
+
+def _owned_leaf(ir: KernelIR, block_nid: int) -> int | None:
+    """Return the sole ISA leaf directly owned by one block."""
+    leaves = [
+        nid
+        for nid in ir.tree.preorder(block_nid)
+        if isinstance(ir.tree.data(nid), ISANode) and owning_block(ir, nid) == block_nid
+    ]
+    return leaves[0] if len(leaves) == 1 else None
+
+
+def _loop_ancestors(ir: KernelIR, leaf_nid: int) -> tuple[int, ...]:
+    """Return the materialized loop nest enclosing one ISA leaf."""
+    return tuple(nid for nid in ir.tree.ancestors(leaf_nid) if isinstance(ir.tree.data(nid), ForNode))
 
 
 __all__ = ["CopyPropagation", "CopyPropagationOption"]

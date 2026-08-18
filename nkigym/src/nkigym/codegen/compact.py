@@ -12,27 +12,26 @@ from nkigym.search.buffer_placement import _anchor_loop_nids_from_regions, _regi
 
 def compact_buffer_shapes(tree: KernelTree, tensors: frozenset[str]) -> dict[str, Buffer]:
     """Compact selected buffer declarations using shared tree access indexes."""
-    declared: dict[str, Buffer] = {}
+    declared: dict[str, tuple[Buffer, int]] = {}
     for block_nid in tree.blocks():
-        block = tree.data(block_nid)
-        assert isinstance(block, BlockNode)
+        block = tree.block(block_nid)
         for buf in block.alloc_buffers:
             if buf.name in tensors:
                 if buf.name in declared:
                     raise AssertionError(f"buffer {buf.name!r} is declared by multiple blocks")
-                declared[buf.name] = buf
+                declared[buf.name] = (buf, block_nid)
     if missing := tensors - declared.keys():
         raise KeyError(f"buffers declared by no block: {sorted(missing)}")
     regions = _regions_by_tensor(tree, tensors)
     ancestors = ordered_tree_topology(tree.graph, tree.root)[1]
-    leaf_extents = {
-        leaf_nid: _leaf_loop_extents(tree, leaf_nid) for pairs in regions.values() for leaf_nid, _region in pairs
-    }
+    leaves = (leaf_nid for pairs in regions.values() for leaf_nid, _region in pairs)
+    leaf_extents = {leaf_nid: _leaf_loop_extents(tree, leaf_nid) for leaf_nid in leaves}
     compacted: dict[str, Buffer] = {}
-    for tensor, buffer in declared.items():
-        anchor_nids = _anchor_loop_nids_from_regions(tree, regions.get(tensor, []), ancestors)
+    for tensor, (buffer, owner) in declared.items():
+        pairs = regions.get(tensor, [])
+        anchor_nids = _anchor_loop_nids_from_regions(tree, pairs, ancestors) & frozenset(ancestors[owner])
         anchors = {tree.loop(nid).loop_var for nid in anchor_nids}
-        compacted[tensor] = _compact_one(buffer, anchors, regions.get(tensor, []), leaf_extents)
+        compacted[tensor] = _compact_one(buffer, anchors, pairs, leaf_extents)
     for block_nid in tree.blocks():
         block = tree.block(block_nid)
         updated = tuple(compacted.get(buffer.name, buffer) for buffer in block.alloc_buffers)
@@ -51,13 +50,10 @@ def _compact_one(
     ``lo + width`` over the interior-loop box, with anchor loop vars zeroed
     and interior loop vars ranging over their leaf-local extents.
     """
-    if buf.location == "shared_hbm":
+    if buf.location == "shared_hbm" or not accesses:
         return buf
-    if not accesses:
-        return buf
-    n_axes = len(buf.shape)
     new_shape = list(buf.shape)
-    for axis in range(n_axes):
+    for axis in range(len(buf.shape)):
         widest = 0
         for leaf_nid, region in accesses:
             if axis >= len(region.ranges):
@@ -83,11 +79,8 @@ def _axis_span(
     coeffs = to_affine(zeroed)
     hi = coeffs.get(None, 0)
     for var, coeff in coeffs.items():
-        if var is None:
-            continue
-        trips = extents.get(var, 1)
-        if coeff > 0:
-            hi += coeff * (trips - 1)
+        if var is not None and coeff > 0:
+            hi += coeff * (extents.get(var, 1) - 1)
     is_partition = axis == 0 and location in ("sbuf", "psum") and width.value == partition
     if is_partition:
         return (hi + 1) * partition
@@ -101,12 +94,11 @@ def _leaf_loop_extents(tree: KernelTree, leaf_nid: int) -> dict[str, int]:
     subtrees with different extents (e.g. canonical trip-1 vs trip-16
     ``i_d1_0``) resolves to the extent in THIS leaf's scope.
     """
-    out: dict[str, int] = {}
-    for anc in tree.ancestors(leaf_nid):
-        data = tree.data(anc)
-        if isinstance(data, ForNode):
-            out[data.loop_var] = data.extent
-    return out
+    return {
+        data.loop_var: data.extent
+        for ancestor in tree.ancestors(leaf_nid)
+        if isinstance((data := tree.data(ancestor)), ForNode)
+    }
 
 
 __all__ = ["compact_buffer_shapes"]

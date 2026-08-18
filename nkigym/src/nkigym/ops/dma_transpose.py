@@ -4,8 +4,7 @@ Same math as :class:`NKITranspose` (which uses Tensor Engine
 ``nisa.nc_transpose``), but runs on the DMA engine so it doesn't
 contend with matmul for TE cycles. Useful when the matmul is TE-bound
 and an explicit DMA transpose is cheaper than a round-trip through
-PSUM. Also the target of the ``TransposeThroughLoad`` rewrite, where the
-``src`` input is an HBM parameter instead of an SBUF buffer.
+PSUM. The ``src`` input may be an HBM parameter or an SBUF buffer.
 """
 
 from collections.abc import Mapping
@@ -13,7 +12,32 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import BatchedPermutationContract, NKIOp, PermutationContract, _operand_role
+
+
+def emit_oriented_value(
+    source: TorchValue, target: TorchValue, intermediate: str, body: list[str], imports: set[str]
+) -> None:
+    """Emit one supported physical transpose path."""
+    if source.storage_dtype is None or not source.storage_dtype.startswith("float8"):
+        body.append(f"{target.name} = NKIDMATranspose()(src={source.name})")
+        imports.add("NKIDMATranspose")
+        return
+    loaded = f"{target.name}_loaded"
+    if source.is_hbm:
+        body.append(f"{loaded} = NKILoad()(src={source.name})")
+        imports.add("NKILoad")
+    source_name = loaded if source.is_hbm else source.name
+    casted = f"{target.name}_float32"
+    body.extend(
+        (
+            f"{casted} = NKIFloat32Cast()(data={source_name})",
+            f"{intermediate} = NKITranspose()(data={casted})",
+            f"{target.name} = NKIFloat8Cast()(data={intermediate})",
+        )
+    )
+    imports.update(("NKIFloat32Cast", "NKITranspose", "NKIFloat8Cast"))
 
 
 class NKIDMATranspose(NKIOp):
@@ -22,6 +46,10 @@ class NKIDMATranspose(NKIOp):
     NAME: ClassVar[str] = "dma_transpose"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"src": ("P", "F"), "dst": ("F", "P")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"src": frozenset({"shared_hbm", "sbuf"})}
+    INPUT_STORAGE_DTYPES: ClassVar[dict[str, frozenset[str]]] = {
+        "src": frozenset({"bfloat16", "float16", "float32", "int32", "tfloat32", "uint32"})
+    }
     """Both abstract axes become a partition axis on one side of the
     transpose, so one instruction covers at most 128 elements of each.
     Larger free dimensions are represented by outer loops."""
@@ -36,6 +64,7 @@ class NKIDMATranspose(NKIOp):
     remains capped at 128.
     """
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+    OUTPUT_TILE_ALIGNMENT_BYTES: ClassVar[dict[str, int]] = {"dst": 32}
 
     @classmethod
     def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> PermutationContract:
@@ -49,7 +78,7 @@ class NKIDMATranspose(NKIOp):
         )
 
     def _check_roles(self, **kwargs: Any) -> None:
-        """``src`` may be HBM param (``TransposeThroughLoad`` rewrite) or SBUF."""
+        """Require an HBM parameter or SBUF source."""
         role = _operand_role(kwargs["src"])
         if role is not None and role not in {"param", "sbuf"}:
             raise TypeError(f"NKIDMATranspose(src=<role={role}>) expects param or sbuf")

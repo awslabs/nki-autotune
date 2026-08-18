@@ -1,7 +1,5 @@
 """Generated-kernel ABI adapters used by synthesis validation and profiling."""
 
-from __future__ import annotations
-
 import operator
 from collections.abc import Callable
 from typing import Any, cast
@@ -14,6 +12,7 @@ from nkigym.codegen.torch_abi import (
     block_diagonal,
     convolution_columns,
     cross_entropy_backward,
+    grouped_context_input,
     head_grouped,
     moe_gate_up_input,
     nonzero_compact,
@@ -30,6 +29,7 @@ from nkigym.codegen.torch_arrays import as_numpy as _as_numpy
 from nkigym.codegen.torch_arrays import flatten_output_array as _flatten_output_array
 from nkigym.codegen.torch_arrays import logical_output_shape
 from nkigym.codegen.torch_layout import Layouts
+from nkigym.ops.grouped_store import adapt_topk_input, rotational_topk_generated_inputs
 from nkigym.profile.types import InputSpecs
 
 
@@ -125,8 +125,7 @@ def adapt_inputs(
     """Convert Torch or NumPy inputs to one generated kernel ABI."""
     adapted: dict[str, np.ndarray] = {}
     for name, value in inputs.items():
-        array = _as_numpy(value)
-        dtype = input_specs[name][1]
+        array, dtype = _as_numpy(value), input_specs[name][1]
         array = array.astype(np.float32) if "float" in dtype or dtype == "bfloat16" else array
         if name in layouts:
             transform, shape = layouts[name]
@@ -142,14 +141,16 @@ def adapt_inputs(
                 array[:, : cast(int, transform[1])] = np.tile(source.reshape(1, -1), (shape[0], 1))
             elif transform[0] in {"moe_gate_up", "moe_down"}:
                 array = moe_gate_up_input(array, shape)
-            elif transform[0] == "wide_topk":
-                array = array.reshape(shape)
+            elif transform[0] in {"wide_topk", "rotational_topk"}:
+                array = adapt_topk_input(array, transform, shape)
             elif str(transform[0]).startswith("block_diagonal"):
                 array = block_diagonal(array, shape, False)
             elif transform[0] == "routed_tokens":
                 array = routed_input(
                     f"routed_{transform[1]}", array, _as_numpy(inputs["expert_index"]), cast(int, transform[2]), shape
                 )
+            elif transform[0] == "grouped_context":
+                array = grouped_context_input(array, shape, transform)
             elif transform[0] == "token_attention":
                 kind, dimensions = cast(str, transform[1]), cast(tuple[int, int, int, int], transform[2:])
                 active_name = {"k": "k_active", "v": "v_active"}.get(kind)
@@ -202,7 +203,7 @@ def adapt_inputs(
         elif kernel_specs[name][0] != input_specs[name][0]:
             array = array.reshape(-1) if len(kernel_specs[name][0]) == 1 else array.reshape(-1, array.shape[-1])
         adapted[name] = pad_array(array, kernel_specs[name][0], edge_axes.get(name, frozenset()))
-    return adapted
+    return adapted | rotational_topk_generated_inputs(kernel_specs, adapted)
 
 
 def adapt_output(
@@ -230,10 +231,10 @@ def adapt_output(
                     array, logical_output_shape(output_shapes, output_groups, len(leaves)), output_layout.endswith("_t")
                 )
             elif output_layout == "token_attention" and array.ndim == 4:
-                array = block_diagonal(
-                    array[:, 0].transpose(0, 2, 1),
-                    logical_output_shape(output_shapes, output_groups, len(leaves)),
-                    False,
+                array = (
+                    array[:, 0]
+                    .transpose(1, 0, 2)
+                    .reshape(logical_output_shape(output_shapes, output_groups, len(leaves)))
                 )
             elif output_layout == "head_grouped" and array.ndim == 4:
                 array = head_grouped(array, logical_output_shape(output_shapes, output_groups, len(leaves)), False)
@@ -257,7 +258,8 @@ def adapt_output(
         result = np.concatenate((indices, counts[:, None]), axis=1).reshape(1, -1)
     elif output_layout == "routed_tokens":
         tensor = cast(torch.Tensor, result).flip(0)
-        result = (tensor[:, :-3], tensor[:, -3:-2], tensor[:, -2:].to(torch.bfloat16).contiguous().view(torch.int32))
+        tokens = tensor[:, -2:].to(torch.bfloat16).contiguous().view(torch.int32).float()
+        result = (tensor[:, :-3], torch.cat((tensor[:, -3:-2].float(), tokens), dim=1))
     elif output_layout == "metadata_groups":
         array = _as_numpy(result)
         start, width = array.shape[1], sum(shape[-1] for shape in output_shapes[: output_groups[0]])
@@ -308,7 +310,7 @@ def kernel_adapters(
     def inputs(values: dict[str, object]) -> dict[str, np.ndarray]:
         """Adapt inputs and retain the first logical source tensor."""
         adapted = adapt_inputs(values, input_specs, kernel_specs, layouts, edge_axes)
-        state["source"] = next(iter(adapted.values()))
+        state["source"] = _as_numpy(next(iter(values.values())))
         return adapted
 
     def output(result: object) -> np.ndarray | tuple[np.ndarray, ...]:

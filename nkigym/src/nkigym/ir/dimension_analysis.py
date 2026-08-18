@@ -9,10 +9,11 @@ import inspect
 import textwrap
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from math import prod
 from threading import RLock
 from typing import Any
 
-from nkigym.ops.base import NKIOp
+from nkigym.ops.base import NKIOp, OperationSSAName, collect_operation_ssa_names
 
 _DIMENSION_TRACE_LOCK = RLock()
 
@@ -99,7 +100,7 @@ def analyze_dimensions(
         if name not in input_specs:
             raise ValueError(f"Missing input_spec for parameter: {name!r}")
 
-    state = _TraceState(ssa_names=_collect_ssa_names(unwrapped))
+    state = _TraceState(ssa_names=collect_operation_ssa_names(unwrapped))
     for name in param_names:
         shape, dtype = input_specs[name]
         sym = _Sym(tuple(shape), name)
@@ -139,11 +140,12 @@ def analyze_dimensions(
 class _Sym:
     """Symbolic tensor: shape + mutable ``dim_ids`` + source name + alloc kwargs."""
 
-    __slots__ = ("shape", "dim_ids", "source_name", "location", "dtype", "storage_dtype")
+    __slots__ = ("shape", "dim_ids", "factor_dim_ids", "source_name", "location", "dtype", "storage_dtype")
 
     def __init__(self, shape: tuple[int, ...], source_name: str) -> None:
         self.shape: tuple[int, ...] = shape
         self.dim_ids: list[str | None] = [None] * len(shape)
+        self.factor_dim_ids: list[tuple[str, ...] | None] = [None] * len(shape)
         self.source_name: str = source_name
         self.location: str | None = None
         self.dtype: str | None = None
@@ -153,7 +155,7 @@ class _Sym:
 class _TraceState:
     """Mutable state threaded through the hook during tracing."""
 
-    def __init__(self, ssa_names: Iterator[str]) -> None:
+    def __init__(self, ssa_names: Iterator[OperationSSAName]) -> None:
         self.sentinels: dict[str, _Sym] = {}
         self.dim_sizes: dict[str, int] = {}
         self.op_records: list[_OpRecord] = []
@@ -191,7 +193,14 @@ def _make_hook(state: _TraceState) -> Callable[..., Any]:
         cls = type(op)
         input_syms, record = _trace_compute_op(cls, merged, state)
         name = next(state.ssa_names)
-        return _synthesize_outputs(cls, name, input_syms, record, state)
+        returned = cls.RETURN_RMW_OPERAND
+        if returned is not None:
+            result = merged.get(returned)
+            if not isinstance(result, _Sym) or returned not in cls.rmw_operands(record.kwargs):
+                raise ValueError(f"{cls.__name__}.{returned} must bind one RMW tensor")
+        else:
+            result = _synthesize_outputs(cls, name, input_syms, record, state)
+        return result
 
     return hook
 
@@ -204,9 +213,12 @@ def _trace_compute_op(cls: type[NKIOp], kwargs: dict[str, Any], state: _TraceSta
     plus the freshly-appended :class:`_OpRecord` so the caller can write the
     synthesized output slot names back into ``record.operand_names``.
     """
-    local: dict[str, str] = {}
+    local = {
+        abstract: state.fresh_dim(int(kwargs[size]) if isinstance(size, str) else size)
+        for abstract, size in cls.FIXED_AXIS_SIZES.items()
+    }
     operand_names: dict[str, str] = {}
-    for slot, axes in cls.OPERAND_AXES.items():
+    for slot in cls.OPERAND_AXES:
         sym = kwargs.get(slot)
         if not isinstance(sym, _Sym):
             continue
@@ -219,7 +231,32 @@ def _trace_compute_op(cls: type[NKIOp], kwargs: dict[str, Any], state: _TraceSta
                 )
             sym.storage_dtype = required_dtype
         operand_names[slot] = sym.source_name
-        for i, abstract in enumerate(axes[: len(sym.shape)]):
+        groups = cls.operand_axis_groups(slot)
+        if len(sym.shape) > len(groups):
+            raise ValueError(f"{cls.__name__}.{slot} has shape {sym.shape}, but only {len(groups)} dimensions")
+        for i, group in enumerate(groups[: len(sym.shape)]):
+            if len(group) > 1:
+                if sym.dim_ids[i] is None:
+                    sym.dim_ids[i] = state.fresh_dim(sym.shape[i])
+                sizes = {axis: state.dim_sizes[local[axis]] for axis in group if axis in local}
+                for axis, size in cls.infer_axis_group(slot, i, sym.shape[i], sizes).items():
+                    local[axis] = state.fresh_dim(size)
+                factors = sym.factor_dim_ids[i]
+                if factors is None:
+                    sym.factor_dim_ids[i] = tuple(local[axis] for axis in group)
+                else:
+                    existing_intervals = _factor_intervals(factors, state)
+                    current = tuple(local[axis] for axis in group)
+                    current_intervals = _factor_intervals(current, state)
+                    for interval in existing_intervals.keys() & current_intervals.keys():
+                        if existing_intervals[interval] != current_intervals[interval]:
+                            _unify(existing_intervals[interval], current_intervals[interval], state, local)
+                    if len(current) > len(factors):
+                        sym.factor_dim_ids[i] = current
+                continue
+            if not group:
+                raise ValueError(f"{cls.__name__}.{slot} has an empty axis group")
+            abstract = group[0]
             existing = sym.dim_ids[i]
             if existing is None:
                 if abstract not in local:
@@ -229,9 +266,6 @@ def _trace_compute_op(cls: type[NKIOp], kwargs: dict[str, Any], state: _TraceSta
                 _unify(existing, local[abstract], state, local)
             else:
                 local[abstract] = existing
-    for abstract, size in cls.FIXED_AXIS_SIZES.items():
-        if abstract not in local:
-            local[abstract] = state.fresh_dim(int(kwargs[size]) if isinstance(size, str) else size)
     op_kwargs = {k: v for k, v in kwargs.items() if not isinstance(v, _Sym)}
     record = _OpRecord(op_cls=cls, operand_names=operand_names, axis_map=local, kwargs=op_kwargs)
     state.op_records.append(record)
@@ -242,8 +276,8 @@ def _trace_compute_op(cls: type[NKIOp], kwargs: dict[str, Any], state: _TraceSta
 
 
 def _synthesize_outputs(
-    cls: type[NKIOp], name: str, input_syms: list["_Sym"], record: "_OpRecord", state: _TraceState
-) -> "_Sym":
+    cls: type[NKIOp], name: OperationSSAName, input_syms: list["_Sym"], record: "_OpRecord", state: _TraceState
+) -> "_Sym | tuple[_Sym, ...]":
     """Create the output sentinel(s) for an op call; return the primary (assigned) one.
 
     Output slots = ``OPERAND_AXES`` keys not in ``INPUT_OPERANDS``. The
@@ -266,25 +300,39 @@ def _synthesize_outputs(
     """
     output_slots = [slot for slot in cls.OPERAND_AXES if slot not in cls.INPUT_OPERANDS]
     primary_slot = "reduce_res" if "reduce_res" in cls.OPERAND_AXES else "dst"
-    logical_dtype = cls.OUTPUT_DTYPE or (input_syms[0].dtype if input_syms else None)
+    default_dtype = cls.OUTPUT_DTYPE or (input_syms[0].dtype if input_syms else None)
+    multiple = isinstance(name, tuple)
+    if isinstance(name, str):
+        names = tuple(name if slot == primary_slot else f"{name}_scratch" for slot in output_slots)
+    else:
+        names = name
+    if len(names) != len(output_slots):
+        raise ValueError(f"{cls.__name__}: expected {len(output_slots)} output names, got {len(names)}")
     primary_sym: _Sym | None = None
-    for slot in output_slots:
-        slot_name = name if slot == primary_slot else f"{name}_scratch"
-        axes = cls.OPERAND_AXES[slot]
-        dim_ids = [record.axis_map[a] for a in axes if a in record.axis_map]
-        shape = tuple(state.dim_sizes[d] for d in dim_ids)
+    output_syms: list[_Sym] = []
+    for slot, slot_name in zip(output_slots, names, strict=True):
+        groups = tuple(group for group in cls.operand_axis_groups(slot) if all(a in record.axis_map for a in group))
+        shape = tuple(prod(state.dim_sizes[record.axis_map[axis]] for axis in group) for group in groups)
+        dim_ids = [
+            record.axis_map[group[0]] if len(group) == 1 else state.fresh_dim(extent)
+            for group, extent in zip(groups, shape, strict=True)
+        ]
         sym = _Sym(shape, slot_name)
         sym.dim_ids = list(dim_ids)
+        sym.factor_dim_ids = [
+            tuple(record.axis_map[axis] for axis in group) if len(group) > 1 else None for group in groups
+        ]
         sym.location = cls.OUTPUT_LOCATION
-        sym.dtype = logical_dtype
-        sym.storage_dtype = cls.OUTPUT_STORAGE_DTYPE
+        sym.dtype = cls.OUTPUT_DTYPES.get(slot, default_dtype)
+        sym.storage_dtype = cls.OUTPUT_STORAGE_DTYPES.get(slot, cls.OUTPUT_STORAGE_DTYPE)
         state.sentinels[slot_name] = sym
         record.operand_names[slot] = slot_name
+        output_syms.append(sym)
         if slot == primary_slot:
             primary_sym = sym
     if primary_sym is None:
         raise ValueError(f"{cls.__name__}: no primary output slot {primary_slot!r} in OPERAND_AXES")
-    return primary_sym
+    return tuple(output_syms) if multiple else primary_sym
 
 
 def _unify(old: str, new: str, state: _TraceState, local: dict[str, str]) -> None:
@@ -301,6 +349,17 @@ def _unify(old: str, new: str, state: _TraceState, local: dict[str, str]) -> Non
             local[abstract] = new
 
 
+def _factor_intervals(dimensions: tuple[str, ...], state: _TraceState) -> dict[tuple[int, int], str]:
+    """Map row-major factor intervals to dimension IDs."""
+    result: dict[tuple[int, int], str] = {}
+    offset = 1
+    for dimension in dimensions:
+        end = offset * state.dim_sizes[dimension]
+        result[(offset, end)] = dimension
+        offset = end
+    return result
+
+
 def _canonicalize_dim_names(state: _TraceState) -> None:
     """Relabel surviving dims to a contiguous ``d0..dN`` sequence.
 
@@ -315,6 +374,11 @@ def _canonicalize_dim_names(state: _TraceState) -> None:
             if d is not None and d not in seen:
                 seen.add(d)
                 order.append(d)
+    for rec in state.op_records:
+        for dimension in rec.axis_map.values():
+            if dimension not in seen:
+                seen.add(dimension)
+                order.append(dimension)
     remap = {old: f"d{i}" for i, old in enumerate(order)}
     if all(old == new for old, new in remap.items()):
         return
@@ -326,38 +390,13 @@ def _apply_rename(state: _TraceState, remap: dict[str, str]) -> None:
     """Substitute every dim id in sentinels and op records via ``remap``."""
     for sym in state.sentinels.values():
         sym.dim_ids = [remap.get(d, d) if d is not None else None for d in sym.dim_ids]
+        sym.factor_dim_ids = [
+            None if factors is None else tuple(remap.get(dimension, dimension) for dimension in factors)
+            for factors in sym.factor_dim_ids
+        ]
     for rec in state.op_records:
         for abstract in rec.axis_map:
             rec.axis_map[abstract] = remap.get(rec.axis_map[abstract], rec.axis_map[abstract])
-
-
-def _collect_ssa_names(func: Callable[..., Any]) -> Iterator[str]:
-    """Yield the LHS of every ``var = NKIOp()(...)`` assignment in source order.
-
-    Each straight-line op call is assigned to a name; the trace consumes
-    these in execution (= source) order to name synthesized outputs.
-    """
-    source = textwrap.dedent(inspect.getsource(func))
-    tree = ast.parse(source)
-    func_def = tree.body[0]
-    if not isinstance(func_def, ast.FunctionDef):
-        raise ValueError("Expected a function definition")
-    for stmt in func_def.body:
-        if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
-            continue
-        target = stmt.targets[0]
-        if isinstance(target, ast.Name) and _is_op_call(stmt.value):
-            yield target.id
-
-
-def _is_op_call(node: ast.expr) -> bool:
-    """Return True if ``node`` is an ``NKIXxx(...)(...)`` double-call (op invocation)."""
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Call)
-        and isinstance(node.func.func, ast.Name)
-        and node.func.func.id.startswith("NKI")
-    )
 
 
 def _parse_return_names(func: Callable[..., Any]) -> tuple[str, ...]:

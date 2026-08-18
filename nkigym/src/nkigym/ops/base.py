@@ -5,14 +5,21 @@ Subclasses implement ``__call__`` for CPU simulation (numpy) and declare
 axis semantics and hardware limits via class attributes.
 """
 
+from __future__ import annotations
+
+import ast
 import functools
+import inspect
+import textwrap
 from abc import abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, ClassVar, Literal
 
 import numpy as np
+
+OperationSSAName = str | tuple[str, ...]
 
 """Role lattice for CPU-sim role tracking:
 
@@ -74,6 +81,28 @@ def _operand_role(value: Any) -> str | None:
     if isinstance(value, np.ndarray):
         return "param"
     return None
+
+
+def collect_operation_ssa_names(func: Callable[..., Any]) -> Iterator[OperationSSAName]:
+    """Yield assigned names for straight-line ``NKIOp`` invocations."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    function = tree.body[0]
+    if not isinstance(function, ast.FunctionDef):
+        raise ValueError("Expected a function definition")
+    for statement in function.body:
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target, value = statement.targets[0], statement.value
+        operation = (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Call)
+            and isinstance(value.func.func, ast.Name)
+            and value.func.func.id.startswith("NKI")
+        )
+        if operation and isinstance(target, ast.Name):
+            yield target.id
+        elif operation and isinstance(target, ast.Tuple) and all(isinstance(item, ast.Name) for item in target.elts):
+            yield tuple(item.id for item in target.elts if isinstance(item, ast.Name))
 
 
 def _tag_as_param(value: Any) -> Any:
@@ -154,6 +183,10 @@ class ReductionContract:
     bias: float = 0.0
     bias_operand: str | None = None
     mapped_output_operand: str | None = None
+    mapped_op_cls: type[NKIOp] | None = None
+    mapped_input_operands: tuple[str, ...] = ()
+    mapped_op_output_operand: str = "dst"
+    mapped_excluded_kwargs: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -492,6 +525,9 @@ class NKIOp:
     NAME: ClassVar[str] = ""
     INDIRECT_DMA_MODE: ClassVar[str | None] = None
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {}
+    OPERAND_AXIS_GROUPS: ClassVar[dict[str, tuple[tuple[str, ...], ...]]] = {}
+    OPERAND_VIEW_AXIS_GROUPS: ClassVar[dict[str, tuple[tuple[str, ...], ...]]] = {}
+    FIRST_WRITE_AXES: ClassVar[tuple[str, ...]] = ()
     AXIS_ROLES: ClassVar[dict[str, "AxisRole"]] = {}
 
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {}
@@ -529,6 +565,9 @@ class NKIOp:
     ``BodyLeaf.reads_writes`` (the tensor names for these slots appear in
     ``reads_writes``, not in ``reads`` or ``writes``).
     """
+
+    SYNTHESIZE_RMW_INITIALIZER: ClassVar[bool] = True
+    RETURN_RMW_OPERAND: ClassVar[str | None] = None
 
     RFACTOR_RECIPE: ClassVar[Literal["rmw", "slot"] | None] = None
     """Which RFactor recipe this op supports, or ``None`` if not rfactorable.
@@ -584,6 +623,33 @@ class NKIOp:
     """
 
     @classmethod
+    def operand_axis_groups(cls, operand: str) -> tuple[tuple[str, ...], ...]:
+        """Return abstract axes folded into each physical operand dimension."""
+        return cls.OPERAND_AXIS_GROUPS.get(operand, tuple((axis,) for axis in cls.OPERAND_AXES[operand]))
+
+    @classmethod
+    def operand_view_axis_groups(cls, operand: str) -> tuple[tuple[str, ...], ...] | None:
+        """Return the optional ISA view dimensions for one operand."""
+        return cls.OPERAND_VIEW_AXIS_GROUPS.get(operand)
+
+    @classmethod
+    def infer_axis_group(
+        cls, operand: str, dimension: int, extent: int, known_sizes: Mapping[str, int]
+    ) -> dict[str, int]:
+        """Infer at most one unknown axis in a flattened physical dimension."""
+        group = cls.operand_axis_groups(operand)[dimension]
+        unknown = tuple(axis for axis in group if axis not in known_sizes)
+        product = 1
+        for axis in group:
+            product *= known_sizes.get(axis, 1)
+        if len(unknown) > 1 or extent % product:
+            raise ValueError(f"{cls.__name__}.{operand} cannot factor extent {extent} as {group}")
+        inferred = {} if not unknown else {unknown[0]: extent // product}
+        if not unknown and product != extent:
+            raise ValueError(f"{cls.__name__}.{operand} expects extent {product} for {group}, got {extent}")
+        return inferred
+
+    @classmethod
     def accepts_input_locations(cls, locations: Mapping[str, str]) -> bool:
         """Return whether the complete input-location assignment is supported."""
         return all(locations.get(operand) in accepted for operand, accepted in cls.INPUT_LOCATIONS.items())
@@ -621,8 +687,9 @@ class NKIOp:
         return cls.RMW_OPERANDS
 
     @classmethod
-    def with_first_write_overwrite(cls, operand: str, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+    def with_first_write_overwrite(cls, operand: str, kwargs: Mapping[str, Any], reduction_axis: str) -> dict[str, Any]:
         """Return kwargs that force the first write to overwrite."""
+        _ = reduction_axis
         if not cls.first_write_overwrites(operand, kwargs):
             raise ValueError(f"{cls.__name__}.{operand} does not support first-write overwrite")
         return dict(kwargs)
@@ -655,8 +722,17 @@ class NKIOp:
     for example, ``NKIMatmul`` accumulates into fp32 PSUM.
     """
 
+    OUTPUT_TILE_ALIGNMENT_BYTES: ClassVar[dict[str, int]] = {}
+    """Required byte alignment between packed logical tiles by output slot."""
+
     OUTPUT_DTYPE: ClassVar[str | None] = None
     """Logical dtype override for operations that explicitly cast their output."""
+
+    OUTPUT_DTYPES: ClassVar[dict[str, str]] = {}
+    """Logical dtype overrides for individual output operand slots."""
+
+    OUTPUT_STORAGE_DTYPES: ClassVar[dict[str, str]] = {}
+    """Physical dtype overrides for individual output operand slots."""
 
     FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {}
     """Abstract output axes whose extents are fixed by the instruction."""
@@ -685,6 +761,11 @@ class NKIOp:
         result = self._run(**merged)
         if isinstance(result, np.ndarray):
             return _RoleArray(result, self._output_role(**merged))
+        if isinstance(result, tuple):
+            return tuple(
+                _RoleArray(value, self._output_role(**merged)) if isinstance(value, np.ndarray) else value
+                for value in result
+            )
         return result
 
 

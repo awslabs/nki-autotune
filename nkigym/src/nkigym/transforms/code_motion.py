@@ -8,7 +8,7 @@ from math import prod
 from weakref import WeakKeyDictionary
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Expr, Var, substitute, to_affine
+from nkigym.ir.arith.expr import Expr, Var, to_affine
 from nkigym.ir.dependency import (
     Dependency,
     _access_invariant_across,
@@ -22,7 +22,7 @@ from nkigym.ops.base import AxisRole
 from nkigym.search.serialization import inherited_analysis
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
-from nkigym.transforms.helper.normalize import normalize_block
+from nkigym.transforms.helper.normalize import _substitute_block_regions
 from nkigym.transforms.helper.tree_ops import _block_local_descendants, _replace_in_parent_children
 
 
@@ -122,31 +122,25 @@ def loop_carries_plain_state(ir: KernelIR, loop_nid: int, tensor: str, excluded_
 def _ancestors(tree: KernelTree, nid: int) -> tuple[int, ...]:
     """Return one cached root-first ancestor chain."""
     cache = _ANCESTORS.setdefault(tree, {})
-    ancestors = cache.get(nid)
-    if ancestors is None:
-        ancestors = tuple(tree.ancestors(nid))
-        cache[nid] = ancestors
-    return ancestors
+    if nid not in cache:
+        cache[nid] = tuple(tree.ancestors(nid))
+    return cache[nid]
 
 
 def _descendants(tree: KernelTree, nid: int) -> frozenset[int]:
     """Return one cached descendant set."""
     cache = _DESCENDANTS.setdefault(tree, {})
-    descendants = cache.get(nid)
-    if descendants is None:
-        descendants = frozenset(tree.descendants(nid))
-        cache[nid] = descendants
-    return descendants
+    if nid not in cache:
+        cache[nid] = frozenset(tree.descendants(nid))
+    return cache[nid]
 
 
 def _preorder(tree: KernelTree, nid: int | None = None) -> tuple[int, ...]:
     """Return one cached preorder traversal."""
     cache = _PREORDERS.setdefault(tree, {})
-    preorder = cache.get(nid)
-    if preorder is None:
-        preorder = tuple(tree.preorder(nid))
-        cache[nid] = preorder
-    return preorder
+    if nid not in cache:
+        cache[nid] = tuple(tree.preorder(nid))
+    return cache[nid]
 
 
 def _clear_analysis_cache(tree: KernelTree) -> None:
@@ -179,7 +173,12 @@ def _move(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int) -> Non
         _prepare_block_for_splice(tree, block_nid, plan)
         _strip_local_prefix_loops(tree, block_nid, len(plan.matched_local_nids))
         _splice_under_target(tree, block_nid, target_loop_nid, index)
-        normalize_block(tree, block_nid)
+    root = tree.block(tree.root)
+    shards = root.annotations.get("program_shards")
+    if isinstance(shards, dict) and any(nid not in tree.graph for nid in shards):
+        annotations = dict(root.annotations)
+        annotations["program_shards"] = {nid: programs for nid, programs in shards.items() if nid in tree.graph}
+        tree.graph.nodes[tree.root]["data"] = replace(root, annotations=annotations)
     _assert_single_parent(tree)
     _clear_analysis_cache(tree)
 
@@ -202,33 +201,7 @@ def _prepare_block_for_splice(tree: KernelTree, block_nid: int, plan: _PrefixPla
         used_names.add(temporary)
         substitutions[loop.loop_var] = Var(name=temporary)
         tree.graph.nodes[local_nid]["data"] = ForNode(loop_var=temporary, extent=loop.extent)
-    _substitute_block_loop_vars(tree, block_nid, substitutions)
-
-
-def _substitute_block_loop_vars(tree: KernelTree, block_nid: int, substitutions: dict[str, Expr]) -> None:
-    """Substitute loop identifiers throughout one leaf block's binding scope."""
-    block = tree.block(block_nid)
-    new_block = replace(
-        block,
-        iter_values=tuple(substitute(value, substitutions) for value in block.iter_values),
-        reads=tuple(_substitute_region(region, substitutions) for region in block.reads),
-        writes=tuple(_substitute_region(region, substitutions) for region in block.writes),
-    )
-    tree.graph.nodes[block_nid]["data"] = new_block
-    for nid in _block_local_descendants(tree, block_nid):
-        node = tree.data(nid)
-        if not isinstance(node, ISANode):
-            continue
-        bindings = {slot: _substitute_region(region, substitutions) for slot, region in node.operand_bindings.items()}
-        tree.graph.nodes[nid]["data"] = replace(node, operand_bindings=bindings)
-
-
-def _substitute_region(region: BufferRegion, substitutions: dict[str, Expr]) -> BufferRegion:
-    """Apply loop-variable substitutions to one buffer region."""
-    ranges = tuple(
-        (substitute(lower, substitutions), substitute(width, substitutions)) for lower, width in region.ranges
-    )
-    return replace(region, ranges=ranges)
+    _substitute_block_regions(tree, block_nid, substitutions)
 
 
 def _strip_local_prefix_loops(tree: KernelTree, block_nid: int, count: int) -> None:
@@ -459,6 +432,9 @@ def _try_prefix_plan(
     matched_local_nids = tuple(moved_nid for moved_nid, _target_nid in matched if moved_nid in local_set)
     if matched_local_nids != facts.local_nids[: len(matched_local_nids)]:
         return None
+    removed_enclosing = facts.enclosing_nids - set(target_nids)
+    if len(matched_local_nids) + len(duplicated) + len(removed_enclosing) > 1:
+        return None
     return _PrefixPlan(
         target_loop_nids=tuple(target_nids),
         local_loop_nids=facts.local_nids,
@@ -490,13 +466,39 @@ def _check_same_loop_prefix(
     ir: KernelIR, block_nid: int, target_loop_nid: int, plan: _PrefixPlan | None = None
 ) -> None:
     """Require the target loops to match the moved block's dependent prefix."""
-    block = ir.tree.data(block_nid)
-    assert isinstance(block, BlockNode)
     resolved_plan = plan if plan is not None else _prefix_plan(ir.tree, block_nid, target_loop_nid)
+    _check_matched_tensor_partitions(ir, block_nid, resolved_plan)
     _check_no_partial_input_replicated(ir, block_nid, target_loop_nid, resolved_plan.duplicated_target_nids)
     _check_no_mutating_input_replicated(ir, block_nid, target_loop_nid, resolved_plan.duplicated_target_nids)
     _check_no_feedback_output_replicated(ir, block_nid, target_loop_nid, resolved_plan.duplicated_target_nids)
     _check_no_reduction_replicated(ir, block_nid, target_loop_nid, resolved_plan.duplicated_target_nids)
+
+
+def _check_matched_tensor_partitions(ir: KernelIR, block_nid: int, plan: _PrefixPlan) -> None:
+    """Require matched loops to select the same shared-tensor partitions."""
+    moved_leaf = _dependency_leaf(ir, block_nid)
+    for moved_nid, target_nid in plan.matched_loop_nids:
+        if moved_nid == target_nid:
+            continue
+        edges = (
+            *ir.dependency.graph.in_edges(moved_leaf, data=True),
+            *ir.dependency.graph.out_edges(moved_leaf, data=True),
+        )
+        moved_var, target_var = ir.tree.loop(moved_nid).loop_var, ir.tree.loop(target_nid).loop_var
+        for producer, consumer, attrs in edges:
+            other_leaf = producer if consumer == moved_leaf else consumer
+            if other_leaf not in _descendants(ir.tree, target_nid):
+                continue
+            tensor = attrs["tensor"]
+            signatures = [
+                frozenset(
+                    tuple(to_affine(lower).get(loop_var, 0) for lower, _width in region.ranges)
+                    for region in _leaf_operand_regions(ir.tree, leaf, tensor, rmw_only=False)
+                )
+                for leaf, loop_var in ((moved_leaf, moved_var), (other_leaf, target_var))
+            ]
+            if signatures[0] != signatures[1]:
+                raise TransformLegalityError(f"matched loops select different partitions of tensor {tensor!r}")
 
 
 def _check_no_partial_input_replicated(
@@ -875,10 +877,10 @@ def _check_move_preserves_dependencies(ir: KernelIR, block_nid: int, target_loop
     """
     _check_move_changes_position(ir.tree, block_nid, target_loop_nid, index)
     plan = _prefix_plan(ir.tree, block_nid, target_loop_nid)
+    _check_access_pattern_motion(ir, block_nid, target_loop_nid, plan)
     _check_same_loop_prefix(ir, block_nid, target_loop_nid, plan)
     moved_leaf = _dependency_leaf(ir, block_nid)
     offending = ir.dependency.first_backward_edge_for_insertion(moved_leaf, target_loop_nid, index)
-    result: None = None
     if offending is not None:
         a, b = offending
         raise TransformLegalityError(
@@ -887,15 +889,36 @@ def _check_move_preserves_dependencies(ir: KernelIR, block_nid: int, target_loop
             f"reduction loop, nor a consumer precede its producer)"
         )
     _check_move_scope_changes(ir, block_nid, target_loop_nid, plan)
-    return result
+
+
+def _check_access_pattern_motion(ir: KernelIR, block_nid: int, target_loop_nid: int, plan: _PrefixPlan) -> None:
+    """Allow explicit views only when motion replaces one exact loop prefix."""
+    if not subtree_has_access_patterns(ir.tree, block_nid) or ir.tree.parent(block_nid) == target_loop_nid:
+        return
+    if plan.duplicated_target_nids or not plan.matched_local_nids:
+        raise TransformLegalityError("CodeMotion cannot duplicate or change the scope of an explicit access pattern")
 
 
 def _check_move_scope_changes(ir: KernelIR, block_nid: int, target_loop_nid: int, plan: _PrefixPlan) -> None:
     """Reject loop-scope changes not represented by dependency direction."""
+    _check_program_shard_scope(ir, block_nid, plan)
     _check_no_rmw_reset_scope_change(ir, block_nid, target_loop_nid, plan)
     _check_no_consumer_hoisted_out_of_producer_loop(ir, block_nid, target_loop_nid, plan)
     _check_no_producer_moved_out_of_consumer_loop(ir, block_nid, target_loop_nid, plan)
     _check_no_partial_producer_moved_into_consumer_loop(ir, block_nid, target_loop_nid, plan)
+
+
+def _check_program_shard_scope(ir: KernelIR, block_nid: int, plan: _PrefixPlan) -> None:
+    """Require code motion to preserve the block's program execution counts."""
+    value = ir.tree.block(ir.tree.root).annotations.get("program_shards", {})
+    if not isinstance(value, dict):
+        raise TransformLegalityError(f"invalid program_shards annotation: {value!r}")
+    facts = _prefix_block_facts(ir.tree, block_nid)
+    local_tail = plan.local_loop_nids[len(plan.matched_local_nids) :]
+    old_programs = sorted(value[nid] for nid in facts.moved_nids if nid in value)
+    new_programs = sorted(value[nid] for nid in (*plan.target_loop_nids, *local_tail) if nid in value)
+    if old_programs != new_programs:
+        raise TransformLegalityError("CodeMotion cannot change a block's program execution scope")
 
 
 def _analysis_context(ir: KernelIR) -> _AnalysisContext:
@@ -1034,6 +1057,8 @@ def _check_move_changes_position(tree: KernelTree, block_nid: int, target_loop_n
             f"move(block={block_nid} under loop={target_loop_nid} at index={index}) "
             f"does not change the block's child slot"
         )
+    if abs(reordered.index(block_nid) - original.index(block_nid)) != 1:
+        raise TransformLegalityError("same-scope CodeMotion must cross one adjacent sibling boundary")
 
 
 @dataclass(frozen=True)
@@ -1080,10 +1105,12 @@ class CodeMotion(Transform[CodeMotionOption]):
         for block_nid in context.leaf_blocks:
             prefix_facts = _prefix_block_facts(ir.tree, block_nid)
             moved_leaf = _dependency_leaf(ir, block_nid)
+            consumers = ir.dependency.direct_consumers(moved_leaf)
             related_leaves = {
                 moved_leaf,
                 *ir.dependency.direct_producers(moved_leaf),
-                *ir.dependency.direct_consumers(moved_leaf),
+                *consumers,
+                *(producer for consumer in consumers for producer in ir.dependency.direct_producers(consumer)),
             }
             target_loops = {
                 nid
@@ -1098,6 +1125,10 @@ class CodeMotion(Transform[CodeMotionOption]):
                     continue
                 plan = _try_prefix_plan(ir.tree, block_nid, target_nid, prefix_facts)
                 if plan is None:
+                    continue
+                try:
+                    _check_access_pattern_motion(ir, block_nid, target_nid, plan)
+                except TransformLegalityError:
                     continue
                 indices = self._legal_indices(ir, block_nid, target_nid)
                 if not indices:
@@ -1118,11 +1149,23 @@ class CodeMotion(Transform[CodeMotionOption]):
                     _check_move_scope_changes(ir, block_nid, target_nid, plan)
                 except TransformLegalityError:
                     continue
+                selected_indices = (
+                    legal_indices
+                    if ir.tree.parent(block_nid) == target_nid
+                    else [self._stable_scope_index(ir, block_nid, target_nid, legal_indices)]
+                )
                 options.extend(
                     CodeMotionOption(block_nid=block_nid, target_loop_nid=target_nid, index=index)
-                    for index in legal_indices
+                    for index in selected_indices
                 )
         return options
+
+    def _stable_scope_index(self, ir: KernelIR, block_nid: int, target_nid: int, legal_indices: list[int]) -> int:
+        """Choose the dependency-legal slot that best preserves source order."""
+        positions = {nid: index for index, nid in enumerate(ir.tree.preorder())}
+        original = positions[block_nid]
+        desired = sum(positions[child] < original for child in ir.tree.children(target_nid))
+        return min(legal_indices, key=lambda index: (abs(index - desired), index))
 
     def _legal_indices(self, ir: KernelIR, block_nid: int, target_nid: int) -> list[int]:
         """Slots in the insertion gap (lp, fc] among the target loop's children.
@@ -1172,8 +1215,6 @@ class CodeMotion(Transform[CodeMotionOption]):
                     f"target_loop_nid={target_loop_nid} is a descendant of moved block "
                     f"{block_nid} (cannot move under its own loop)"
                 )
-        if (context is None or context.has_access_patterns) and subtree_has_access_patterns(ir.tree, block_nid):
-            raise TransformLegalityError("CodeMotion cannot move a block with an explicit access pattern")
         if context is None or context.pipeline_stages:
             _check_pipeline_boundary(ir, block_nid, target_loop_nid, context)
 
@@ -1181,6 +1222,13 @@ class CodeMotion(Transform[CodeMotionOption]):
         """Structural checks (target/block in graph, target a ForNode, target not a
         descendant of the block) then span-promotion ordering. No output guard."""
         self._check_static_legality(ir, option.block_nid, option.target_loop_nid, None)
+        if ir.tree.parent(option.block_nid) != option.target_loop_nid:
+            legal_indices = self._legal_indices(ir, option.block_nid, option.target_loop_nid)
+            expected = self._stable_scope_index(ir, option.block_nid, option.target_loop_nid, legal_indices)
+            if option.index != expected:
+                raise TransformLegalityError(
+                    f"cross-scope CodeMotion requires stable insertion index {expected}; got {option.index}"
+                )
         _check_move_preserves_dependencies(ir, option.block_nid, option.target_loop_nid, option.index)
 
 

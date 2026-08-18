@@ -6,6 +6,7 @@ from typing import Any, ClassVar, Literal
 
 import numpy as np
 
+from nkigym.ops.activation import NKIActivation
 from nkigym.ops.base import AxisRole, NKIOp, ReductionContract, _operand_role, reduction_combinator
 
 VE_PARTITION_MAX = 128
@@ -60,6 +61,9 @@ class NKIActivationReduce(NKIOp):
             bias=float(kwargs["bias"]) if isinstance(kwargs.get("bias"), Real) else 0.0,
             bias_operand="bias",
             mapped_output_operand="dst",
+            mapped_op_cls=NKIActivation,
+            mapped_input_operands=("data", "bias"),
+            mapped_excluded_kwargs=frozenset({"reduce_op"}),
         )
 
     def _check_roles(self, **kwargs: Any) -> None:

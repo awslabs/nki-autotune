@@ -20,6 +20,7 @@ class NKILoad(NKIOp):
     layout; the free axis is unbounded."""
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 1}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+    PREFERRED_TILE_SIZE: ClassVar[dict[str, int]] = {"F": 512}
     OUTPUT_ROLE: ClassVar[str] = "sbuf"
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 

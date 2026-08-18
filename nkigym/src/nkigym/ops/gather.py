@@ -4,6 +4,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+from nkigym.codegen.torch_values import TorchSegments, TorchValue
 from nkigym.ops.base import NKIOp, _operand_role
 
 
@@ -38,4 +39,25 @@ class NKIGather(NKIOp):
         return result
 
 
-__all__ = ["NKIGather"]
+def emit_routed_gather(
+    source: str, indices: TorchValue | TorchSegments, width: int, stem: str, body: list[str], imports: set[str]
+) -> TorchValue | TorchSegments:
+    """Emit one wide or segmented routed HBM gather."""
+    values = indices.values if isinstance(indices, TorchSegments) else (indices,)
+    chunks: list[TorchValue] = []
+    imports.add("NKIGather")
+    for index, value in enumerate(values):
+        if len(value.shape) != 2:
+            raise ValueError(f"routed gather indices must be rank two, got {value.shape}")
+        offsets = TorchValue(value.name, tuple(reversed(value.shape)), not value.transposed)
+        if offsets.transposed:
+            offsets = TorchValue(f"sbuf_{stem}_indices_{index}", offsets.shape)
+            imports.add("NKIDMATranspose")
+            body.append(f"{offsets.name} = NKIDMATranspose()(src={value.name})")
+        target = TorchValue(f"sbuf_{stem}_{index}", (offsets.shape[0], width))
+        body.append(f"{target.name} = NKIGather()(src={source}, indices={offsets.name})")
+        chunks.append(target)
+    return TorchSegments(tuple(chunks), axis=0) if isinstance(indices, TorchSegments) else chunks[0]
+
+
+__all__ = ["NKIGather", "emit_routed_gather"]

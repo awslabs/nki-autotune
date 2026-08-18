@@ -388,7 +388,7 @@ WORKLOADS = (
         "atol": 1e-05,
         "rtol": 1e-05,
         "nakb_latency_ms": 0.181100551,
-        "best_historical_latency_ms": 0.181100551,
+        "best_historical_latency_ms": 0.177796389,
     },
     {
         "torch_ref": _torch_ref_2,

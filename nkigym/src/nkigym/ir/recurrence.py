@@ -363,7 +363,11 @@ def _build_match(
         external_outputs = [stages[-1].state_tensor]
         valid_boundary = len(stages) == stage_count
     else:
-        valid_boundary = external_outputs == [stages[-1].state_tensor]
+        final = stages[-1].state_tensor
+        valid_boundary = final in external_outputs and set(external_outputs).issubset(
+            stage.state_tensor for stage in stages
+        )
+        external_outputs = [final, *(output for output in external_outputs if output != final)]
     sizes = _chunk_sizes(ir, absorbed, progress_axis)
     if not valid_boundary or not sizes:
         return None
@@ -385,8 +389,7 @@ def _build_match(
 
 def _detect_deferred(graph: ValueGraph, evaluation: _Evaluation) -> _Deferred | None:
     """Find a unique broadcast factor movable after the recurrence."""
-    stage_index = len(evaluation.stages) - 1
-    final = evaluation.stages[stage_index]
+    stage_index, final = len(evaluation.stages) - 1, evaluation.stages[-1]
     factors = _flatten_product(final.factor)
     reciprocal = [
         factor
@@ -467,8 +470,7 @@ def _deferred_candidates(
             continue
         factor_slot = slots[0]
         passthrough = next((slot for slot in contract.input_operands if slot != factor_slot))
-        source = inputs[passthrough]
-        output = graph.outputs[combine]
+        source, output = inputs[passthrough], graph.outputs[combine]
         if (
             factor_slot in contract.broadcast_operands
             and passthrough not in contract.broadcast_operands
@@ -487,6 +489,8 @@ def _positive_sum_stage(graph: ValueGraph, evaluation: _Evaluation, index: int) 
     reducer = graph.contracts[stage.reducer_leaf]
     if not isinstance(reducer, ReductionContract) or stage.combinator.combiner != "add":
         return False
+    if reducer.map_operator == "exp":
+        return True
     producer = graph.predecessors[stage.reducer_leaf].get(reducer.input_operand)
     if producer is None:
         return False
