@@ -5,9 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from nkigym.ir import Expr, KernelIR, Var, substitute, to_affine
+from nkigym.ir.arith.analyzer import Analyzer
+from nkigym.ir.arith.expr import expr_variables
+from nkigym.ir.program_sharding import PROGRAM_SHARDS_ANNOTATION, configured_program_shards
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import BilinearReductionContract, InitializerContract, ReductionContract
-from nkigym.search.state_facts import operation_facts
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -47,9 +49,6 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
 
     def analyze(self, ir: KernelIR) -> list[EliminateIdentityInitializerOption]:
         """Return every identity initializer with proven overwrite semantics."""
-        facts = operation_facts(ir)
-        if not facts.has_initializer or not facts.has_reduction:
-            return []
         options: list[EliminateIdentityInitializerOption] = []
         overlap_nodes = software_pipeline_overlap_nodes(ir)
         for initializer_leaf_nid in ir.tree.preorder():
@@ -138,7 +137,7 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             initializer_region is None
             or reduction_region is None
             or initializer_region.tensor != option.tensor
-            or reduction_region != initializer_region
+            or not self._regions_equal(initializer_region, reduction_region)
             or initializer_contract.value != identity
             or not reduction.op_cls.first_write_overwrites(output_operand, reduction.kwargs)
         ):
@@ -174,6 +173,18 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             reduction_axis=reduction_axis,
         )
         return result
+
+    def _regions_equal(self, lhs: BufferRegion, rhs: BufferRegion) -> bool:
+        """Return whether two regions denote the same tensor coordinates."""
+        analyzer = Analyzer()
+        return (
+            lhs.tensor == rhs.tensor
+            and len(lhs.ranges) == len(rhs.ranges)
+            and all(
+                analyzer.can_prove_equal(lhs_lower, rhs_lower) and analyzer.can_prove_equal(lhs_width, rhs_width)
+                for (lhs_lower, lhs_width), (rhs_lower, rhs_width) in zip(lhs.ranges, rhs.ranges, strict=True)
+            )
+        )
 
     def _reduction_fields(self, contract: object) -> tuple[str, str, float] | None:
         """Return output, reduction axis, and identity for supported contracts."""
@@ -255,8 +266,7 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             variable
             for lower, width in region.ranges
             for expression in (lower, width)
-            for variable in to_affine(expression)
-            if variable is not None
+            for variable in expr_variables(expression)
         )
 
     def _loop_binds_axis(self, block: BlockNode, loop_var: str, axis: str) -> bool:
@@ -285,6 +295,7 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
 
     def _remove_initializer(self, ir: KernelIR, match: _InitializerMatch) -> None:
         """Remove one identity fill already superseded by an explicit overwrite."""
+        shards = configured_program_shards(ir)
         block_nid = match.option.initializer_block_nid
         execution_nid = match.initializer_execution_nid
         parent = ir.tree.parent(execution_nid)
@@ -299,6 +310,12 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             ir.tree.graph.nodes[block_nid]["data"] = replace(
                 block, iter_vars=(), iter_values=(), reads=(), writes=(), axis_map={}
             )
+        root = ir.tree.block(ir.tree.root)
+        annotations = dict(root.annotations)
+        annotations[PROGRAM_SHARDS_ANNOTATION] = {
+            loop_nid: programs for loop_nid, programs in shards.items() if loop_nid in ir.tree.graph
+        }
+        ir.tree.graph.nodes[ir.tree.root]["data"] = replace(root, annotations=annotations)
         finalize_rewrite(ir)
 
     def _prune_empty_loops(self, ir: KernelIR, nid: int, stop_nid: int) -> None:

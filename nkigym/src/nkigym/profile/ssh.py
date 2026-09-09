@@ -103,89 +103,72 @@ class _CommandRunner:
                 self.lines.append(text)
 
 
-def profile_over_ssh(host: str, kernel_path: Path, request_path: Path, output_dir: Path, timeout_s: int) -> str:
-    """Profile one kernel remotely and return the complete transport log."""
-    if not kernel_path.is_file():
-        raise FileNotFoundError(f"kernel source not found: {kernel_path}")
-    return _profile_over_ssh(host, kernel_path, request_path, output_dir, timeout_s, False)
+def profile_over_ssh(host: str, input_path: Path, request_path: Path, output_dir: Path, timeout_s: int) -> str:
+    """Execute one kernel request remotely and return the complete transport log."""
+    if not input_path.is_file() and not input_path.is_dir():
+        raise FileNotFoundError(f"kernel request input not found: {input_path}")
+    return _profile_over_ssh(host, input_path, request_path, output_dir, timeout_s)
 
 
-def profile_batch_over_ssh(host: str, input_dir: Path, request_path: Path, output_dir: Path, timeout_s: int) -> str:
-    """Profile a directory of labeled kernels in one remote batch."""
-    if not input_dir.is_dir():
-        raise FileNotFoundError(f"batch profile input directory not found: {input_dir}")
-    return _profile_over_ssh(host, input_dir, request_path, output_dir, timeout_s, True)
-
-
-def _profile_over_ssh(
-    host: str, input_path: Path, request_path: Path, output_dir: Path, timeout_s: int, batch: bool
-) -> str:
-    """Run one single-kernel or batch profile transport."""
+def _profile_over_ssh(host: str, input_path: Path, request_path: Path, output_dir: Path, timeout_s: int) -> str:
+    """Run one kernel execution/profile transport."""
     _validate_host(host)
     _require_command("ssh")
     _require_command("rsync")
     if timeout_s <= 0:
         raise ValueError("SSH profile timeout must be positive")
     if not request_path.is_file():
-        label = "batch profile" if batch else "profile"
-        raise FileNotFoundError(f"{label} request not found: {request_path}")
+        raise FileNotFoundError(f"profile request not found: {request_path}")
     output_dir.mkdir(parents=True, exist_ok=True)
     request_text = request_path.read_text(encoding="utf-8")
     remote_run = f"{_REMOTE_RUN_ROOT}/{time.time_ns()}-{os.getpid()}-{secrets.token_hex(4)}"
-    remote_input = f"{remote_run}/input" if batch else f"{remote_run}/kernel.py"
+    directory_input = input_path.is_dir()
+    remote_input = f"{remote_run}/input" if directory_input else f"{remote_run}/kernel.py"
     remote_output = f"{remote_run}/output"
     rsync_shell = shlex.join(("ssh", *_SSH_OPTIONS))
     runner = _CommandRunner(timeout_s)
-    worker = "batch_worker" if batch else "worker"
-    upload_source = f"{input_path}/" if batch else str(input_path)
-    upload_target = f"{host}:{remote_input}/" if batch else f"{host}:{remote_input}"
-    failure: SSHTransportError | None = None
+    upload_source = f"{input_path}/" if directory_input else str(input_path)
+    upload_target = f"{host}:{remote_input}/" if directory_input else f"{host}:{remote_input}"
     try:
         runner.run(
-            "Checking installed batch profile worker" if batch else "Checking installed profile worker",
+            "Checking installed profile worker",
             [
                 "ssh",
                 *_SSH_OPTIONS,
                 host,
                 (
                     f"test -x {_REMOTE_PYTHON} && "
-                    f"{_REMOTE_PYTHON} -c 'import nkigym.profile.{worker}' && "
-                    f'mkdir -p "$HOME"/{remote_input if batch else remote_run}'
+                    f"{_REMOTE_PYTHON} -c 'import nkigym.profile.worker' && "
+                    f'mkdir -p "$HOME"/{remote_input if directory_input else remote_run}'
                 ),
             ],
             None,
         )
+        runner.run("Uploading kernel request", ["rsync", "-az", "-e", rsync_shell, upload_source, upload_target], None)
         runner.run(
-            "Uploading batch kernels" if batch else "Uploading kernel.py",
-            ["rsync", "-az", "-e", rsync_shell, upload_source, upload_target],
-            None,
-        )
-        runner.run(
-            "Profiling kernel batch" if batch else "Profiling kernel",
+            "Executing and profiling kernel",
             [
                 "ssh",
                 *_SSH_OPTIONS,
                 host,
                 (
-                    f"{_REMOTE_PYTHON} -m nkigym.profile.{worker} "
-                    f'{"--input" if batch else "--kernel"} "$HOME"/{remote_input} '
+                    f"{_REMOTE_PYTHON} -m nkigym.profile.worker "
+                    f'{"--input" if directory_input else "--kernel"} "$HOME"/{remote_input} '
                     f'--output "$HOME"/{remote_output}'
                 ),
             ],
             request_text,
         )
         runner.run(
-            "Downloading batch profile artifacts",
+            "Downloading profile artifacts",
             ["rsync", "-az", "-e", rsync_shell, f"{host}:{remote_output}/", f"{output_dir}/"],
             None,
         )
     except SSHTransportError as error:
-        failure = error
+        raise SSHTransportError(str(error), runner.log) from error
     finally:
         runner.cleanup(host, remote_run, False)
-    (output_dir / _TRANSPORT_LOG_FILE).write_text(runner.log, encoding="utf-8")
-    if failure is not None:
-        raise SSHTransportError(str(failure), runner.log) from failure
+        (output_dir / _TRANSPORT_LOG_FILE).write_text(runner.log, encoding="utf-8")
     return runner.log
 
 

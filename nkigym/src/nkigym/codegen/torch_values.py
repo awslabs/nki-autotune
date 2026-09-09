@@ -37,47 +37,29 @@ def emit_activation(
 
 
 def _emit_exact_gelu(source: TorchValue, name: str, body: list[str], imports: set[str]) -> TorchValue:
-    """Emit an accurate normal-CDF approximation for exact GELU."""
-    absolute = TorchValue(f"{name}_absolute", source.shape, source.transposed)
-    reciprocal = TorchValue(f"{name}_reciprocal", source.shape, source.transposed)
-    polynomial = TorchValue(f"{name}_polynomial_0", source.shape, source.transposed)
-    imports.update(("NKIActivation", "NKITensorTensor"))
-    body.extend(
-        (
-            f'{absolute.name} = NKIActivation(op="abs", scale=1.0)(data={source.name})',
-            f'{reciprocal.name} = NKIActivation(op="reciprocal", scale=0.23164190351963043, bias=1.0)'
-            f"(data={absolute.name})",
-            f'{polynomial.name} = NKIActivation(op="copy", scale=0.5307027697563171, '
-            f"bias=-0.726576030254364)(data={reciprocal.name})",
-        )
-    )
-    for index, coefficient in enumerate((0.710706889629364, -0.14224837720394135, 0.12741480767726898), 1):
-        product = TorchValue(f"{name}_product_{index}", source.shape, source.transposed)
-        body.append(
-            f'{product.name} = NKITensorTensor(op="multiply")(data1={polynomial.name}, data2={reciprocal.name})'
-        )
-        polynomial = TorchValue(f"{name}_polynomial_{index}", source.shape, source.transposed)
-        body.append(f'{polynomial.name} = NKIActivation(op="copy", bias={coefficient!r})(data={product.name})')
-    weighted = TorchValue(f"{name}_weighted", source.shape, source.transposed)
+    """Emit native GELU plus a decaying polynomial accuracy correction."""
     squared = TorchValue(f"{name}_squared", source.shape, source.transposed)
+    polynomial_0 = TorchValue(f"{name}_polynomial_0", source.shape, source.transposed)
+    product = TorchValue(f"{name}_product", source.shape, source.transposed)
+    polynomial_1 = TorchValue(f"{name}_polynomial_1", source.shape, source.transposed)
     exponential = TorchValue(f"{name}_exponential", source.shape, source.transposed)
-    tail = TorchValue(f"{name}_tail", source.shape, source.transposed)
-    delta = TorchValue(f"{name}_delta", source.shape, source.transposed)
-    sign = TorchValue(f"{name}_sign", source.shape, source.transposed)
-    signed = TorchValue(f"{name}_signed", source.shape, source.transposed)
-    cdf = TorchValue(f"{name}_cdf", source.shape, source.transposed)
+    correction = TorchValue(f"{name}_correction", source.shape, source.transposed)
+    approximate = TorchValue(f"{name}_approximate", source.shape, source.transposed)
     target = TorchValue(name, source.shape, source.transposed)
+    imports.update(("NKIActivation", "NKIScalarTensorTensor", "NKITensorTensor"))
     body.extend(
         (
-            f'{weighted.name} = NKITensorTensor(op="multiply")' f"(data1={polynomial.name}, data2={reciprocal.name})",
             f'{squared.name} = NKIActivation(op="square", scale=1.0)(data={source.name})',
-            f'{exponential.name} = NKIActivation(op="exp", scale=-0.5)(data={squared.name})',
-            f'{tail.name} = NKITensorTensor(op="multiply")(data1={weighted.name}, data2={exponential.name})',
-            f'{delta.name} = NKIActivation(op="copy", scale=-1.0, bias=0.5)(data={tail.name})',
-            f'{sign.name} = NKIActivation(op="sign", scale=1.0)(data={source.name})',
-            f'{signed.name} = NKITensorTensor(op="multiply")(data1={sign.name}, data2={delta.name})',
-            f'{cdf.name} = NKIActivation(op="copy", bias=0.5)(data={signed.name})',
-            f'{target.name} = NKITensorTensor(op="multiply")(data1={source.name}, data2={cdf.name})',
+            f'{polynomial_0.name} = NKIActivation(op="copy", scale=-0.00012687359622193486, '
+            f"bias=0.00046550246152931305)(data={squared.name})",
+            f'{product.name} = NKITensorTensor(op="multiply")' f"(data1={polynomial_0.name}, data2={squared.name})",
+            f'{polynomial_1.name} = NKIScalarTensorTensor(op0="add", op1="multiply")'
+            f"(data={product.name}, operand0=-6.871650057892193e-05, operand1={squared.name})",
+            f'{exponential.name} = NKIActivation(op="exp", scale=-0.5461375669722928)(data={squared.name})',
+            f'{correction.name} = NKITensorTensor(op="multiply")'
+            f"(data1={polynomial_1.name}, data2={exponential.name})",
+            f'{approximate.name} = NKIActivation(op="gelu", scale=1.0)(data={source.name})',
+            f'{target.name} = NKITensorTensor(op="add")(data1={approximate.name}, data2={correction.name})',
         )
     )
     return target

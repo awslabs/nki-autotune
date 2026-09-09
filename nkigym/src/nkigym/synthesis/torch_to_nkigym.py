@@ -38,17 +38,21 @@ from nkigym.codegen.torch_values import emit_activation, emit_cast, emit_cumsum,
 from nkigym.codegen.torch_wide_topk import emit_wide_topk
 from nkigym.ir import build_initial_ir
 from nkigym.ir.dimension_analysis import _DIMENSION_TRACE_LOCK, analyze_dimensions
+from nkigym.ir.operand_layout import CanonicalTileError
 from nkigym.ops import _OP_MODULES
 from nkigym.ops.dma_transpose import emit_oriented_value
+from nkigym.ops.float32_scale import emit_tensor_scalar_or_divide
 from nkigym.ops.gather import emit_routed_gather
+from nkigym.ops.grouped_counts_copy import emit_bincount_source, emit_grouped_bincount
 from nkigym.ops.grouped_load import emit_output_stores, emit_rotational_topk
+from nkigym.ops.grouped_vector_store import emit_grouped_cross_entropy
 from nkigym.ops.index_iota import emit_packed_topk_indices
+from nkigym.ops.reciprocal import emit_activation_or_reciprocal
 from nkigym.ops.stream_shuffle_broadcast import _stream_shuffle_source, _supports_free_broadcast
 from nkigym.ops.tensor_scalar import _tensor_scalar_operands, _vector_broadcast
 from nkigym.ops.tiled_grouped_matmul import lower_grouped_attention
 from nkigym.profile import InputSpecs
 from nkigym.profile.abi import adapt_inputs, adapt_output, kernel_adapters, reference_graph
-from nkigym.search.axis_groups import CanonicalTileError
 from nkigym.synthesis.artifact import ArrayResult, SynthesizedKernel, _exec_nkigym_source, _results_match
 
 _UNARY_OPERATIONS = {name: name for name in "exp log reciprocal rsqrt sqrt square tanh sigmoid silu".split()}
@@ -75,7 +79,7 @@ class _Program:
     edge_axes: dict[str, frozenset[int]]
     output_shapes: tuple[tuple[int, ...], ...]
     output_groups: tuple[int, ...]
-    sort_topk_output: bool
+    sort_topk_output: bool | None
 
 
 class _Lowerer:
@@ -87,9 +91,10 @@ class _Lowerer:
         self.imports = {"NKILoad", "NKIStore"}
         self.body: list[str] = []
         self.values: dict[Node, _Value | _Segments | float | tuple[_Value | _Segments, ...]] = {}
+        self.logsumexp_values: dict[str, _Value] = {}
         self.outputs: tuple[_Value, ...] = ()
         self.output_groups: tuple[int, ...] = ()
-        self.sort_topk_output = False
+        self.sort_topk_output: bool | None = None
 
     def build(self) -> str:
         """Lower every FX node and render one decorated function."""
@@ -259,7 +264,7 @@ class _Lowerer:
 
     def _activate(self, source: _Value, operation: str, name: str, scale: float = 1.0) -> _Value:
         """Emit one unary activation value."""
-        return emit_activation(source, operation, name, scale, self.body, self.imports)
+        return emit_activation_or_reciprocal(source, operation, name, scale, self.body, self.imports)
 
     def _cast(self, source: _Value, class_name: str, name: str) -> _Value:
         """Emit one activation-backed dtype cast."""
@@ -393,14 +398,11 @@ class _Lowerer:
         self, left: _Value | float, right: _Value | float, operation: str, target_name: str, node: Node
     ) -> _Value:
         """Emit one non-segmented tensor binary operation."""
-        if operation == "divide":
-            if isinstance(left, _Value) and isinstance(right, _Value):
-                operation = "multiply"
-                right = self._activate(right, "reciprocal", f"sbuf_{node.name}_reciprocal")
-            elif isinstance(left, _Value) and isinstance(right, float):
-                operation, right = "multiply", 1.0 / right
-            elif not isinstance(left, _Value) or not isinstance(right, (_Value, float)):
+        if operation == "divide" and isinstance(right, _Value):
+            if not isinstance(left, _Value):
                 raise ValueError("Torch division requires a tensor numerator")
+            operation = "multiply"
+            right = self._activate(right, "reciprocal", f"sbuf_{node.name}_reciprocal")
         if isinstance(left, _Value) and isinstance(right, _Value) and left.shape == right.shape:
             left = self._orient(left, False, node, "_left")
             right = self._orient(right, False, node, "_right")
@@ -431,12 +433,8 @@ class _Lowerer:
                 transposed, operand = tensor.transposed, repr(scalar)
             if operation not in {"add", "divide", "greater_equal", "less", "maximum", "subtract", "multiply"}:
                 raise ValueError(f"NKITensorScalar does not support {operation}")
-            target = _Value(target_name, tensor.shape, transposed=transposed)
-            reverse_argument = ", reverse0=True" if reverse and operation == "subtract" else ""
-            self.imports.add("NKITensorScalar")
-            self.body.append(
-                f'{target.name} = NKITensorScalar(op0="{operation}"{reverse_argument})'
-                f"(data={tensor.name}, operand0={operand})"
+            target = emit_tensor_scalar_or_divide(
+                tensor, operation, operand, reverse, target_name, self.body, self.imports
             )
         return target
 
@@ -533,6 +531,8 @@ class _Lowerer:
 
     def _emit_logsumexp(self, source: _Value, node: Node) -> _Value:
         """Emit max-shifted exponential reduction and logarithm."""
+        if cached := self.logsumexp_values.get(source.name):
+            return cached
         source = self._orient(source, False, node, "_logsumexp_data")
         base = f"sbuf_{node.name}"
         maximum = self._reduce(source, f"{base}_maximum", "copy", "max")
@@ -548,23 +548,15 @@ class _Lowerer:
         return target
 
     def _lower_cross_entropy(self, node: Node) -> None:
-        """Lower unreduced cross entropy against one-hot targets."""
+        """Lower grouped unreduced cross entropy against integer targets."""
         logits, targets = (self._value(cast(Node, argument)) for argument in node.args[:2])
-        if logits.shape != targets.shape or node.kwargs.get("reduction") != "none":
-            raise ValueError("Torch cross_entropy requires matching rank-two inputs and reduction='none'")
-        logits = self._orient(logits, False, node, "_logits")
-        targets = self._orient(targets, False, node, "_targets")
-        product, selected = f"sbuf_{node.name}_product", f"sbuf_{node.name}_selected"
-        loss = _Value(f"sbuf_{node.name}", (logits.shape[0],))
-        lse = self._emit_logsumexp(logits, node)
-        self.imports.update(("NKIActivationReduce", "NKITensorScalar", "NKITensorTensor"))
-        self.body.extend(
-            (
-                f'{product} = NKITensorTensor(op="multiply")(data1={logits.name}, data2={targets.name})',
-                f'{selected} = NKIActivationReduce(op="copy", reduce_op="add")(data={product})',
-                f'{loss.name} = NKITensorScalar(op0="subtract")(data={lse.name}, operand0={selected})',
-            )
-        )
+        target_shape = len(targets.shape) == 2 and targets.shape[0] == logits.shape[0]
+        if len(logits.shape) != 2 or not target_shape or node.kwargs.get("reduction") != "none":
+            raise ValueError("Torch cross_entropy requires packed rank-two logits and row targets")
+        if not logits.is_hbm:
+            raise ValueError("Torch cross_entropy logits must remain in HBM until grouped loading")
+        loss, lse = emit_grouped_cross_entropy(logits, targets, node.name, self.body, self.imports)
+        self.logsumexp_values[logits.name] = lse
         self.values[node] = loss
 
     def _lower_cross_entropy_backward(self, node: Node) -> None:
@@ -602,15 +594,12 @@ class _Lowerer:
         if source.shape != (1, columns * tokens):
             raise ValueError("nonzero compaction requires one flattened row per logical column")
         self.imports.add("NKINonzeroWithCount")
-        values = []
-        for column in range(columns):
-            chunk = self._slice_value(source, column * tokens, tokens, node, f"_column_{column}")
-            value = _Value(f"sbuf_{node.name}_output_{column}", (1, tokens + 1))
-            self.body.append(
-                f"{value.name} = NKINonzeroWithCount(input_width={tokens}, output_width={tokens + 1})(src={chunk.name})"
-            )
-            values.append(value)
-        self.values[node] = _Segments(tuple(values))
+        value = _Value(f"sbuf_{node.name}_output", (1, columns * (tokens + 1)))
+        self.body.append(
+            f"{value.name} = NKINonzeroWithCount(columns={columns}, input_width={tokens}, "
+            f"output_width={tokens + 1})(src={source.name})"
+        )
+        self.values[node] = value
 
     def _lower_moe_experts(self, node: Node) -> None:
         """Lower tiled selected-expert MLP evaluation."""
@@ -621,10 +610,13 @@ class _Lowerer:
 
     def _lower_bincount(self, node: Node) -> None:
         """Lower grouped histogram metadata with replicated threshold reductions."""
-        source = self._cast(self._value(cast(Node, node.args[0])), "NKIFloat32Cast", f"sbuf_{node.name}_data")
+        source = emit_bincount_source(self._value(cast(Node, node.args[0])), node.name, self.body, self.imports)
         groups, experts = int(node.kwargs["groups"]), int(node.kwargs["minlength"])
         if source.shape[0] != 128 or groups < 1 or experts % groups:
             raise ValueError("grouped bincount requires 128 replicated rows and experts divisible by groups")
+        if groups > 128 and groups == experts:
+            self.values[node] = emit_grouped_bincount(source, node.name, groups, experts, self.body, self.imports)
+            return
         group_size, outputs = experts // groups, ([], [], [])
         self.imports.update(("NKIActivationReduce", "NKIIota"))
         for start in range(0, groups, 128):
@@ -652,6 +644,7 @@ class _Lowerer:
         """Lower an exact descending top-k selection."""
         source = self._value(cast(Node, node.args[0]))
         k = node.kwargs.get("k", node.args[1] if len(node.args) > 1 else None)
+        self.sort_topk_output = bool(self.sort_topk_output) or not bool(node.kwargs.get("sorted", True))
         if isinstance(config := node.kwargs.get("rotational_config"), tuple) and isinstance(k, int):
             layout = cast(tuple[int, int, int, int, int], config)
             self.values[node] = emit_rotational_topk(
@@ -663,13 +656,10 @@ class _Lowerer:
                 source, int(k), int(node.kwargs["wide_width"]), node.name, self.body, self.imports
             )
             return
-        dimension, largest, sorted_output = (
-            node.kwargs.get(name, default) for name, default in (("dim", -1), ("largest", True), ("sorted", True))
-        )
+        dimension, largest = (node.kwargs.get(name, default) for name, default in (("dim", -1), ("largest", True)))
         valid_k = isinstance(k, int) and 1 <= k <= source.shape[1]
         if len(source.shape) != 2 or not valid_k or dimension not in {-1, 1} or not largest:
             raise ValueError("Torch topk requires rank two, valid k, dim=-1, and largest=True")
-        self.sort_topk_output |= not sorted_output
         self.values[node] = self._emit_topk(source, k, node)
 
     def _lower_sparse_topk_affinity(self, node: Node) -> None:
@@ -735,7 +725,7 @@ class _Lowerer:
         source_node = cast(Node, node.args[0])
         descending = bool(node.kwargs.get("descending", False))
         if _operation_name(source_node.target) == "neg" and not descending and len(source_node.users) == 1:
-            source = self._value(cast(Node, source_node.args[0]))
+            source = self._value(source_node := cast(Node, source_node.args[0]))
         elif descending:
             source = self._value(source_node)
         else:
@@ -747,10 +737,9 @@ class _Lowerer:
             raise ValueError("Torch argsort requires one static prefix width")
         if not isinstance(width := widths.pop(), int) or width < 1 or width > source.shape[1]:
             raise ValueError("Torch argsort prefix width is invalid")
-        routed = any(c.target is routed_gather for u in node.users for c in u.users)
         self.values[node] = (
             emit_packed_topk_indices(source, width, node.name, self.body, self.imports)
-            if routed and len(source_node.users) == 1 and source.shape[0] <= 128 and width % 8 == 0
+            if len(source_node.users) == 1 and source.shape[0] <= 128 and width % 8 == 0
             else self._emit_topk(source, width, node)[1]
         )
 
@@ -780,9 +769,12 @@ class _Lowerer:
         groups: list[int] = []
         for item in leaves:
             value = self.values[item]
+            shape = tuple(getattr(item.meta.get("tensor_meta", item.meta.get("example_value")), "shape", ()))
             segments = value.values if isinstance(value, _Segments) else (self._value(item),)
+            preserve_orientation = len(shape) == 4 and shape[0] == 128 and np.prod(segments[0].shape) == np.prod(shape)
             outputs.extend(
-                self._orient(segment, False, item, f"_output_{index}") for index, segment in enumerate(segments)
+                (segment if preserve_orientation else self._orient(segment, False, item, f"_output_{index}"))
+                for index, segment in enumerate(segments)
             )
             groups.append(-len(segments) if isinstance(value, _Segments) and value.axis == 0 else len(segments))
         self.outputs, self.output_groups = tuple(outputs), tuple(groups)
@@ -861,7 +853,11 @@ def synthesize_torch_to_nkigym(
         and tuple(sorted(cast(tuple[int, ...], transform))) == tuple(range(len(transform)))
         for name, (transform, _shape) in input_layouts.items()
     )
-    has_input_permutation = has_topk or output_layout in {"grouped_context", "token_attention"} or has_input_permutation
+    has_input_permutation = (
+        has_topk
+        or output_layout in {"cross_entropy_rows", "grouped_context", "token_attention"}
+        or has_input_permutation
+    )
     validation_specs = input_specs if has_input_permutation else _validation_specs(input_specs)
     validation_graph = _trace_torch(f_torch, validation_specs)
     validation_layouts = discover_input_layouts(validation_graph)
@@ -925,7 +921,7 @@ def _lower_program(graph_module: GraphModule, input_specs: InputSpecs) -> _Progr
             function,
             normalized,
             {name: frozenset(axes) for name, axes in edge_axes.items()},
-            tuple(value.shape for value in lowerer.outputs),
+            tuple(tuple(reversed(value.shape)) if value.transposed else value.shape for value in lowerer.outputs),
             lowerer.output_groups,
             lowerer.sort_topk_output,
         )

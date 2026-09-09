@@ -25,10 +25,8 @@ from nkigym.profile.ssh import _SSH_OPTIONS, SSHTransportError, _CommandRunner, 
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
-_SSH_WORKER_OPTIONS = (*_SSH_OPTIONS, "-n", "-o", "ControlMaster=no", "-o", "ControlPath=none")
+_SSH_WORKER_OPTIONS = (*_SSH_OPTIONS, "-n")
 _REMOTE_PYTHON = '"$HOME"/venvs/kernel-env/bin/python'
-_REMOTE_RUN_ROOT = ".cache/nkigym-simulate/runs"
-_WORKER_SOURCE = Path(__file__).with_name("simulate_nki_worker.py")
 ArrayResult = np.ndarray | tuple[np.ndarray, ...]
 _SerializedCase = tuple[int, str, str, str, dict[str, np.ndarray], ArrayResult]
 
@@ -176,13 +174,13 @@ def _detect_host_cpu_count(host: str) -> int:
         check=False,
     )
     if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        raise RuntimeError(f"detecting CPU count on {host} failed with exit {completed.returncode}: {detail}")
-    raw_count = completed.stdout.strip()
+        raise RuntimeError(
+            f"detecting CPU count on {host} failed with exit {completed.returncode}: {completed.stderr.strip() or completed.stdout.strip()}"
+        )
     try:
-        cpu_count = int(raw_count)
+        cpu_count = int(completed.stdout.strip())
     except ValueError as error:
-        raise RuntimeError(f"detecting CPU count on {host} returned {raw_count!r}") from error
+        raise RuntimeError(f"detecting CPU count on {host} returned {completed.stdout.strip()!r}") from error
     if cpu_count <= 0:
         raise RuntimeError(f"detecting CPU count on {host} returned {cpu_count}")
     return cpu_count
@@ -190,43 +188,48 @@ def _detect_host_cpu_count(host: str) -> int:
 
 def _deduplicate_cases(cases: list[FP32SimulationCase]) -> list[tuple[int, FP32SimulationCase]]:
     """Keep the earliest state for each exact kernel and shared input set."""
-    unique: list[tuple[int, FP32SimulationCase]] = []
-    seen: set[tuple[str, str, int, int]] = set()
+    unique: dict[tuple[str, str, int, int], tuple[int, FP32SimulationCase]] = {}
     for index, case in enumerate(cases):
-        identity = (case.kernel, case.func_name, id(case.inputs), id(case.expected))
-        if identity not in seen:
-            seen.add(identity)
-            unique.append((index, case))
-    return unique
+        unique.setdefault((case.kernel, case.func_name, id(case.inputs), id(case.expected)), (index, case))
+    return list(unique.values())
 
 
 def _partition_cases(
     host_capacities: list[tuple[str, int]], cases: list[tuple[int, FP32SimulationCase]]
 ) -> list[tuple[str, int, list[_SerializedCase]]]:
-    """Balance cases across remote CPU capacity by source and input volume."""
+    """Balance shared-input case groups across remote CPU capacity."""
 
-    def case_weight(case: FP32SimulationCase) -> int:
-        """Estimate remote work from rendered code and copied tensor bytes."""
-        return len(case.kernel) + sum(value.nbytes for value in case.inputs.values()) // 1024
+    def group_weight(group: list[tuple[int, FP32SimulationCase]]) -> int:
+        """Estimate loop-expanded simulation work for one shared-input group."""
+        return sum(sum(16 ** (s.find("nisa") // 4) for s in c.kernel.splitlines() if "nisa." in s) for _, c in group)
 
-    ranked_hosts = sorted(enumerate(host_capacities), key=lambda item: (-item[1][1], item[0]))
-    active_hosts = [capacity for _index, capacity in ranked_hosts[: min(len(host_capacities), len(cases))]]
+    grouped: dict[tuple[int, int], list[tuple[int, FP32SimulationCase]]] = {}
+    for indexed_case in cases:
+        grouped.setdefault((id((case := indexed_case[1]).inputs), id(case.expected)), []).append(indexed_case)
+
+    active_hosts = sorted(host_capacities, key=lambda item: -item[1])[: min(len(host_capacities), len(cases))]
     assigned: list[list[tuple[int, FP32SimulationCase]]] = [[] for _host in active_hosts]
     weights = [0 for _host in active_hosts]
-    weighted_cases = sorted(cases, key=lambda item: (-case_weight(item[1]), item[0]))
-    for indexed_case in weighted_cases:
-        host_index = min(
-            range(len(active_hosts)), key=lambda index: (weights[index] / active_hosts[index][1], weights[index], index)
-        )
-        assigned[host_index].append(indexed_case)
-        weights[host_index] += case_weight(indexed_case[1])
+    for group in grouped.values():
+        small = sum(value.nbytes for value in group[0][1].inputs.values()) < 1 << 28
+        count = min(len(group), len(active_hosts)) if small else 1
+        selected: set[int] = set()
+        for chunk in (group[index::count] for index in range(count)):
+            host_index = min(
+                range(len(active_hosts)),
+                key=lambda index: (index in selected, weights[index] / active_hosts[index][1], weights[index], index),
+            )
+            selected.add(host_index)
+            assigned[host_index].extend(chunk)
+            weights[host_index] += group_weight(chunk)
     partitions = []
     for (host, cpu_count), host_cases in zip(active_hosts, assigned, strict=True):
         serialized = [
             (index, case.label, case.kernel, case.func_name, case.inputs, case.expected)
             for index, case in sorted(host_cases, key=lambda item: item[0])
         ]
-        partitions.append((host, min(cpu_count, len(serialized)), serialized))
+        if serialized:
+            partitions.append((host, min(cpu_count, len(serialized)), serialized))
     return partitions
 
 
@@ -236,8 +239,7 @@ def _write_requests(
     """Write one request bundle and result path per host."""
     requests: list[tuple[str, Path, Path]] = []
     for index, (host, worker_count, cases) in enumerate(partitions):
-        host_directory = directory / f"host-{index}"
-        host_directory.mkdir()
+        (host_directory := directory / f"host-{index}").mkdir()
         request_path, result_path = host_directory / "request.pkl", host_directory / "result.json"
         with request_path.open("wb") as request_file:
             pickle.dump((cases, atol, rtol, worker_count), request_file, protocol=pickle.HIGHEST_PROTOCOL)
@@ -247,10 +249,12 @@ def _write_requests(
 
 def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_s: int) -> _HostResult:
     """Upload and execute one host partition, then parse its result."""
-    remote_run = f"{_REMOTE_RUN_ROOT}/{time.time_ns()}-{os.getpid()}-{secrets.token_hex(4)}"
+    remote_run = f".cache/nkigym-simulate/runs/{time.time_ns()}-{os.getpid()}-{secrets.token_hex(4)}"
     rsync_shell = shlex.join(("ssh", *_SSH_OPTIONS))
     runner = _CommandRunner(timeout_s)
-    failure: SSHTransportError | None = None
+    if request_path.stat().st_size >= 1 << 30:
+        subprocess.run(("pigz", "-1", "-f", str(request_path)), check=True)
+        request_path = Path(f"{request_path}.gz")
     try:
         runner.run(
             "Checking remote simulation environment",
@@ -270,10 +274,10 @@ def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_
             "Uploading simulation batch",
             [
                 "rsync",
-                "-a",
+                "-az" if request_path.stat().st_size >= 1 << 30 else "-a",
                 "-e",
                 rsync_shell,
-                str(_WORKER_SOURCE.resolve()),
+                str(Path(__file__).with_name("simulate_nki_worker.py").resolve()),
                 str(request_path),
                 f"{host}:{remote_run}/",
             ],
@@ -287,12 +291,9 @@ def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_
             None,
         )
     except SSHTransportError as error:
-        failure = error
+        raise RuntimeError(f"SSH batch simulation failed for {host}: {error}\n{runner.log[-5000:]}") from error
     finally:
         runner.cleanup(host, remote_run, True)
-    if failure is not None:
-        detail = runner.log[-5000:]
-        raise RuntimeError(f"SSH batch simulation failed for {host}: {failure}\n{detail}") from failure
     return _read_host_result(host, result_path)
 
 
@@ -304,15 +305,14 @@ def _start_remote_worker(host: str, remote_run: str, runner: _CommandRunner) -> 
         f'--worker "$HOME"/{remote_run}/request.pkl '
         f'"$HOME"/{remote_run}/result.json'
     )
-    process_group_path = f'"$HOME"/{remote_run}/worker.pgid'
     script = (
-        f'printf "%s\\n" "$$" > {process_group_path}; '
+        f'test ! -f "$HOME"/{remote_run}/request.pkl.gz || gzip -df "$HOME"/{remote_run}/request.pkl.gz; printf "%s\\n" "$$" > "$HOME"/{remote_run}/worker.pgid; '
         f'{worker}; status=$?; printf "%s\\n" "$status" > "$HOME"/{remote_run}/worker.exit'
     )
     launch = f"setsid -f sh -c {shlex.quote(script)} " f'>"$HOME"/{remote_run}/worker.log 2>&1 < /dev/null'
     command = (
         f'{launch}; attempts=0; while test "$attempts" -lt 100; do '
-        f"test -s {process_group_path} && exit 0; "
+        f'test -s "$HOME"/{remote_run}/worker.pgid && exit 0; '
         "attempts=$((attempts + 1)); sleep 0.1; done; exit 1"
     )
     runner.run("Starting remote simulation worker", ["ssh", *_SSH_WORKER_OPTIONS, host, command], None)
@@ -362,7 +362,7 @@ def _wait_for_remote_result(host: str, remote_run: str, runner: _CommandRunner) 
             )
         if state != "pending":
             raise SSHTransportError(f"remote simulation worker returned malformed state {state!r}", runner.log)
-        time.sleep(min(5.0, remaining_s))
+        time.sleep(min(0.25, remaining_s))
 
 
 def _read_host_result(host: str, result_path: Path) -> _HostResult:
@@ -403,7 +403,5 @@ def _raise_batch_failure(results: list[_HostResult]) -> None:
     failures = [(result.host, result.failure) for result in results if result.failure is not None]
     if failures:
         host, failure = min(failures, key=lambda item: item[1].case_index)
-        message = f"{failure.label}\nremote host: {host}\n{failure.traceback}"
-        if failure.exception_type == "AssertionError":
-            raise AssertionError(message)
-        raise RuntimeError(message)
+        error_type = AssertionError if failure.exception_type == "AssertionError" else RuntimeError
+        raise error_type(f"{failure.label}\nremote host: {host}\n{failure.traceback}")

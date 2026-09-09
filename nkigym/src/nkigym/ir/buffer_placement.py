@@ -1,4 +1,4 @@
-"""Lifetime-safe LCA buffer placement over a :class:`KernelTree`.
+"""Provide lifetime-safe buffer placement over a :class:`KernelTree`.
 
 Each :class:`Buffer` starts from the lowest common ancestor of every block
 that reads or writes it. If that block is nested under a loop, the declaration
@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from math import gcd, lcm
 
-from nkigym.ir.arith.expr import Const, to_affine
+from nkigym.ir.arith.expr import Const, affine_coefficient
 from nkigym.ir.dimension_analysis import TensorDims
 from nkigym.ir.graph_index import ordered_tree_topology
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree, partition_extent
@@ -258,16 +258,17 @@ def _anchor_loop_nids_from_regions(
 def _offsets_consistently(loop_var: str, regions: list[BufferRegion]) -> bool:
     """Return whether ``loop_var`` has one coefficient per axis across all regions."""
     n_axes = max(len(region.ranges) for region in regions)
-    return all(len({_axis_coeff(region, axis, loop_var) for region in regions}) == 1 for axis in range(n_axes))
+    coefficients = [[_axis_coeff(region, axis, loop_var) for region in regions] for axis in range(n_axes)]
+    return all(None not in axis_coefficients and len(set(axis_coefficients)) == 1 for axis_coefficients in coefficients)
 
 
-def _axis_coeff(region: BufferRegion, axis: int, loop_var: str) -> int:
-    """Return ``loop_var``'s coefficient in one region-axis lower bound."""
-    coeff = 0
+def _axis_coeff(region: BufferRegion, axis: int, loop_var: str) -> int | None:
+    """Return one affine coefficient, or ``None`` when it cannot be proven."""
+    coefficient = 0
     if axis < len(region.ranges):
         lower, _width = region.ranges[axis]
-        coeff = to_affine(lower).get(loop_var, 0)
-    return coeff
+        coefficient = affine_coefficient(lower, loop_var)
+    return coefficient
 
 
 def _regions_by_tensor(tree: KernelTree, tensors: frozenset[str]) -> dict[str, list[tuple[int, BufferRegion]]]:
@@ -291,13 +292,3 @@ def _lca(nids: set[int], ancestors: dict[int, tuple[int, ...]]) -> int:
         return next(iter(nids))
     paths = [(*ancestors[nid], nid) for nid in nids]
     return next(level[0] for level in reversed(tuple(zip(*paths))) if len(set(level)) == 1)
-
-
-__all__ = [
-    "buffer_placement_targets",
-    "collect_buffers",
-    "layout_satisfies_alignment",
-    "layout_satisfies_output_alignment",
-    "place_buffer",
-    "place_buffers",
-]

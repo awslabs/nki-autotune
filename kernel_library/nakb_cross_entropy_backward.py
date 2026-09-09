@@ -94,7 +94,7 @@ WORKLOADS = (
         "atol": 1e-05,
         "rtol": 1e-05,
         "nakb_latency_ms": 0.051545753,
-        "best_historical_latency_ms": 0.051545753,
+        "best_nkigym_latency_ms": 0.051545753,
     },
     {
         "torch_ref": _torch_ref_0,
@@ -103,7 +103,7 @@ WORKLOADS = (
         "atol": 1e-05,
         "rtol": 1e-05,
         "nakb_latency_ms": 3.409941339,
-        "best_historical_latency_ms": 3.409941339,
+        "best_nkigym_latency_ms": 3.409941339,
     },
     {
         "torch_ref": _torch_ref_0,
@@ -112,7 +112,7 @@ WORKLOADS = (
         "atol": 1e-05,
         "rtol": 1e-05,
         "nakb_latency_ms": 4.655005227,
-        "best_historical_latency_ms": 4.655005227,
+        "best_nkigym_latency_ms": 4.655005227,
     },
     {
         "torch_ref": _torch_ref_0,
@@ -121,7 +121,7 @@ WORKLOADS = (
         "atol": 1e-05,
         "rtol": 1e-05,
         "nakb_latency_ms": 8.034641613,
-        "best_historical_latency_ms": 8.034641613,
+        "best_nkigym_latency_ms": 8.034641613,
     },
     {
         "torch_ref": _torch_ref_1,
@@ -130,6 +130,6 @@ WORKLOADS = (
         "atol": 1e-05,
         "rtol": 1e-05,
         "nakb_latency_ms": 4.811285816,
-        "best_historical_latency_ms": 4.811285816,
+        "best_nkigym_latency_ms": 4.811285816,
     },
 )

@@ -52,16 +52,6 @@ _I32_MAX = 2**31 - 1
 """Upper limit of ``Everything(int32)`` (``const_int_bound.cc`` ~line 724)."""
 
 
-def _floordiv(a: int, b: int) -> int:
-    """Floor division matching ``arith::floordiv`` (Python ``//`` is already floor)."""
-    return a // b
-
-
-def _floormod(a: int, b: int) -> int:
-    """Floor modulo matching ``arith::floormod`` (Python ``%`` is already floor)."""
-    return a % b
-
-
 def _inf_aware_add(x: int, y: int) -> int:
     """Compute ``x + y`` aware of inf, mirroring ``InfAwareAdd`` (``const_int_bound.cc`` ~line 578).
 
@@ -91,10 +81,8 @@ def _inf_aware_mul(x: int, y: int) -> int:
     product never collides with the sentinel (the same assumption the Add helper
     documents).
     """
-    x_inf = x == _POS_INF or x == _NEG_INF
-    y_inf = y == _POS_INF or y == _NEG_INF
     result: int
-    if not x_inf and not y_inf:
+    if x not in (_POS_INF, _NEG_INF) and y not in (_POS_INF, _NEG_INF):
         result = x * y
     elif (x > 0 and y > 0) or (x < 0 and y < 0):
         result = _POS_INF
@@ -116,7 +104,7 @@ def _inf_aware_floordiv(x: int, y: int) -> int:
     if x == _POS_INF or x == _NEG_INF:
         result = x if y > 0 else -x
     else:
-        result = _floordiv(x, y)
+        result = x // y
     return result
 
 
@@ -323,7 +311,7 @@ class RewriteSimplifier:
         if isinstance(a, Const) and isinstance(b, Const):
             if b.value == 0:
                 raise ZeroDivisionError("FloorDiv by zero")
-            result = Const(value=_floordiv(a.value, b.value))
+            result = Const(value=a.value // b.value)
         elif isinstance(a, Const) and a.value == 0:
             result = a
         elif isinstance(b, Const) and b.value == 1:
@@ -346,13 +334,13 @@ class RewriteSimplifier:
             x, c1 = match
             c2 = b.value
             residue_expr = FloorDiv(
-                left=Add(left=Mul(left=x, right=Const(value=_floormod(c1, c2))), right=Const(value=_floormod(0, c2))),
-                right=Const(value=c2),
+                left=Add(left=Mul(left=x, right=Const(value=c1 % c2)), right=Const(value=0 % c2)), right=Const(value=c2)
             )
-            residue = self.simplify(residue_expr)
-            if isinstance(residue, Const):
-                quotient = Mul(left=x, right=Const(value=_floordiv(c1, c2)))
-                result = Add(left=quotient, right=Add(left=Const(value=0), right=residue))
+            if c1 % c2 != c1:
+                residue = self.simplify(residue_expr)
+                if isinstance(residue, Const):
+                    quotient = Mul(left=x, right=Const(value=c1 // c2))
+                    result = Add(left=quotient, right=Add(left=Const(value=0), right=residue))
         return result
 
     def _visit_mod(self, op: Mod) -> Expr:
@@ -397,7 +385,7 @@ class RewriteSimplifier:
         if match is not None and isinstance(b, Const) and b.value != 0:
             x, c1 = match
             c2 = b.value
-            reduced = self._visit_mul(Mul(left=x, right=Const(value=_floormod(c1, c2))))
+            reduced = self._visit_mul(Mul(left=x, right=Const(value=c1 % c2)))
             result = Mod(left=reduced, right=Const(value=c2))
         return result
 
@@ -410,7 +398,7 @@ class RewriteSimplifier:
         if isinstance(a, Const) and isinstance(b, Const):
             if b.value == 0:
                 raise ZeroDivisionError("Mod by zero")
-            result = Const(value=_floormod(a.value, b.value))
+            result = Const(value=a.value % b.value)
         elif isinstance(a, Const) and a.value == 0:
             result = a
         elif isinstance(b, Const) and b.value == 1:
@@ -434,7 +422,7 @@ class RewriteSimplifier:
             y_div = self.simplify(FloorDiv(left=y, right=Const(value=c1)))
             condition = c1 > 0 and c2 > 0 and c2 % c1 == 0 and y_div == Const(value=0)
             if condition:
-                inner = Mod(left=x, right=Const(value=_floordiv(c2, c1)))
+                inner = Mod(left=x, right=Const(value=c2 // c1))
                 result = Add(left=Mul(left=inner, right=Const(value=c1)), right=y)
         return result
 
@@ -654,6 +642,3 @@ def _match_mul_const_plus(expr: Expr) -> tuple[Expr, int, Expr] | None:
             x, c1 = left_match
             result = (x, c1, expr.right)
     return result
-
-
-__all__ = ["RewriteSimplifier"]

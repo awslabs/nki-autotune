@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from nkigym.ir.arith.expr import Const, Expr, substitute, to_affine
+from nkigym.ir.arith.analyzer import Analyzer
+from nkigym.ir.arith.expr import Const, Expr, substitute
+from nkigym.ir.buffer_placement import _anchor_loop_nids_from_regions, _regions_by_tensor
 from nkigym.ir.graph_index import ordered_tree_topology
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
-from nkigym.search.buffer_placement import _anchor_loop_nids_from_regions, _regions_by_tensor
 
 
 def compact_buffer_shapes(tree: KernelTree, tensors: frozenset[str]) -> dict[str, Buffer]:
@@ -76,11 +77,12 @@ def _axis_span(
     """
     assert isinstance(width, Const), f"region width must be Const; got {width!r}"
     zeroed = substitute(lo, {a: Const(value=0) for a in anchors})
-    coeffs = to_affine(zeroed)
-    hi = coeffs.get(None, 0)
-    for var, coeff in coeffs.items():
-        if var is not None and coeff > 0:
-            hi += coeff * (extents.get(var, 1) - 1)
+    analyzer = Analyzer()
+    for var, extent in extents.items():
+        analyzer.bind(var, 0, extent)
+    _lo, hi = analyzer.const_int_bound(zeroed)
+    if hi is None:
+        raise ValueError(f"cannot bound compacted buffer index {zeroed!r}")
     is_partition = axis == 0 and location in ("sbuf", "psum") and width.value == partition
     if is_partition:
         return (hi + 1) * partition

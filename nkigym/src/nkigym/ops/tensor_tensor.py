@@ -11,7 +11,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
+from nkigym.ops.base import NKIOp, PartitionTileBatchingContract, PointwiseContract, _operand_role
 
 _OPS: dict[str, Any] = {
     "add": np.add,
@@ -45,6 +45,11 @@ class NKITensorTensor(NKIOp):
             input_operands=("data1", "data2"),
             output_operand="dst",
         )
+
+    @classmethod
+    def partition_tile_batching_contract(cls, kwargs: Mapping[str, Any]) -> PartitionTileBatchingContract | None:
+        """Allow additive peer completion to span contiguous physical tiles."""
+        return PartitionTileBatchingContract(operands=("data1", "data2", "dst")) if kwargs.get("op") == "add" else None
 
     def _check_roles(self, **kwargs: Any) -> None:
         """Allow a PSUM first input while requiring an SBUF second input."""

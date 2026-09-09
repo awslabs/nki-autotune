@@ -117,6 +117,3 @@ def _as_int(endpoint: Expr) -> int:
     if not isinstance(endpoint, Const):
         raise TypeError(f"IntSet endpoint is not a Const: {endpoint!r}")
     return endpoint.value
-
-
-__all__ = ["IntSet"]

@@ -69,6 +69,6 @@ WORKLOADS = (
         "atol": 1e-05,
         "rtol": 1e-05,
         "nakb_latency_ms": 1.393264489,
-        "best_historical_latency_ms": 1.393264489,
+        "best_nkigym_latency_ms": 1.393264489,
     },
 )

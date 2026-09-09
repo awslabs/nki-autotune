@@ -118,6 +118,22 @@ class EQ(InternedValue):
 Expr = Const | Var | Add | Sub | Mul | FloorDiv | Mod | Min | Max | LT | LE | EQ
 
 
+def expr_variables(expr: Expr) -> frozenset[str]:
+    """Return all variable names occurring anywhere in one expression."""
+    if isinstance(expr, (Const, Var)):
+        return frozenset((expr.name,)) if isinstance(expr, Var) else frozenset()
+    return expr_variables(expr.left) | expr_variables(expr.right)
+
+
+def affine_coefficient(expr: Expr, variable: str) -> int | None:
+    """Return one affine coefficient, or ``None`` when it cannot be proven."""
+    try:
+        coefficient = to_affine(expr).get(variable, 0)
+    except NonAffineError:
+        coefficient = None if variable in expr_variables(expr) else 0
+    return coefficient
+
+
 def to_affine(expr: Expr) -> dict[str | None, int]:
     """Collapse ``expr`` to canonical affine form ``c0 + c1*v1 + c2*v2 + ...``.
 
@@ -363,26 +379,3 @@ def _format_raw_at_precedence(expr: Expr, parent_precedence: int, group_equal_pr
         raise TypeError(f"Unknown Expr node {type(expr).__name__}")
     needs_parentheses = precedence < parent_precedence or (group_equal_precedence and precedence == parent_precedence)
     return f"({result})" if needs_parentheses else result
-
-
-__all__ = [
-    "Add",
-    "Const",
-    "EQ",
-    "Expr",
-    "FloorDiv",
-    "LE",
-    "LT",
-    "Max",
-    "Min",
-    "Mod",
-    "Mul",
-    "NonAffineError",
-    "Sub",
-    "Var",
-    "affine_terms",
-    "format_expr",
-    "from_affine",
-    "substitute",
-    "to_affine",
-]

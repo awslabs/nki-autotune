@@ -25,7 +25,6 @@ from nkigym.ir.recurrence import _build_match, _compatible_block, _evaluate, _Ma
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole, BilinearReductionContract, ReductionContract
 from nkigym.ops.store import NKIStore
-from nkigym.search.state_facts import operation_facts
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.canonical_rewrite import block_chain, finalize_rewrite, owning_block
 from nkigym.transforms.helper.operation_builder import NameSupply, OperationBuilder, OperationScope
@@ -390,8 +389,10 @@ def _preserved_chunk_size(ir: KernelIR, match: _Match) -> int | None:
                     if not isinstance(width, Const):
                         return None
                     sizes.add(width.value)
-    size = min(sizes, default=0)
-    return size if size in match.chunk_sizes and all(value % size == 0 for value in sizes) else None
+    if len(sizes) != 1:
+        return None
+    size = next(iter(sizes))
+    return size if size in match.chunk_sizes else None
 
 
 def _new_context(
@@ -864,7 +865,11 @@ class OnlineFusion(Transform[OnlineFusionOption]):
                 if state.remaining and _incremental_intact(ir, state)
                 else []
             )
-        elif (facts := operation_facts(ir)).has_unknown_contract or not facts.has_reduction:
+        elif any(
+            ir.tree.isa(nid).op_cls.algebraic_contract(ir.tree.isa(nid).kwargs) is None
+            for nid in ir.tree.preorder()
+            if isinstance(ir.tree.data(nid), ISANode)
+        ):
             options = []
         else:
             options = [

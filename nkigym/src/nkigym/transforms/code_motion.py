@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from fractions import Fraction
-from math import prod
 from weakref import WeakKeyDictionary
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Expr, Var, to_affine
+from nkigym.ir.arith.expr import Expr, Var, affine_coefficient, expr_variables, to_affine
 from nkigym.ir.dependency import (
     Dependency,
     _access_invariant_across,
@@ -19,11 +18,11 @@ from nkigym.ir.dependency import (
 from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.ops.base import AxisRole
-from nkigym.search.serialization import inherited_analysis
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
 from nkigym.transforms.helper.normalize import _substitute_block_regions
 from nkigym.transforms.helper.tree_ops import _block_local_descendants, _replace_in_parent_children
+from nkigym.transforms.split import _tensorized_loop_element_stride
 
 
 @dataclass(frozen=True)
@@ -201,7 +200,9 @@ def _prepare_block_for_splice(tree: KernelTree, block_nid: int, plan: _PrefixPla
         used_names.add(temporary)
         substitutions[loop.loop_var] = Var(name=temporary)
         tree.graph.nodes[local_nid]["data"] = ForNode(loop_var=temporary, extent=loop.extent)
-    _substitute_block_regions(tree, block_nid, substitutions)
+    for nid in tree.preorder(block_nid):
+        if isinstance(tree.data(nid), BlockNode):
+            _substitute_block_regions(tree, nid, substitutions)
 
 
 def _strip_local_prefix_loops(tree: KernelTree, block_nid: int, count: int) -> None:
@@ -243,12 +244,8 @@ def _local_loop_nids(tree: KernelTree, block_nid: int) -> list[int]:
 
 def _bound_loop_dims(block: BlockNode) -> dict[str, str]:
     """Map each loop variable in the block's iter bindings to its concrete dimension."""
-    result: dict[str, str] = {}
-    for iter_var, value in zip(block.iter_vars, block.iter_values):
-        for name in to_affine(value):
-            if name is not None:
-                result[name] = iter_var.axis
-    return result
+    bindings = zip(block.iter_vars, block.iter_values)
+    return {name: iter_var.axis for iter_var, value in bindings for name in expr_variables(value)}
 
 
 def _cached_bound_loop_dims(tree: KernelTree, block_nid: int) -> dict[str, str]:
@@ -269,7 +266,7 @@ def _prefix_block_facts(tree: KernelTree, block_nid: int) -> _PrefixBlockFacts:
         local_nids = tuple(_local_loop_nids(tree, block_nid))
         leaf = next(nid for nid in _preorder(tree, block_nid) if isinstance(tree.data(nid), ISANode))
         moved_nids = tuple(nid for nid in _ancestors(tree, leaf) if isinstance(tree.data(nid), ForNode))
-        bound_dims = _cached_bound_loop_dims(tree, block_nid)
+        bound_dims = _cached_bound_loop_dims(tree, _owning_block(tree, leaf))
         facts = _PrefixBlockFacts(
             local_nids=local_nids,
             moved_nids=moved_nids,
@@ -367,27 +364,27 @@ def _loop_element_stride(tree: KernelTree, block_nid: int, loop_nid: int) -> Fra
     """Return one bound loop's logical element stride in ``block_nid``."""
     cache = _LOOP_STRIDES.setdefault(tree, {})
     key = (block_nid, loop_nid)
-    cached = cache.get(key)
-    if cached is not None:
-        return cached
-    block = tree.block(block_nid)
-    loop_var = tree.loop(loop_nid).loop_var
-    matches = [
-        (iter_var, to_affine(value))
-        for iter_var, value in zip(block.iter_vars, block.iter_values)
-        if loop_var in to_affine(value)
-    ]
-    if len(matches) != 1:
-        raise TransformLegalityError(
-            f"loop {loop_nid} ({loop_var!r}) must bind exactly one iter_var in block {block_nid}"
+    if key not in cache:
+        loop_var = tree.loop(loop_nid).loop_var
+        block = tree.block(block_nid)
+        direct = [
+            (iter_var, value)
+            for iter_var, value in zip(block.iter_vars, block.iter_values)
+            if loop_var in expr_variables(value)
+        ]
+        abstract = (
+            next((name for name, axis in block.axis_map.items() if axis == direct[0][0].axis), None)
+            if len(direct) == 1 and direct[0][1] == Var(name=loop_var)
+            else None
         )
-    iter_var, affine = matches[0]
-    bound_names = {name for name in affine if name is not None}
-    extents = _bound_execution_extents(tree, block_nid, bound_names)
-    domain_extent = iter_var.dom[1] - iter_var.dom[0]
-    stride = Fraction(affine[loop_var] * domain_extent, prod(extents.values()))
-    cache[key] = stride
-    return stride
+        leaf = tree.isa(_owned_leaf(tree, block_nid))
+        folded = abstract is not None and any(
+            len(group) > 1 and abstract in group
+            for slot in leaf.operand_bindings
+            for group in leaf.op_cls.operand_axis_groups(slot)
+        )
+        cache[key] = Fraction(1) if folded else _tensorized_loop_element_stride(tree, block_nid, loop_nid)
+    return cache[key]
 
 
 def _try_prefix_plan(
@@ -416,7 +413,8 @@ def _try_prefix_plan(
         if (moved_dim, moved_loop.extent) != (target_dim, target_loop.extent):
             return None
         if moved_nid != target_nid:
-            moved_stride = _loop_element_stride(tree, block_nid, moved_nid)
+            moved_owner = _owning_block(tree, moved_nid)
+            moved_stride = _loop_element_stride(tree, moved_owner, moved_nid)
             target_stride = _loop_element_stride(tree, target_block_nid, target_nid)
             if moved_stride != target_stride:
                 return None
@@ -492,12 +490,12 @@ def _check_matched_tensor_partitions(ir: KernelIR, block_nid: int, plan: _Prefix
             tensor = attrs["tensor"]
             signatures = [
                 frozenset(
-                    tuple(to_affine(lower).get(loop_var, 0) for lower, _width in region.ranges)
+                    tuple(affine_coefficient(lower, loop_var) for lower, _width in region.ranges)
                     for region in _leaf_operand_regions(ir.tree, leaf, tensor, rmw_only=False)
                 )
                 for leaf, loop_var in ((moved_leaf, moved_var), (other_leaf, target_var))
             ]
-            if signatures[0] != signatures[1]:
+            if any(None in signature for group in signatures for signature in group) or signatures[0] != signatures[1]:
                 raise TransformLegalityError(f"matched loops select different partitions of tensor {tensor!r}")
 
 
@@ -519,10 +517,12 @@ def _check_no_partial_input_replicated(
             )
             consumer_reads = tuple(region for region in moved_reads if region.tensor == tensor)
             producer_varies = any(
-                loop.loop_var in to_affine(lower) for region in producer_writes for lower, _width in region.ranges
+                loop.loop_var in expr_variables(lower) for region in producer_writes for lower, _width in region.ranges
             )
             consumer_is_invariant = bool(consumer_reads) and all(
-                loop.loop_var not in to_affine(lower) for region in consumer_reads for lower, _width in region.ranges
+                loop.loop_var not in expr_variables(lower)
+                for region in consumer_reads
+                for lower, _width in region.ranges
             )
             if producer_varies and consumer_is_invariant:
                 raise TransformLegalityError(
@@ -733,14 +733,13 @@ def _check_no_rmw_reset_scope_change(ir: KernelIR, block_nid: int, target_loop_n
 def _loop_reinitializes_tensor(tree: KernelTree, loop_nid: int, tensor: str, excluded_leaves: frozenset[int]) -> bool:
     """Return whether a repeated invariant plain write resets ``tensor``."""
     loop = tree.loop(loop_nid)
-    result = any(
+    return any(
         nid not in excluded_leaves
         and isinstance((node := tree.data(nid)), ISANode)
         and tensor in _plain_written_tensors(node)
         and _access_invariant_across(tree, nid, loop.loop_var, tensor)
         for nid in _descendants(tree, loop_nid)
     )
-    return result
 
 
 def _check_no_consumer_hoisted_out_of_producer_loop(
@@ -784,7 +783,7 @@ def _leaf_execution_invariant_across(tree: KernelTree, leaf_nid: int, loop_var: 
     node = tree.data(leaf_nid)
     assert isinstance(node, ISANode)
     return all(
-        loop_var not in to_affine(lo) for region in node.operand_bindings.values() for lo, _width in region.ranges
+        loop_var not in expr_variables(lo) for region in node.operand_bindings.values() for lo, _width in region.ranges
     )
 
 
@@ -843,10 +842,12 @@ def _check_no_partial_producer_moved_into_consumer_loop(
                 region for region in ir.dependency.info(consumer).read_regions if region.tensor == tensor
             )
             producer_varies = any(
-                moved_var in to_affine(lower) for region in producer_regions for lower, _width in region.ranges
+                moved_var in expr_variables(lower) for region in producer_regions for lower, _width in region.ranges
             )
             consumer_invariant = bool(consumer_regions) and all(
-                target_var not in to_affine(lower) for region in consumer_regions for lower, _width in region.ranges
+                target_var not in expr_variables(lower)
+                for region in consumer_regions
+                for lower, _width in region.ranges
             )
             if producer_varies and consumer_invariant:
                 raise TransformLegalityError(
@@ -1097,7 +1098,6 @@ class CodeMotion(Transform[CodeMotionOption]):
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
-    @inherited_analysis("code-motion")
     def analyze(self, ir: KernelIR) -> list[CodeMotionOption]:
         """Enumerate (block, target loop, index) triples passing legality."""
         options: list[CodeMotionOption] = []

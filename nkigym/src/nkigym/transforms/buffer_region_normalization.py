@@ -6,50 +6,229 @@ from dataclasses import dataclass, replace
 from weakref import WeakKeyDictionary
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Const, Expr, from_affine, substitute, to_affine
+from nkigym.ir.arith.analyzer import Analyzer
+from nkigym.ir.arith.expr import Add, Const, Expr, Mod, Mul, NonAffineError, Var, from_affine, substitute, to_affine
+from nkigym.ir.buffer_placement import (
+    _anchor_loop_nids_from_regions,
+    _regions_by_tensor,
+    layout_satisfies_output_alignment,
+)
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.graph_index import ordered_tree_topology
+from nkigym.ir.program_sharding import configured_program_shards, owning_block
 from nkigym.ir.tree import AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
-from nkigym.search.buffer_placement import _anchor_loop_nids_from_regions, _regions_by_tensor
+from nkigym.ops.base import CopyContract
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 
 _RegionFingerprint = tuple[str, int, int, tuple[tuple[Expr, Expr], ...]]
 _Normalization = tuple[int, int]
 _NORMALIZATIONS: WeakKeyDictionary[KernelTree, dict[str, frozenset[_Normalization]]] = WeakKeyDictionary()
+_PROGRAM_FRAMES: WeakKeyDictionary[KernelTree, dict[str, _ProgramFrame | None]] = WeakKeyDictionary()
+_AXIS_FOLDS: WeakKeyDictionary[KernelTree, tuple[BufferAxisFoldOption, ...]] = WeakKeyDictionary()
+_PROGRAM_ID = "nl.program_id(0)"
+
+
+@dataclass(frozen=True)
+class _ProgramFrame:
+    """One buffer axis covered by aligned logical-program loops."""
+
+    axis: int
+    loops: tuple[int, ...]
+    programs: int
+    leaf_loops: dict[int, int | None]
+    block_loops: dict[int, int | None]
 
 
 @dataclass(frozen=True)
 class BufferRegionNormalizationOption(TransformOption):
-    """Remove one allocation-frame loop from one physical buffer axis."""
+    """Translate one allocation or logical-program frame on one buffer axis."""
 
     tensor: str
     axis: int
     anchor_loop_nid: int
+    program_loop_nids: tuple[int, ...] = ()
 
 
-class BufferRegionNormalization(Transform[BufferRegionNormalizationOption]):
+@dataclass(frozen=True)
+class BufferAxisFoldOption(TransformOption):
+    """Reinterpret aligned free-axis slices as partition tiles."""
+
+    tensor: str
+    free_tile: int
+
+
+_BufferNormalizationOption = BufferRegionNormalizationOption | BufferAxisFoldOption
+
+
+class BufferRegionNormalization(Transform[_BufferNormalizationOption]):
     """Translate one buffer's accesses into its current local allocation frame."""
 
-    def analyze(self, ir: KernelIR) -> list[BufferRegionNormalizationOption]:
+    def analyze(self, ir: KernelIR) -> list[_BufferNormalizationOption]:
         """Return one option per buffer axis and allocation-frame anchor."""
         tensors = frozenset(name for name, buffer in ir.all_buffers().items() if buffer.location in {"sbuf", "psum"})
         changed = _normalizations_required(ir.tree, tensors)
-        return [
+        options: list[_BufferNormalizationOption] = [
             BufferRegionNormalizationOption(tensor=tensor, axis=axis, anchor_loop_nid=anchor)
             for tensor, axis, anchor in sorted(changed)
             if access_patterns_fit_buffer(
                 ir.tree, tensor, ir.buffer(tensor), {ir.tree.loop(anchor).loop_var: Const(value=0)}
             )
         ]
+        options.extend(
+            BufferRegionNormalizationOption(tensor, frame.axis, frame.loops[0], frame.loops)
+            for tensor in sorted(tensors)
+            if (frame := _program_frame(ir, tensor)) is not None
+        )
+        options.extend(_axis_fold_options(ir))
+        return options
 
-    def apply(self, ir: KernelIR, option: BufferRegionNormalizationOption) -> KernelIR:
-        """Re-check legality and normalize one buffer without changing its shape."""
+    def apply(self, ir: KernelIR, option: _BufferNormalizationOption) -> KernelIR:
+        """Re-check legality and normalize one buffer coordinate frame."""
         if option not in self.analyze(ir):
             raise TransformLegalityError(f"illegal BufferRegionNormalization option: {option}")
         new_ir = copy_for_rewrite(ir)
-        _normalize_region_axis(new_ir.tree, option.tensor, option.axis, option.anchor_loop_nid)
+        if isinstance(option, BufferAxisFoldOption):
+            _fold_free_axis(new_ir, option)
+        elif option.program_loop_nids:
+            frame = _program_frame(new_ir, option.tensor)
+            if frame is None or frame.loops != option.program_loop_nids:
+                raise AssertionError(f"program frame disappeared after deepcopy: {option}")
+            _normalize_program_regions(new_ir.tree, option.tensor, option.axis, frame)
+            _PROGRAM_FRAMES.pop(new_ir.tree, None)
+        else:
+            _normalize_region_axis(new_ir.tree, option.tensor, option.axis, option.anchor_loop_nid)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
+
+
+def _axis_fold_options(ir: KernelIR) -> tuple[BufferAxisFoldOption, ...]:
+    """Return cached free-axis coordinate folds for copy-produced buffers."""
+    cached = _AXIS_FOLDS.get(ir.tree)
+    if cached is None:
+        buffers = {
+            name: buffer
+            for name, buffer in ir.all_buffers().items()
+            if buffer.location in {"sbuf", "psum"}
+            and len(buffer.shape) == 2
+            and buffer.logical_tile_count() == 1
+            and buffer.list_len == buffer.versions == 1
+        }
+        regions: dict[str, list[BufferRegion]] = {name: [] for name in buffers}
+        copy_writers: set[str] = set()
+        invalid_writers: set[str] = set()
+        patterned: set[str] = set()
+        semantic_offsets: set[str] = set()
+        for nid in ir.tree.preorder():
+            node = ir.tree.data(nid)
+            if isinstance(node, BlockNode):
+                for region in (*node.reads, *node.writes):
+                    if region.tensor in regions:
+                        regions[region.tensor].append(region)
+            elif isinstance(node, ISANode):
+                contract = node.op_cls.algebraic_contract(node.kwargs)
+                for slot, region in node.operand_bindings.items():
+                    if region.tensor not in regions:
+                        continue
+                    regions[region.tensor].append(region)
+                    if slot not in node.op_cls.INPUT_OPERANDS:
+                        if isinstance(contract, CopyContract) and slot == contract.output_operand:
+                            copy_writers.add(region.tensor)
+                        else:
+                            invalid_writers.add(region.tensor)
+                    if slot in node.access_patterns:
+                        patterned.add(region.tensor)
+                for abstract_axis, (_key, source_slot) in getattr(node.op_cls, "SPLIT_OFFSET_KWARGS", {}).items():
+                    source = node.operand_bindings.get(source_slot)
+                    if (
+                        source is not None
+                        and source.tensor in regions
+                        and node.op_cls.operand_dimension(source_slot, abstract_axis) == 1
+                    ):
+                        semantic_offsets.add(source.tensor)
+        options = []
+        for name in sorted(buffers):
+            buffer = buffers[name]
+            free_tile = _foldable_free_tile(
+                ir,
+                buffer,
+                tuple(regions[name]),
+                name in copy_writers
+                and name not in invalid_writers
+                and name not in patterned
+                and name not in semantic_offsets,
+            )
+            if free_tile is not None:
+                options.append(BufferAxisFoldOption(tensor=name, free_tile=free_tile))
+        cached = tuple(options)
+        _AXIS_FOLDS[ir.tree] = cached
+    return cached
+
+
+def _foldable_free_tile(ir: KernelIR, buffer: Buffer, regions: tuple[BufferRegion, ...], copy_only: bool) -> int | None:
+    """Return the uniform free slice width for one legal coordinate fold."""
+    result = None
+    widths = {
+        region.ranges[1][1].value
+        for region in regions
+        if len(region.ranges) == 2 and isinstance(region.ranges[1][1], Const)
+    }
+    if copy_only and regions and len(widths) == 1:
+        width = next(iter(widths))
+        aligned = 0 < width < buffer.shape[1] and buffer.shape[1] % width == 0
+        aligned = aligned and all(_fold_region_is_aligned(region, buffer, width) for region in regions)
+        candidate = replace(buffer, shape=(buffer.shape[0] * buffer.shape[1] // width, width))
+        if aligned and layout_satisfies_output_alignment(ir.tree, candidate):
+            result = width
+    return result
+
+
+def _fold_region_is_aligned(region: BufferRegion, buffer: Buffer, width: int) -> bool:
+    """Return whether one region is a complete aligned free-axis slice."""
+    result = False
+    if len(region.ranges) == 2:
+        leading_width = region.ranges[0][1]
+        free_lower, free_width = region.ranges[1]
+        if leading_width == Const(value=buffer.partition_extent()) and free_width == Const(value=width):
+            try:
+                coefficients = to_affine(free_lower)
+            except NonAffineError:
+                coefficients = {}
+            else:
+                result = all(coefficient % width == 0 for coefficient in coefficients.values())
+    return result
+
+
+def _fold_free_axis(ir: KernelIR, option: BufferAxisFoldOption) -> None:
+    """Reframe aligned free-axis slices as logical partition tiles."""
+    buffer = ir.buffer(option.tensor)
+    factor = buffer.shape[1] // option.free_tile
+    replacement = replace(buffer, shape=(buffer.shape[0] * factor, option.free_tile))
+
+    def rewrite(region: BufferRegion) -> BufferRegion:
+        """Rewrite one selected region into the folded coordinate frame."""
+        result = region
+        if region.tensor == option.tensor:
+            free_lower, free_width = region.ranges[1]
+            quotient = from_affine(
+                {variable: coefficient // option.free_tile for variable, coefficient in to_affine(free_lower).items()}
+            )
+            tile_lower = Add(left=Mul(left=region.ranges[0][0], right=Const(value=factor)), right=quotient)
+            result = replace(region, ranges=((tile_lower, region.ranges[0][1]), (Const(value=0), free_width)))
+        return result
+
+    for nid in ir.tree.preorder():
+        node = ir.tree.data(nid)
+        if isinstance(node, BlockNode):
+            allocations = tuple(replacement if item.name == option.tensor else item for item in node.alloc_buffers)
+            ir.tree.graph.nodes[nid]["data"] = replace(
+                node,
+                reads=tuple(rewrite(region) for region in node.reads),
+                writes=tuple(rewrite(region) for region in node.writes),
+                alloc_buffers=allocations,
+            )
+        elif isinstance(node, ISANode):
+            bindings = {slot: rewrite(region) for slot, region in node.operand_bindings.items()}
+            ir.tree.graph.nodes[nid]["data"] = replace(node, operand_bindings=bindings)
 
 
 def _regions_requiring_normalization(tree: KernelTree, tensors: frozenset[str]) -> set[str]:
@@ -80,6 +259,161 @@ def _normalizations_required(tree: KernelTree, tensors: frozenset[str]) -> set[t
                 if _axis_changes(records[tensor], axis, {tree.loop(anchor).loop_var: Const(value=0)})
             )
     return {(tensor, axis, anchor) for tensor in tensors for axis, anchor in cached[tensor]}
+
+
+def _program_frame(ir: KernelIR, tensor: str) -> _ProgramFrame | None:
+    """Return an aligned program-local partition frame for one buffer."""
+    cached = _PROGRAM_FRAMES.setdefault(ir.tree, {})
+    if tensor not in cached:
+        cached[tensor] = _compute_program_frame(ir, tensor)
+    return cached[tensor]
+
+
+def _compute_program_frame(ir: KernelIR, tensor: str) -> _ProgramFrame | None:
+    """Prove that every access covers one matching per-program buffer slice."""
+    buffer = ir.buffer(tensor)
+    pairs = _regions_by_tensor(ir.tree, frozenset((tensor,))).get(tensor, [])
+    shards = configured_program_shards(ir)
+    if buffer.location not in {"sbuf", "psum"} or buffer.list_len != 1 or not pairs or not shards:
+        return None
+    leaf_loops: dict[int, int | None] = {}
+    block_loops: dict[int, int | None] = {}
+    axes: set[int] = set()
+    spans: set[int] = set()
+    program_counts: set[int] = set()
+    shard_programs = set(shards.values())
+    if len(shard_programs) != 1:
+        return None
+    direct_programs = next(iter(shard_programs))
+    for leaf_nid, region in pairs:
+        if not region.ranges:
+            return None
+        matches: list[tuple[int, Expr, int | None, int, int, int]] = [
+            (axis, lower, loop_nid, programs, coefficients.get(ir.tree.loop(loop_nid).loop_var, 0), width.value)
+            for axis, (lower, width) in enumerate(region.ranges)
+            if isinstance(width, Const)
+            for coefficients in (_affine_or_none(lower),)
+            if coefficients is not None
+            for loop_nid, programs in shards.items()
+            if loop_nid in ir.tree.ancestors(leaf_nid)
+            and coefficients.get(ir.tree.loop(loop_nid).loop_var, 0) > 0
+            and (axis != 0 or width.value == buffer.partition_extent())
+        ]
+        matches.extend(
+            (axis, lower, None, direct_programs, coefficients[_PROGRAM_ID], width.value)
+            for axis, (lower, width) in enumerate(region.ranges)
+            if isinstance(width, Const)
+            for coefficients in (_affine_or_none(lower),)
+            if coefficients is not None
+            and coefficients.get(_PROGRAM_ID, 0) > 0
+            and (axis != 0 or width.value == buffer.partition_extent())
+        )
+        if len(matches) != 1:
+            return None
+        axis, lower, loop_nid, programs, coefficient, width = matches[0]
+        if loop_nid is None:
+            local_extent = 1
+            normalized = substitute(lower, {_PROGRAM_ID: Const(value=0)})
+        else:
+            loop = ir.tree.loop(loop_nid)
+            local_extent = loop.extent // programs
+            if loop.extent % programs:
+                return None
+            local = Mod(left=Var(name=loop.loop_var), right=Const(value=local_extent))
+            normalized = substitute(lower, {loop.loop_var: local})
+        leaf = ir.tree.isa(leaf_nid)
+        patterns = tuple(
+            leaf.access_patterns[slot]
+            for slot, binding in leaf.operand_bindings.items()
+            if binding.tensor == tensor and slot in leaf.access_patterns
+        )
+        if patterns and (
+            loop_nid is not None
+            or any(
+                not _pattern_fits(
+                    ir.tree, leaf_nid, _substitute_pattern(pattern, {_PROGRAM_ID: Const(value=0)}), buffer
+                )
+                for pattern in patterns
+            )
+        ):
+            return None
+        analyzer = Analyzer()
+        for ancestor in ir.tree.ancestors(leaf_nid):
+            if isinstance((node := ir.tree.data(ancestor)), ForNode):
+                analyzer.bind(node.loop_var, 0, node.extent)
+        lo, hi = analyzer.const_int_bound(normalized)
+        span = coefficient * local_extent
+        if lo is None or hi is None or lo < 0 or hi >= span or (axis != 0 and hi + width > span):
+            return None
+        owner = owning_block(ir, leaf_nid)
+        if owner in block_loops and block_loops[owner] != loop_nid:
+            return None
+        leaf_loops[leaf_nid] = loop_nid
+        block_loops[owner] = loop_nid
+        axes.add(axis)
+        spans.add(span)
+        program_counts.add(programs)
+    if len(axes) != 1 or len(spans) != 1 or len(program_counts) != 1:
+        return None
+    axis = next(iter(axes))
+    span = next(iter(spans))
+    programs = next(iter(program_counts))
+    capacity = buffer.logical_tile_count() if axis == 0 else buffer.shape[axis]
+    if span * programs != capacity:
+        return None
+    loops = tuple(sorted(loop_nid for loop_nid in set(leaf_loops.values()) if loop_nid is not None))
+    return _ProgramFrame(axis, loops, programs, leaf_loops, block_loops) if loops else None
+
+
+def _affine_or_none(expr: Expr) -> dict[str | None, int] | None:
+    """Return affine coefficients, or ``None`` for a normalized expression."""
+    try:
+        result = to_affine(expr)
+    except NonAffineError:
+        result = None
+    return result
+
+
+def _normalize_program_regions(tree: KernelTree, tensor: str, axis: int, frame: _ProgramFrame) -> None:
+    """Rewrite one private buffer axis into each program's local coordinates."""
+
+    def rewrite(region: BufferRegion, loop_nid: int | None) -> BufferRegion:
+        """Translate one region with its enclosing program loop."""
+        if region.tensor != tensor or axis >= len(region.ranges):
+            return region
+        substitutions: dict[str, Expr]
+        if loop_nid is None:
+            substitutions = {_PROGRAM_ID: Const(value=0)}
+        else:
+            loop = tree.loop(loop_nid)
+            local_extent = loop.extent // frame.programs
+            substitutions = {loop.loop_var: Mod(left=Var(name=loop.loop_var), right=Const(value=local_extent))}
+        ranges = list(region.ranges)
+        lower, width = ranges[axis]
+        ranges[axis] = (substitute(lower, substitutions), width)
+        return replace(region, ranges=tuple(ranges))
+
+    def rewrite_pattern(pattern: AccessPattern, loop_nid: int | None) -> AccessPattern:
+        """Translate one explicit view with the same program selector."""
+        if loop_nid is not None:
+            raise AssertionError("program-local access patterns require direct program indexing")
+        return _substitute_pattern(pattern, {_PROGRAM_ID: Const(value=0)})
+
+    for block_nid, loop_nid in frame.block_loops.items():
+        block = tree.block(block_nid)
+        tree.graph.nodes[block_nid]["data"] = replace(
+            block,
+            reads=tuple(rewrite(region, loop_nid) for region in block.reads),
+            writes=tuple(rewrite(region, loop_nid) for region in block.writes),
+        )
+    for leaf_nid, loop_nid in frame.leaf_loops.items():
+        leaf = tree.isa(leaf_nid)
+        bindings = {slot: rewrite(region, loop_nid) for slot, region in leaf.operand_bindings.items()}
+        patterns = {
+            slot: rewrite_pattern(pattern, loop_nid) if bindings[slot].tensor == tensor else pattern
+            for slot, pattern in leaf.access_patterns.items()
+        }
+        tree.graph.nodes[leaf_nid]["data"] = replace(leaf, operand_bindings=bindings, access_patterns=patterns)
 
 
 def _normalize_region_axis(tree: KernelTree, tensor: str, axis: int, anchor_loop_nid: int) -> None:
@@ -266,10 +600,25 @@ def _translated_pattern(
             }
         )
 
-    dimensions = tuple((translate(stride), substitute(extent, substitutions)) for stride, extent in pattern.pattern)
+    try:
+        dimensions = tuple((translate(stride), substitute(extent, substitutions)) for stride, extent in pattern.pattern)
+        offset = translate(pattern.offset)
+    except NonAffineError:
+        return None
     first_stride, first_extent = dimensions[0]
     valid = first_stride == Const(value=new_stride) or first_stride == Const(value=0) and first_extent == Const(value=1)
-    return AccessPattern(pattern=dimensions, offset=translate(pattern.offset)) if valid else None
+    return AccessPattern(pattern=dimensions, offset=offset) if valid else None
+
+
+def _substitute_pattern(pattern: AccessPattern, substitutions: dict[str, Expr]) -> AccessPattern:
+    """Apply one coordinate substitution to an explicit physical view."""
+    return replace(
+        pattern,
+        pattern=tuple(
+            (substitute(stride, substitutions), substitute(extent, substitutions)) for stride, extent in pattern.pattern
+        ),
+        offset=substitute(pattern.offset, substitutions),
+    )
 
 
 def _pattern_fits(tree: KernelTree, nid: int, pattern: AccessPattern, buffer: Buffer) -> bool:
@@ -308,6 +657,7 @@ def _affine_bounds(expr: Expr, extents: dict[str, int]) -> tuple[int, int]:
 
 
 __all__ = [
+    "BufferAxisFoldOption",
     "BufferRegionNormalization",
     "BufferRegionNormalizationOption",
     "access_patterns_fit_buffer",

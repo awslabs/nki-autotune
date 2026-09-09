@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from nkigym.ir import AccessPattern, Const, KernelIR
-from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
+from nkigym.ir import LE, AccessPattern, Const, Expr, KernelIR
+from nkigym.ir.arith.analyzer import Analyzer
+from nkigym.ir.tree import BufferRegion, ForNode, ISANode
 from nkigym.ops.base import BilinearReductionContract, CopyContract, InitializerContract, PermutationContract
 from nkigym.ops.dma_transpose import NKIDMATranspose
-from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.tensor_scalar import NKITensorScalar
 from nkigym.ops.tensor_tensor import NKITensorTensor
@@ -51,6 +51,7 @@ class _PermutationMove:
     permutation_leaf: int
     passthrough: str
     factor: str
+    factor_region: BufferRegion
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class _BilinearMove:
     reducer_leaf: int
     passthrough: str
     factor: str
+    factor_region: BufferRegion
     drain_leaf: int
 
 
@@ -92,6 +94,15 @@ class CommuteBroadcastFactor(Transform[CommuteBroadcastFactorOption]):
         return result
 
 
+def _ranges_equal(lhs: tuple[tuple[Expr, Expr], ...], rhs: tuple[tuple[Expr, Expr], ...]) -> bool:
+    """Return whether two regions address the same logical coordinates."""
+    analyzer = Analyzer()
+    return len(lhs) == len(rhs) and all(
+        analyzer.can_prove_equal(lhs_lower, rhs_lower) and analyzer.can_prove_equal(lhs_width, rhs_width)
+        for (lhs_lower, lhs_width), (rhs_lower, rhs_width) in zip(lhs, rhs, strict=True)
+    )
+
+
 def _permutation_moves(ir: KernelIR) -> dict[int, _PermutationMove]:
     """Return contract-proven factor moves across one transpose."""
     result: dict[int, _PermutationMove] = {}
@@ -111,29 +122,54 @@ def _permutation_moves(ir: KernelIR) -> dict[int, _PermutationMove]:
         permutation = ir.tree.isa(permutation_leaf)
         permutation_contract = permutation.op_cls.algebraic_contract(permutation.kwargs)
         passthrough = bypass.operand_bindings["data"].tensor
-        factor = bypass.operand_bindings["operand0"].tensor
+        passthrough_region = bypass.operand_bindings["data"]
+        factor_region = bypass.operand_bindings["operand0"]
+        factor = factor_region.tensor
         output = bypass.operand_bindings["dst"].tensor
         affected = (owning_block(ir.tree, bypass_leaf), owning_block(ir.tree, permutation_leaf))
         if (
             permutation.op_cls is not NKIDMATranspose
             or not isinstance(permutation_contract, PermutationContract)
             or permutation_contract.permutation != (1, 0)
+            or permutation.operand_bindings.get("src") is None
             or permutation.operand_bindings["src"].tensor != output
-            or len(bypass.operand_bindings["operand0"].ranges) != 1
-            or len(bypass.operand_bindings["data"].ranges) != 2
+            or len(factor_region.ranges) != 1
+            or len(passthrough_region.ranges) != 2
             or len(bypass.operand_bindings["dst"].ranges) != 2
         ):
             continue
+        permutation_source = permutation.operand_bindings["src"]
+        factor_buffer = ir.buffer(factor)
         if (
-            ir.buffer(factor).physical_dtype() == "float32"
+            factor_buffer.location == "sbuf"
+            and factor_buffer.physical_dtype() == "float32"
+            and factor_buffer.list_len == factor_buffer.versions == 1
             and ir.buffer(passthrough) == replace(ir.buffer(output), name=passthrough)
             and is_canonical_block(ir, affected[1])
+            and _ranges_equal(passthrough_region.ranges, bypass.operand_bindings["dst"].ranges)
+            and _ranges_equal(factor_region.ranges, passthrough_region.ranges[:1])
+            and _ranges_equal(factor_region.ranges, permutation_source.ranges[:1])
+            and _transpose_broadcast_supports(factor_region)
+            and "operand0" not in bypass.access_patterns
             and not intersects_software_pipeline(ir, affected)
         ):
             result[permutation_leaf] = _PermutationMove(
-                bypass_leaf=bypass_leaf, permutation_leaf=permutation_leaf, passthrough=passthrough, factor=factor
+                bypass_leaf=bypass_leaf,
+                permutation_leaf=permutation_leaf,
+                passthrough=passthrough,
+                factor=factor,
+                factor_region=factor_region,
             )
     return result
+
+
+def _transpose_broadcast_supports(factor_region: BufferRegion) -> bool:
+    """Return whether one factor width is legal for a native transpose broadcast."""
+    maximum = NKITransposeBroadcast.MAX_TILE_SIZE["F"]
+    if not isinstance(maximum, int):
+        raise AssertionError("transpose broadcast must declare a finite free-axis maximum")
+    width = factor_region.ranges[0][1]
+    return Analyzer().can_prove(LE(left=width, right=Const(value=maximum)))
 
 
 def _producer_for_tensor(ir: KernelIR, consumer_leaf: int, tensor: str) -> int | None:
@@ -208,9 +244,13 @@ def _bilinear_moves(ir: KernelIR) -> dict[int, _BilinearMove]:
             if reducer_node.operand_bindings[slot].tensor == pointwise_output
         ]
         drains = ir.dependency.direct_consumers(reducer_leaf)
-        factor = ir.tree.isa(broadcast_leaf).operand_bindings["data"].tensor
+        broadcast_node = ir.tree.isa(broadcast_leaf)
+        factor_region = broadcast_node.operand_bindings["data"]
+        factor = factor_region.tensor
         passthrough = inputs[permutation_slots[0]]
         blocks = tuple(owning_block(ir.tree, nid) for nid in (pointwise_leaf, permutation_leaf, reducer_leaf, *drains))
+        drain = ir.tree.isa(drains[0]) if len(drains) == 1 else None
+        drain_source = None if drain is None else drain.operand_bindings.get("src")
         if (
             len(reducer_slots) == 1
             and reducer_slots[0] == reducer.left_operand
@@ -221,6 +261,11 @@ def _bilinear_moves(ir: KernelIR) -> dict[int, _BilinearMove]:
                 ir.tree.isa(drains[0]).op_cls.algebraic_contract(ir.tree.isa(drains[0]).kwargs), CopyContract
             )
             and ir.tree.isa(drains[0]).op_cls is NKITensorCopy
+            and drain_source is not None
+            and len(factor_region.ranges) == 1
+            and len(drain_source.ranges) == 2
+            and _ranges_equal(factor_region.ranges, drain_source.ranges[:1])
+            and ir.buffer(passthrough) == replace(ir.buffer(pointwise_output), name=passthrough)
             and ir.buffer(factor).physical_dtype() == "float32"
             and not intersects_software_pipeline(ir, blocks)
         ):
@@ -229,6 +274,7 @@ def _bilinear_moves(ir: KernelIR) -> dict[int, _BilinearMove]:
                 reducer_leaf=reducer_leaf,
                 passthrough=passthrough,
                 factor=factor,
+                factor_region=factor_region,
                 drain_leaf=drains[0],
             )
     return result
@@ -245,6 +291,7 @@ def _commute_permutation(ir: KernelIR, move: _PermutationMove) -> None:
     broadcast_name = fresh_name(ir, f"{move.factor}_transposed_broadcast")
     output_buffer = ir.buffer(output.tensor)
     factor_buffer = ir.buffer(move.factor)
+    transposed_map = {"P": block.axis_map["F"], "F": block.axis_map["P"]}
     append_root_buffers(
         ir,
         (
@@ -258,7 +305,6 @@ def _commute_permutation(ir: KernelIR, move: _PermutationMove) -> None:
             ),
         ),
     )
-    transposed_map = {"P": block.axis_map["F"], "F": block.axis_map["P"]}
     transpose_spec = required_spec(
         ir, NKIDMATranspose, {"src": move.passthrough, "dst": transposed_name}, dict(block.axis_map), {}
     )
@@ -283,17 +329,18 @@ def _commute_permutation(ir: KernelIR, move: _PermutationMove) -> None:
     if broadcast_leaf is None:
         raise AssertionError(f"broadcast block {broadcast_block} has no sole ISA leaf")
     broadcast_node = ir.tree.isa(broadcast_leaf)
-    factor_region = broadcast_node.operand_bindings["data"]
+    if not _ranges_equal(broadcast_node.operand_bindings["data"].ranges, move.factor_region.ranges):
+        raise AssertionError("commuted broadcast did not preserve the factor region")
     factor_stride = factor_buffer.logical_tile_count() * factor_buffer.per_tile_physical_shape()[2]
     ir.tree.graph.nodes[broadcast_leaf]["data"] = replace(
         broadcast_node,
         access_patterns={
             "data": AccessPattern(
                 pattern=(
-                    (Const(value=factor_stride), factor_region.ranges[0][1]),
+                    (Const(value=factor_stride), move.factor_region.ranges[0][1]),
                     (Const(value=0), Const(value=output_buffer.partition_extent())),
                 ),
-                offset=factor_region.ranges[0][0],
+                offset=move.factor_region.ranges[0][0],
             )
         },
     )
@@ -324,9 +371,8 @@ def _commute_bilinear(ir: KernelIR, move: _BilinearMove) -> None:
     bindings["src"] = temporary_region
     ir.tree.graph.nodes[move.drain_leaf]["data"] = replace(drain, operand_bindings=bindings)
     ir.tree.graph.nodes[drain_block_nid]["data"] = replace(drain_block, reads=(temporary_region,))
-    factor_region = BufferRegion(tensor=move.factor, ranges=(source.ranges[0],))
     multiply_block = ir.tree.add_node(
-        replace(drain_block, reads=(source, factor_region), writes=(temporary_region,), alloc_buffers=())
+        replace(drain_block, reads=(source, move.factor_region), writes=(temporary_region,), alloc_buffers=())
     )
     parent = multiply_block
     for loop in chain[1:-1]:
@@ -335,7 +381,7 @@ def _commute_bilinear(ir: KernelIR, move: _BilinearMove) -> None:
     ir.tree.add_node(
         ISANode(
             op_cls=NKITensorScalar,
-            operand_bindings={"data": source, "operand0": factor_region, "dst": temporary_region},
+            operand_bindings={"data": source, "operand0": move.factor_region, "dst": temporary_region},
             kwargs={"op0": "multiply"},
         ),
         parent=parent,

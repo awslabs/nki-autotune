@@ -3,7 +3,7 @@
 Each workload type contributes its first registered configuration. This keeps
 operation coverage broad without repeating the expensive rollout across every
 shape and configuration variant. ``hf_ffn`` remains covered by synthesis and
-hardware search tests but is excluded here because its instruction-level CPU
+hardware profiling tests but is excluded here because its instruction-level CPU
 simulation cannot complete within this test's fixed timeout.
 """
 

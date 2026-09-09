@@ -21,7 +21,7 @@ from weakref import WeakKeyDictionary
 
 import networkx as nx
 
-from nkigym.ir.arith.expr import to_affine
+from nkigym.ir.arith.expr import expr_variables
 from nkigym.ir.graph_index import DAGReachability, ordered_tree_topology
 from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
@@ -439,7 +439,7 @@ def _access_invariant_across(tree: KernelTree, leaf_nid: int, loop_var: str, ten
         regions = _leaf_operand_regions(tree, leaf_nid, tensor, rmw_only=False)
         invariant = bool(regions)
         for region in regions:
-            if any(loop_var in to_affine(lo) for lo, _w in region.ranges):
+            if any(loop_var in expr_variables(lo) for lo, _w in region.ranges):
                 invariant = False
                 break
         cache[key] = invariant
@@ -457,39 +457,45 @@ def _tensor_carried_across(tree: KernelTree, loop_nid: int, tensor: str) -> bool
     carries. Post-RFactor the matmul's psum rmw is invariant across BOTH ko and
     ki, but the per-ko memset sits inside ko and re-zeros it — so ko is a re-init
     loop (not carried) while ki (no enclosed init) is the true accumulation carry.
-    A leaf that itself RMWs the tensor is its accumulator store-back (e.g. the
-    fold's ``dst`` aliasing ``data1``), NOT a re-init — only a SEPARATE plain-write
-    leaf (a memset) re-initializes. This is role-blind: it reads regions +
-    static or explicitly aliased RMW operands only, never the axis role
-    (RFactor flips ko/ki to PARALLEL yet psum still carries across ki).
+    A leaf that itself RMWs the tensor is normally its accumulator store-back,
+    not a re-init. An explicit dynamic first-write overwrite is the exception:
+    it re-initializes enclosing loops whose coordinates do not index any leaf
+    operand, while the indexed reduction loop remains carried. This is
+    role-blind: it reads regions and configured RMW operands, never axis roles.
     """
     cache = _CARRIED_TENSORS.setdefault(tree, {})
     key = (loop_nid, tensor)
     carried = cache.get(key)
     if carried is None:
-        loop = tree.data(loop_nid)
-        assert isinstance(loop, ForNode), f"_tensor_carried_across: {loop_nid} is not a ForNode"
-        loop_var = loop.loop_var
-        has_invariant_rmw = False
-        has_enclosed_init = False
+        assert isinstance(loop := tree.data(loop_nid), ForNode), f"_tensor_carried_across: {loop_nid} is not a ForNode"
+        has_invariant_rmw = has_enclosed_init = False
         for nid in tree.descendants(loop_nid):
             data = tree.data(nid)
             if not isinstance(data, ISANode):
                 continue
+            rmw_slots = _rmw_operand_slots(data)
             rmw_regions = _leaf_operand_regions(tree, nid, tensor, rmw_only=True)
-            if rmw_regions and not any(loop_var in to_affine(lo) for region in rmw_regions for lo, _w in region.ranges):
-                has_invariant_rmw = True
+            rmw_invariant = bool(rmw_regions) and not any(
+                loop.loop_var in expr_variables(lo) for region in rmw_regions for lo, _w in region.ranges
+            )
+            has_invariant_rmw |= rmw_invariant
+            has_enclosed_init |= (
+                rmw_invariant
+                and isinstance(data.kwargs.get("accumulate"), tuple)
+                and all(
+                    _access_invariant_across(tree, nid, loop.loop_var, region.tensor)
+                    for region in data.operand_bindings.values()
+                )
+            )
             if rmw_regions:
                 continue
-            rmw_slots = _rmw_operand_slots(data)
             for slot, region in data.operand_bindings.items():
-                if region.tensor != tensor:
-                    continue
-                if slot in rmw_slots:
-                    continue
-                if slot in getattr(data.op_cls, "INPUT_OPERANDS", frozenset()):
-                    continue
-                if not any(loop_var in to_affine(lo) for lo, _w in region.ranges):
+                if (
+                    region.tensor == tensor
+                    and slot not in rmw_slots
+                    and slot not in data.op_cls.INPUT_OPERANDS
+                    and not any(loop.loop_var in expr_variables(lo) for lo, _w in region.ranges)
+                ):
                     has_enclosed_init = True
         carried = has_invariant_rmw and not has_enclosed_init
         cache[key] = carried
@@ -500,6 +506,3 @@ _PROMOTED_SPANS: WeakKeyDictionary[Dependency, dict[tuple[int, str], tuple[float
 _INSERTION_BOUNDS: WeakKeyDictionary[
     Dependency, dict[int, tuple[tuple[tuple[str, float, int], ...], tuple[tuple[str, float, int], ...]]]
 ] = WeakKeyDictionary()
-
-
-__all__ = ["Dependency"]

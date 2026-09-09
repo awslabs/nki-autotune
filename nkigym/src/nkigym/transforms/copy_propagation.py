@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
+from nkigym.ir.arith import LE, Add, Analyzer, Const, Sub
+from nkigym.ir.program_sharding import owning_block
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import CopyContract
+from nkigym.ops.float8_cast import NKIFloat8Cast
+from nkigym.ops.store import NKIStore
 from nkigym.ops.tensor_copy import NKITensorCopy
-from nkigym.search.program_sharding import owning_block
-from nkigym.search.state_facts import operation_facts
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -44,16 +46,8 @@ class _CopyPropagationMatch:
 class CopyPropagation(Transform[CopyPropagationOption]):
     """Substitute one value-preserving copy source into its consumer."""
 
-    SPLIT_PREPARATION_DEPTH = 1
-
-    def split_preparation_applicable(self, ir: KernelIR) -> bool:
-        """Return whether the kernel contains an on-chip tensor copy."""
-        return operation_facts(ir).has_ops(NKITensorCopy)
-
     def analyze(self, ir: KernelIR) -> list[CopyPropagationOption]:
         """Return ordered copy-consumer pairs accepted by storage contracts."""
-        if not operation_facts(ir).has_copy:
-            return []
         options: list[CopyPropagationOption] = []
         buffers = ir.all_buffers()
         overlap_nodes = software_pipeline_overlap_nodes(ir)
@@ -105,6 +99,8 @@ class CopyPropagation(Transform[CopyPropagationOption]):
             return result
         if intersects_software_pipeline(ir, (copy_nid, consumer_nid), overlap_nodes):
             return result
+        if positions is None:
+            positions = {nid: index for index, nid in enumerate(ir.tree.preorder())}
         copy_leaf_nid = _owned_leaf(ir, copy_nid)
         consumer_leaf_nid = _owned_leaf(ir, consumer_nid)
         if copy_leaf_nid is None or consumer_leaf_nid is None:
@@ -121,7 +117,7 @@ class CopyPropagation(Transform[CopyPropagationOption]):
             )
             ordered = sibling_ordered or (
                 copy_leaf_nid in ir.dependency.direct_producers(consumer_leaf_nid)
-                and _loop_ancestors(ir, copy_leaf_nid) == _loop_ancestors(ir, consumer_leaf_nid)
+                and positions[copy_leaf_nid] < positions[consumer_leaf_nid]
             )
         if not ordered:
             return result
@@ -135,7 +131,10 @@ class CopyPropagation(Transform[CopyPropagationOption]):
         source = copy_leaf.operand_bindings.get(contract.input_operand)
         copied = copy_leaf.operand_bindings.get(contract.output_operand)
         consumed = consumer_leaf.operand_bindings.get(option.consumer_operand)
-        if source is None or copied is None or consumed != copied:
+        if source is None or copied is None or consumed is None or consumed.tensor != copied.tensor:
+            return result
+        source = _project_source_region(ir, source, copied, consumed)
+        if source is None:
             return result
         if copied.tensor in ir.param_buffers or copied.tensor in ir.return_names:
             return result
@@ -156,45 +155,45 @@ class CopyPropagation(Transform[CopyPropagationOption]):
         dtypes[option.consumer_operand] = source_buffer.physical_dtype()
         required_dtype = consumer_leaf.op_cls.REQUIRED_INPUT_STORAGE_DTYPES.get(option.consumer_operand)
         accepted_dtypes = consumer_leaf.op_cls.INPUT_STORAGE_DTYPES.get(option.consumer_operand, frozenset())
+        dma_cast = (
+            copy_leaf.op_cls is NKIFloat8Cast
+            and consumer_leaf.op_cls is NKIStore
+            and option.consumer_operand == "src"
+            and copied_buffer.physical_dtype() == "float8_e4m3"
+        )
         storage_compatible = (
-            source_buffer.physical_dtype() == copied_buffer.physical_dtype()
+            dma_cast
+            or source_buffer.physical_dtype() == copied_buffer.physical_dtype()
             or source_buffer.physical_dtype() in accepted_dtypes
         )
         if (
             copied_buffer.location == "shared_hbm"
-            or source_buffer.location not in {"sbuf", "psum"}
+            or source_buffer.location not in {"shared_hbm", "sbuf", "psum"}
             or accepted_locations is None
             or source_buffer.location not in accepted_locations
-            or source_buffer.dtype != copied_buffer.dtype
+            or (source_buffer.dtype != copied_buffer.dtype and not dma_cast)
             or not storage_compatible
             or not consumer_leaf.op_cls.accepts_input_locations(locations)
             or not consumer_leaf.op_cls.accepts_input_storage_dtypes(dtypes)
             or (required_dtype is not None and source_buffer.physical_dtype() != required_dtype)
             or source.tensor == copied.tensor
             or len(source.ranges) != len(copied.ranges)
+            or not _location_tile_compatible(consumer_leaf, option.consumer_operand, source, source_buffer)
         ):
-            return result
-        if tuple(width for _lower, width in source.ranges) != tuple(width for _lower, width in copied.ranges):
             return result
         copy_block = ir.tree.block(copy_nid)
         if any(buffer.name != copied.tensor for buffer in copy_block.alloc_buffers):
             return result
         if not self._has_single_use_and_definition(ir, copied.tensor, copy_leaf_nid, consumer_leaf_nid):
             return result
-        if not self._source_remains_stable(
-            ir,
-            source.tensor,
-            copy_leaf_nid,
-            consumer_leaf_nid,
-            positions if positions is not None else {nid: index for index, nid in enumerate(ir.tree.preorder())},
-        ):
+        if not self._source_remains_stable(ir, source.tensor, copy_leaf_nid, consumer_leaf_nid, positions):
             return result
         result = _CopyPropagationMatch(
             option=option,
             copy_leaf_nid=copy_leaf_nid,
             consumer_leaf_nid=consumer_leaf_nid,
             source=source,
-            copied=copied,
+            copied=consumed,
         )
         return result
 
@@ -270,9 +269,52 @@ def _owned_leaf(ir: KernelIR, block_nid: int) -> int | None:
     return leaves[0] if len(leaves) == 1 else None
 
 
-def _loop_ancestors(ir: KernelIR, leaf_nid: int) -> tuple[int, ...]:
-    """Return the materialized loop nest enclosing one ISA leaf."""
-    return tuple(nid for nid in ir.tree.ancestors(leaf_nid) if isinstance(ir.tree.data(nid), ForNode))
+def _project_source_region(
+    ir: KernelIR, source: BufferRegion, copied: BufferRegion, consumed: BufferRegion
+) -> BufferRegion | None:
+    """Map one contained copied-buffer subregion back to its value source."""
+    if len(source.ranges) != len(copied.ranges) or len(copied.ranges) != len(consumed.ranges):
+        return None
+    analyzer = Analyzer()
+    extents: dict[str, int] = {}
+    for nid in ir.tree.preorder():
+        node = ir.tree.data(nid)
+        if isinstance(node, ForNode):
+            extents[node.loop_var] = max(extents.get(node.loop_var, 0), node.extent)
+    for loop_var, extent in extents.items():
+        analyzer.bind(loop_var, 0, extent)
+    ranges = []
+    for (source_lower, source_width), (copied_lower, copied_width), (used_lower, used_width) in zip(
+        source.ranges, copied.ranges, consumed.ranges
+    ):
+        if not analyzer.can_prove_equal(source_width, copied_width):
+            return None
+        offset = (
+            Const(value=0)
+            if analyzer.can_prove_equal(used_lower, copied_lower)
+            else analyzer.simplify(Sub(left=used_lower, right=copied_lower))
+        )
+        end = analyzer.simplify(Add(left=offset, right=used_width))
+        if not analyzer.can_prove(LE(left=Const(value=0), right=offset)) or not analyzer.can_prove(
+            LE(left=end, right=copied_width)
+        ):
+            return None
+        lower = analyzer.simplify(Add(left=source_lower, right=offset))
+        ranges.append((lower, used_width))
+    return BufferRegion(tensor=source.tensor, ranges=tuple(ranges))
+
+
+def _location_tile_compatible(consumer: ISANode, operand: str, source: BufferRegion, source_buffer: Buffer) -> bool:
+    """Enforce any operation-specific direct-HBM tile limits."""
+    if source_buffer.location != "shared_hbm":
+        return True
+    limits = getattr(consumer.op_cls, "HBM_SOURCE_MAX_TILE_SIZE", {})
+    for abstract_axis, maximum in limits.items():
+        dimension = consumer.op_cls.operand_dimension(operand, abstract_axis)
+        width = source.ranges[dimension][1]
+        if not isinstance(width, Const) or width.value > maximum:
+            return False
+    return True
 
 
 __all__ = ["CopyPropagation", "CopyPropagationOption"]

@@ -10,7 +10,6 @@ from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.base import PointwiseContract
 from nkigym.ops.tensor_scalar import NKITensorScalar
-from nkigym.search.state_facts import operation_facts
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -47,14 +46,13 @@ class DecomposeBroadcastSubtract(Transform[DecomposeBroadcastSubtractOption]):
     def analyze(self, ir: KernelIR) -> list[DecomposeBroadcastSubtractOption]:
         """Return supported broadcast-subtraction decompositions."""
         options: list[DecomposeBroadcastSubtractOption] = []
-        if "subtract" in operation_facts(ir).pointwise_operators:
-            overlap_nodes = software_pipeline_overlap_nodes(ir)
-            for block_nid in ir.tree.blocks():
-                if block_nid == ir.tree.root:
-                    continue
-                option = DecomposeBroadcastSubtractOption(pointwise_block_nid=block_nid)
-                if _resolve(ir, option, overlap_nodes) is not None:
-                    options.append(option)
+        overlap_nodes = software_pipeline_overlap_nodes(ir)
+        for block_nid in ir.tree.blocks():
+            if block_nid == ir.tree.root:
+                continue
+            option = DecomposeBroadcastSubtractOption(pointwise_block_nid=block_nid)
+            if _resolve(ir, option, overlap_nodes) is not None:
+                options.append(option)
         return options
 
     def apply(self, ir: KernelIR, option: DecomposeBroadcastSubtractOption) -> KernelIR:

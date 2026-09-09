@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import replace
 from math import prod
 
-from nkigym.ir.arith.expr import Const, Expr, Mul, Var, from_affine, substitute, to_affine
+from nkigym.ir.arith.expr import Const, Expr, Mul, Var, expr_variables, from_affine, substitute
 from nkigym.ir.tree import PARTITION_DIM, AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.transforms.helper.tree_ops import _block_local_descendants, _replace_in_parent_children
 
@@ -16,7 +17,7 @@ def _iter_value_loopvars(block: BlockNode) -> set[str]:
         *block.iter_values,
         *(lower for region in (*block.reads, *block.writes) for lower, _width in region.ranges),
     )
-    return {name for value in values for name in to_affine(value) if name is not None}
+    return {name for value in values for name in expr_variables(value)}
 
 
 def normalize_block(tree: KernelTree, block_nid: int) -> None:
@@ -36,18 +37,8 @@ def _drop_trip1(tree: KernelTree, block_nid: int) -> None:
     for nid in trivial:
         parent = tree.parent(nid)
         assert parent is not None
-        children = tree.children(nid)
-        _replace_in_parent_children(tree, parent, [nid], children)
+        _replace_in_parent_children(tree, parent, [nid], tree.children(nid))
         tree.graph.remove_node(nid)
-
-
-def _enclosing_dim_counts(tree: KernelTree, block_nid: int) -> dict[str, int]:
-    """Count enclosing loops per dimension to avoid rendered-name collisions."""
-    out: dict[str, int] = {}
-    for loop_var, _extent in _all_enclosing_loops(tree, block_nid):
-        dim = _dim_from_loopvar(loop_var)
-        out[dim] = out.get(dim, 0) + 1
-    return out
 
 
 def _all_enclosing_loops(tree: KernelTree, block_nid: int) -> list[tuple[str, int]]:
@@ -64,21 +55,30 @@ def _rename_dense(tree: KernelTree, block_nid: int) -> None:
     block = tree.data(block_nid)
     assert isinstance(block, BlockNode)
     old_to_dim = _loopvar_to_dim(tree, block_nid, block)
-    counters: dict[str, int] = dict(_enclosing_dim_counts(tree, block_nid))
+    counters = Counter(_dim_from_loopvar(loop_var) for loop_var, _extent in _all_enclosing_loops(tree, block_nid))
+    local_loops = [
+        (nid, data)
+        for nid in _block_local_descendants(tree, block_nid)
+        if isinstance((data := tree.data(nid)), ForNode)
+    ]
+    occupied = {
+        data.loop_var
+        for nid in (*tree.ancestors(block_nid), *tree.descendants(block_nid))
+        if isinstance((data := tree.data(nid)), ForNode)
+    }
     substitutions: dict[str, Expr] = {}
-    for nid in _block_local_descendants(tree, block_nid):
-        data = tree.data(nid)
-        if not isinstance(data, ForNode):
-            continue
+    for nid, data in local_loops:
         dim = old_to_dim.get(data.loop_var)
         if dim is None:
             continue
         n = counters.get(dim, 0)
+        while (new_name := f"i_{dim}_{n}") in occupied and new_name != data.loop_var:
+            n += 1
         counters[dim] = n + 1
-        new_name = f"i_{dim}_{n}"
         if new_name != data.loop_var:
             substitutions[data.loop_var] = Var(name=new_name)
             tree.graph.nodes[nid]["data"] = ForNode(loop_var=new_name, extent=data.extent)
+        occupied.add(new_name)
     if substitutions:
         _substitute_block_regions(tree, block_nid, substitutions)
 
@@ -265,7 +265,7 @@ def _recompute_region(
                 f"{region.tensor}: partition-axis width {width.value} must be a multiple of {partition_extent}"
             )
         partition_tiles = width.value // partition_extent
-        if _is_zero(affine):
+        if isinstance(affine, Const) and affine.value == 0:
             lo = affine
         elif is_partition and partition_tiles == 1:
             lo = affine
@@ -285,18 +285,12 @@ def _axis_capacity(buf: Buffer | None, axis_index: int, location: str, width: in
     return extent // width if width > 0 else 0
 
 
-def _is_zero(expr: Expr) -> bool:
-    """True when ``expr`` is the constant 0 (a loopless axis offsets at 0)."""
-    return isinstance(expr, Const) and expr.value == 0
-
-
 def _loopvar_to_dim(tree: KernelTree, block_nid: int, block: BlockNode) -> dict[str, str]:
     """Map each local loop variable to the concrete dimension it binds."""
     out: dict[str, str] = {}
     for iv, value in zip(block.iter_vars, block.iter_values):
-        for name in to_affine(value).keys():
-            if name is not None:
-                out[name] = iv.axis
+        for name in expr_variables(value):
+            out[name] = iv.axis
     """Fallback for loop_vars not yet in iter_values (freshly inserted by a split):
     parse the stem i_d{dim}_N -> d{dim}."""
     for nid in _block_local_descendants(tree, block_nid):

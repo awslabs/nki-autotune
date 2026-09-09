@@ -15,17 +15,16 @@ metadata and generated kernel into a cache directory.
 
 from __future__ import annotations
 
+import pickle
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, SupportsIndex
 
 from nkigym.ir.canonical_build import build_canonical_blocknode_tree
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.dimension_analysis import analyze_dimensions
 from nkigym.ir.tree import Buffer, KernelTree
-from nkigym.search.serialization import reduce_kernel_ir
 
 
 @dataclass
@@ -48,9 +47,17 @@ class KernelIR:
     dependency: Dependency
     param_buffers: dict[str, Buffer] = field(default_factory=dict)
 
-    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[Any, ...]:
-        """Return the cached compact process-transfer representation."""
-        return reduce_kernel_ir(self, protocol.__index__())
+    def __getstate__(self) -> bytes:
+        """Return one cached serialization payload for parallel read-only analysis."""
+        payload = self.__dict__.get("_pickle_cache")
+        if not isinstance(payload, bytes):
+            state = {key: value for key, value in self.__dict__.items() if key != "_pickle_cache"}
+            self.__dict__["_pickle_cache"] = payload = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
+        return payload
+
+    def __setstate__(self, payload: bytes) -> None:
+        """Restore one cached serialization payload."""
+        self.__dict__.update(pickle.loads(payload), _pickle_cache=payload)
 
     @property
     def return_name(self) -> str:
@@ -92,8 +99,7 @@ class KernelIR:
         """Write ``envelope.md`` and a black-formatted ``kernel.py`` into ``cache_dir``."""
         from nkigym.codegen import render
 
-        cache_path = Path(cache_dir)
-        cache_path.mkdir(parents=True, exist_ok=True)
+        (cache_path := Path(cache_dir)).mkdir(parents=True, exist_ok=True)
         (cache_path / "envelope.md").write_text(self._render_envelope_md(), encoding="utf-8")
         kernel_path = cache_path / "kernel.py"
         kernel_path.write_text(render(self), encoding="utf-8")
@@ -121,7 +127,7 @@ class KernelIR:
         return "\n".join(lines)
 
 
-def build_initial_ir(func: Callable[..., Any], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> KernelIR:
+def build_initial_ir(func: Callable[..., object], input_specs: dict[str, tuple[tuple[int, ...], str]]) -> KernelIR:
     """Run dim analysis, build the schedule tree, derive the dependency graph, flatten.
 
     Args:
@@ -150,6 +156,3 @@ def build_initial_ir(func: Callable[..., Any], input_specs: dict[str, tuple[tupl
         dependency=Dependency(tree),
         param_buffers=param_buffers,
     )
-
-
-__all__ = ["KernelIR", "build_initial_ir"]

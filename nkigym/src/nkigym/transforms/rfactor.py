@@ -13,7 +13,6 @@ from nkigym.ops.memset import NKIMemset
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.tensor_reduce import NKITensorReduce
 from nkigym.ops.tensor_tensor import NKITensorTensor
-from nkigym.search.state_facts import operation_facts
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -24,7 +23,7 @@ from nkigym.transforms.base import (
 )
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
 from nkigym.transforms.helper.canonical_rewrite import append_root_buffers, fresh_name, owning_block, single_leaf
-from nkigym.transforms.helper.normalize import normalize_block
+from nkigym.transforms.helper.normalize import _rename_dense
 from nkigym.transforms.helper.tile_region import retile_region
 from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 from nkigym.transforms.split import (
@@ -121,7 +120,8 @@ class _SlotRFactor:
             location="sbuf",
         )
         append_root_buffers(ir, (slot_buffer,))
-        loop_nid = self._factor_source_to_slots(ir, match, target_axis, factors, slot_buffer.name)
+        loop_nid, output_region = self._factor_source_to_slots(ir, match, target_axis, factors, slot_buffer.name)
+        match = replace(match, output_region=output_region)
         loop = ir.tree.loop(loop_nid)
         partial_read = BufferRegion(
             tensor=slot_buffer.name, ranges=(match.output_region.ranges[0], (Const(value=0), Const(value=loop.extent)))
@@ -203,70 +203,82 @@ class _SlotRFactor:
 
     def _factor_source_to_slots(
         self, ir: KernelIR, match: _SlotMatch, target_axis: str, factors: tuple[int, int], slot_name: str
-    ) -> int:
+    ) -> tuple[int, BufferRegion]:
         """Create the factor loop and make every iteration write one partial slot."""
-        leaf = ir.tree.isa(match.leaf_nid)
         parent_nid = ir.tree.parent(match.leaf_nid)
         if parent_nid is None:
             raise AssertionError(f"slot reduction leaf {match.leaf_nid} has no parent")
-        block = ir.tree.block(match.block_nid)
 
         top_nid, bottom_nid = _build_for_chain(ir.tree, f"i_{target_axis}", factors[:-1])
+        ir.tree.graph.add_edge(bottom_nid, match.leaf_nid)
+        _replace_in_parent_children(ir.tree, parent_nid, [match.leaf_nid], [top_nid])
+        _rename_dense(ir.tree, match.block_nid)
+
+        leaf = ir.tree.isa(match.leaf_nid)
+        block = ir.tree.block(match.block_nid)
+        output_region = leaf.operand_bindings[match.contract.output_operand]
         factor_loop = ir.tree.loop(top_nid)
-        partial_write = BufferRegion(
-            tensor=slot_name, ranges=(match.output_region.ranges[0], (Var(name=factor_loop.loop_var), Const(value=1)))
-        )
+        factor_value = Var(name=factor_loop.loop_var)
+        partial_write = BufferRegion(tensor=slot_name, ranges=(output_region.ranges[0], (factor_value, Const(value=1))))
 
         inverse_axis_map = {concrete: abstract for abstract, concrete in block.axis_map.items()}
         abstract_axis = inverse_axis_map.get(target_axis)
         new_width = factors[-1]
 
-        def set_width(lo: Expr, _width: int) -> tuple[Expr, int]:
-            """Keep the offset while setting the factored reduction width."""
-            return lo, new_width
+        def split_width(lo: Expr, _width: int) -> tuple[Expr, int]:
+            """Add one factor-loop tile relative to the existing allocation frame."""
+            offset = Mul(left=factor_value, right=Const(value=new_width))
+            return Add(left=lo, right=offset), new_width
 
         bindings = {
-            slot: retile_region(region, leaf.op_cls.OPERAND_AXES[slot], abstract_axis, set_width)
+            slot: retile_region(region, leaf.op_cls.operand_axis_groups(slot), abstract_axis, split_width)
             for slot, region in leaf.operand_bindings.items()
         }
         bindings[match.contract.output_operand] = partial_write
 
         tensor_to_axes = {
-            leaf.operand_bindings[slot].tensor: leaf.op_cls.OPERAND_AXES[slot] for slot in leaf.operand_bindings
+            leaf.operand_bindings[slot].tensor: leaf.op_cls.operand_axis_groups(slot) for slot in leaf.operand_bindings
         }
         iter_vars = tuple(
             replace(iter_var, role=AxisRole.PARALLEL) if iter_var.axis == match.reduction_axis else iter_var
             for iter_var in block.iter_vars
         )
+        iter_values = tuple(
+            (
+                Add(left=Mul(left=value, right=Const(value=factors[0])), right=factor_value)
+                if iter_var.axis == match.reduction_axis
+                else value
+            )
+            for iter_var, value in zip(block.iter_vars, block.iter_values)
+        )
         writes = tuple(
             (
                 partial_write
-                if region == match.output_region
-                else retile_region(region, tensor_to_axes.get(region.tensor, ()), abstract_axis, set_width)
+                if region == output_region
+                else retile_region(region, tensor_to_axes.get(region.tensor, ()), abstract_axis, split_width)
             )
             for region in block.writes
         )
         ir.tree.graph.nodes[match.block_nid]["data"] = replace(
             block,
             iter_vars=iter_vars,
+            iter_values=iter_values,
             reads=tuple(
-                retile_region(region, tensor_to_axes.get(region.tensor, ()), abstract_axis, set_width)
+                retile_region(region, tensor_to_axes.get(region.tensor, ()), abstract_axis, split_width)
                 for region in block.reads
             ),
             writes=writes,
         )
         ir.tree.graph.nodes[match.leaf_nid]["data"] = replace(leaf, operand_bindings=bindings)
-        ir.tree.graph.add_edge(bottom_nid, match.leaf_nid)
-        _replace_in_parent_children(ir.tree, parent_nid, [match.leaf_nid], [top_nid])
-        normalize_block(ir.tree, match.block_nid)
         offset_spec = getattr(leaf.op_cls, "SPLIT_OFFSET_KWARGS", {}).get(abstract_axis)
         if offset_spec is not None:
+            assert abstract_axis is not None
             offset_key, output_slot = offset_spec
             current = ir.tree.isa(match.leaf_nid)
-            output_axis = current.op_cls.OPERAND_AXES[output_slot].index(abstract_axis)
+            output_axis = current.op_cls.operand_dimension(output_slot, abstract_axis)
             kwargs = {**current.kwargs, offset_key: current.operand_bindings[output_slot].ranges[output_axis][0]}
             ir.tree.graph.nodes[match.leaf_nid]["data"] = replace(current, kwargs=kwargs)
-        return top_nid
+        return top_nid, output_region
 
     def _iter_value(self, block: BlockNode, axis: str | None) -> Expr | None:
         """Return the iter value for ``axis``."""
@@ -382,8 +394,6 @@ class RFactor(Transform[RFactorOption]):
 
     def analyze(self, ir: KernelIR) -> list[RFactorOption]:
         """Enumerate every fully legal ACCUMULATION loop of an rfactorable op."""
-        if not operation_facts(ir).has_rfactor:
-            return []
         options: list[RFactorOption] = []
         overlap_nodes = software_pipeline_overlap_nodes(ir)
         analysis = _RMWAnalysis(buffers=ir.all_buffers(), order={nid: i for i, nid in enumerate(ir.tree.preorder())})
@@ -430,9 +440,7 @@ class RFactor(Transform[RFactorOption]):
                 axis_loops = [
                     nid
                     for nid in ir.tree.ancestors(leaf)
-                    if isinstance((node := ir.tree.data(nid)), ForNode)
-                    and node.loop_var in binding_vars
-                    and block_nid in ir.tree.ancestors(nid)
+                    if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var in binding_vars
                 ]
             if (
                 self._supports_rmw_op(op_cls)
@@ -493,7 +501,7 @@ class RFactor(Transform[RFactorOption]):
         return result
 
     def _drain_block_is_removable(self, ir: KernelIR, loop_nid: int, matmul_leaf: int, analysis: _RMWAnalysis) -> bool:
-        """Whether the sole drain is an outside-``ko`` identity copy in its own block."""
+        """Whether the sole consumer is an outside-``ko`` identity drain."""
         matmul = ir.tree.data(matmul_leaf)
         assert isinstance(matmul, ISANode)
         psum_name = matmul.operand_bindings["dst"].tensor
@@ -515,6 +523,7 @@ class RFactor(Transform[RFactorOption]):
             out_name = drain.operand_bindings["dst"].tensor
             result = (
                 leaves == drains
+                and ir.dependency.direct_consumers(matmul_leaf) == [drain_nid]
                 and loop_nid not in ir.tree.ancestors(drain_nid)
                 and analysis.order[matmul_leaf] < analysis.order[drain_nid]
                 and drain.operand_bindings["src"].ranges == drain.operand_bindings["dst"].ranges

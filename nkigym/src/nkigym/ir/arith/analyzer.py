@@ -105,6 +105,3 @@ class Analyzer:
         diff = self.simplify(Sub(left=lhs, right=rhs))
         result = diff == Const(value=0) or affine_terms(lhs) == affine_terms(rhs)
         return result
-
-
-__all__ = ["Analyzer"]

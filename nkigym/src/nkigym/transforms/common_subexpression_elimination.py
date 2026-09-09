@@ -7,8 +7,7 @@ from dataclasses import dataclass, replace
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Expr, Var, substitute
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
-from nkigym.ops.base import PointwiseContract
-from nkigym.search.state_facts import operation_facts
+from nkigym.ops.base import PermutationContract, PointwiseContract
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -44,12 +43,10 @@ class _CommonSubexpressionMatch:
 
 
 class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOption]):
-    """Share identical contract-declared pointwise expressions."""
+    """Share identical contract-declared pure expressions."""
 
     def analyze(self, ir: KernelIR) -> list[CommonSubexpressionEliminationOption]:
         """Return repeated pure pointwise blocks within each direct child list."""
-        if not operation_facts(ir).pointwise_operators:
-            return []
         options: list[CommonSubexpressionEliminationOption] = []
         overlap_nodes = software_pipeline_overlap_nodes(ir)
         for parent_nid in ir.tree.preorder():
@@ -74,13 +71,13 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
         return options
 
     def _candidate_key(self, ir: KernelIR, block_nid: int) -> str | None:
-        """Return a cheap exact-match key for one pure pointwise block."""
+        """Return a cheap exact-match key for one pure expression block."""
         leaf_nid = single_leaf(ir.tree, block_nid)
         key: str | None = None
         if leaf_nid is not None:
             leaf = ir.tree.isa(leaf_nid)
             contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
-            if isinstance(contract, PointwiseContract):
+            if isinstance(contract, (PointwiseContract, PermutationContract)):
                 block = ir.tree.block(block_nid)
                 loop_extents = tuple(
                     node.extent
@@ -146,7 +143,7 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
         canonical_contract = canonical_leaf.op_cls.algebraic_contract(canonical_leaf.kwargs)
         redundant_contract = redundant_leaf.op_cls.algebraic_contract(redundant_leaf.kwargs)
         if (
-            not isinstance(canonical_contract, PointwiseContract)
+            not isinstance(canonical_contract, (PointwiseContract, PermutationContract))
             or canonical_contract != redundant_contract
             or canonical_leaf.op_cls is not redundant_leaf.op_cls
             or canonical_leaf.kwargs != redundant_leaf.kwargs
@@ -217,7 +214,7 @@ class CommonSubexpressionElimination(Transform[CommonSubexpressionEliminationOpt
             return ()
         leaf = ir.tree.isa(leaf_nid)
         contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
-        if not isinstance(contract, PointwiseContract):
+        if not isinstance(contract, (PointwiseContract, PermutationContract)):
             return ()
         output = leaf.operand_bindings.get(contract.output_operand)
         if output is None:

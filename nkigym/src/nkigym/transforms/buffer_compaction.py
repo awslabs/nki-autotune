@@ -8,9 +8,9 @@ from dataclasses import dataclass, replace
 from nkigym.codegen.compact import _compact_one, compact_buffer_shapes
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Expr, to_affine
+from nkigym.ir.buffer_placement import _offsets_consistently, layout_satisfies_output_alignment
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
-from nkigym.search.buffer_placement import _offsets_consistently, layout_satisfies_output_alignment
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.buffer_region_normalization import (
     _regions_requiring_normalization,

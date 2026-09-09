@@ -48,6 +48,3 @@ def rebind_exact_retile(dependency: Dependency, tree: KernelTree, block_nid: int
         raise AssertionError("exact retile changed ISA leaf execution order")
     result._topology_valid = False
     return result
-
-
-__all__ = ["rebind_exact_retile", "rebind_unchanged_dependency"]
