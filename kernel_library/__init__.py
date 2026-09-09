@@ -15,7 +15,7 @@ from typing import TypedDict, cast
 import numpy as np
 import torch
 
-from kernel_library._best_nkigym import BEST_NKIGYM_ARTIFACTS, BestNKIGymArtifact, BestNKIGymLadderStep
+from kernel_library._best_nkigym import BEST_NKIGYM_LADDERS
 from nkigym.profile import InputSpecs
 
 TorchResult = torch.Tensor | tuple[torch.Tensor | None, ...] | dict[str, torch.Tensor | np.ndarray] | np.ndarray
@@ -106,9 +106,10 @@ def _coerce_enum_args(function: Callable[..., object], inputs: dict[str, object]
     return coerced
 
 
-class _WorkloadFields(TypedDict):
-    """Fields shared by every strict workload dictionary."""
+class Workload(TypedDict):
+    """One strict NAKB workload dictionary."""
 
+    torch_ref: TorchReference
     input_specs: InputSpecs
     input_generator: InputGenerator
     atol: float
@@ -117,24 +118,6 @@ class _WorkloadFields(TypedDict):
     best_nkigym_latency_ms: float
 
 
-class _RawWorkload(_WorkloadFields):
-    """One literal workload dictionary before artifact attachment."""
-
-    torch_ref: TorchReference
-
-
-class Workload(_RawWorkload):
-    """One target workload with its current best NKIGym compatibility record."""
-
-    best_nkigym_kernel: str | None
-    best_nkigym_ladder: tuple[BestNKIGymLadderStep, ...] | None
-
-
-class SynthesisWorkload(Workload):
-    """One workload exposed through the compatibility alias registry."""
-
-
-_RAW_WORKLOAD_FIELDS = frozenset(_RawWorkload.__required_keys__)
 _WORKLOAD_FIELDS = frozenset(Workload.__required_keys__)
 _GROUPED_SYNTHESIS_WORKLOADS = {"dynamic_elementwise_add_m512_h256": ("dynamic_elementwise_add", 0)}
 
@@ -161,36 +144,13 @@ def _validate_input_specs(module_name: str, raw_input_specs: object) -> InputSpe
     return cast(InputSpecs, input_specs)
 
 
-def _validate_best_artifact(
-    module_name: str, workload_name: str, nakb_latency_ms: float, best_nkigym_latency_ms: float
-) -> BestNKIGymArtifact | None:
-    """Validate one optional kernel-and-ladder compatibility record."""
-    artifact = BEST_NKIGYM_ARTIFACTS.get(workload_name)
-    if best_nkigym_latency_ms < nakb_latency_ms and artifact is None:
-        raise ValueError(f"{module_name} improves on NAKB but has no recorded best NKIGym artifact")
-    if artifact is not None:
-        if not artifact.kernel or not artifact.kernel.endswith("\n"):
-            raise ValueError(f"{module_name}.best_nkigym_kernel must be a non-empty source string ending in newline")
-        if not isinstance(artifact.ladder, tuple):
-            raise TypeError(f"{module_name}.best_nkigym_ladder must be a tuple")
-        for step_index, step in enumerate(artifact.ladder):
-            context = f"{module_name}.best_nkigym_ladder[{step_index}]"
-            if not isinstance(step, dict) or set(step) != {"transform", "option"}:
-                raise TypeError(f"{context} must contain exactly transform and option")
-            if not isinstance(step["transform"], str) or not step["transform"]:
-                raise ValueError(f"{context}.transform must be a non-empty string")
-            if not isinstance(step["option"], dict):
-                raise TypeError(f"{context}.option must be a dictionary")
-    return artifact
-
-
 def _validate_workload(module_name: str, workload_name: str, raw_workload: object) -> Workload:
-    """Validate one literal workload and attach its recorded NKIGym artifact."""
+    """Validate one literal workload."""
     if not isinstance(raw_workload, dict):
         raise TypeError(f"{module_name} workload must be a dictionary")
     values = cast(dict[str, object], raw_workload)
-    if set(values) != _RAW_WORKLOAD_FIELDS:
-        raise ValueError(f"{module_name} workload fields must be exactly {sorted(_RAW_WORKLOAD_FIELDS)}")
+    if set(values) != _WORKLOAD_FIELDS:
+        raise ValueError(f"{module_name} workload fields must be exactly {sorted(_WORKLOAD_FIELDS)}")
     torch_ref = values["torch_ref"]
     input_specs = _validate_input_specs(module_name, values["input_specs"])
     input_generator = values["input_generator"]
@@ -215,20 +175,12 @@ def _validate_workload(module_name: str, workload_name: str, raw_workload: objec
         latency = cast(float, values[field])
         if latency <= 0.0:
             raise ValueError(f"{module_name}.{field} must be positive")
-    artifact = _validate_best_artifact(
-        module_name,
-        workload_name,
-        cast(float, values["nakb_latency_ms"]),
-        cast(float, values["best_nkigym_latency_ms"]),
-    )
-    enriched = {
-        **values,
-        "best_nkigym_kernel": None if artifact is None else artifact.kernel,
-        "best_nkigym_ladder": None if artifact is None else artifact.ladder,
-    }
-    if set(enriched) != _WORKLOAD_FIELDS:
-        raise AssertionError(f"{module_name} runtime workload fields are inconsistent")
-    return cast(Workload, enriched)
+    if (
+        cast(float, values["best_nkigym_latency_ms"]) < cast(float, values["nakb_latency_ms"])
+        and workload_name not in BEST_NKIGYM_LADDERS
+    ):
+        raise ValueError(f"{module_name} improves on NAKB but has no recorded best NKIGym ladder")
+    return cast(Workload, values)
 
 
 def _validate_grouped_workloads(module_name: str, workload_type: str, raw_workloads: object) -> tuple[Workload, ...]:
@@ -263,20 +215,20 @@ def _discover_workloads() -> dict[str, tuple[Workload, ...]]:
         for workload_type, workloads in nakb_workloads.items()
         for workload_index in range(len(workloads))
     }
-    unknown_artifacts = sorted(set(BEST_NKIGYM_ARTIFACTS) - registered_names)
-    if unknown_artifacts:
-        raise RuntimeError(f"best NKIGym artifacts reference unknown workloads: {', '.join(unknown_artifacts)}")
+    unknown_ladders = sorted(set(BEST_NKIGYM_LADDERS) - registered_names)
+    if unknown_ladders:
+        raise RuntimeError(f"best NKIGym ladders reference unknown workloads: {', '.join(unknown_ladders)}")
     return dict(sorted(nakb_workloads.items()))
 
 
-def _workload_aliases(nakb_workloads: dict[str, tuple[Workload, ...]]) -> dict[str, SynthesisWorkload]:
+def _workload_aliases(nakb_workloads: dict[str, tuple[Workload, ...]]) -> dict[str, Workload]:
     """Return configured aliases for selected NAKB workloads."""
-    workloads: dict[str, SynthesisWorkload] = {}
+    workloads: dict[str, Workload] = {}
     for workload_name, (workload_type, workload_index) in _GROUPED_SYNTHESIS_WORKLOADS.items():
         grouped_workloads = nakb_workloads.get(workload_type)
         if grouped_workloads is None or workload_index >= len(grouped_workloads):
             raise RuntimeError(f"missing grouped synthesis workload {workload_name!r}")
-        workloads[workload_name] = cast(SynthesisWorkload, grouped_workloads[workload_index])
+        workloads[workload_name] = grouped_workloads[workload_index]
     return dict(sorted(workloads.items()))
 
 
@@ -285,12 +237,10 @@ WORKLOADS = _workload_aliases(NAKB_WORKLOADS)
 
 __all__ = [
     "ArgumentAdapter",
-    "BestNKIGymArtifact",
-    "BestNKIGymLadderStep",
+    "BEST_NKIGYM_LADDERS",
     "InputGenerator",
     "InputSpecs",
     "NAKB_WORKLOADS",
-    "SynthesisWorkload",
     "TorchReference",
     "TorchResult",
     "WORKLOADS",

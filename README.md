@@ -36,23 +36,21 @@ pytest --cpu-hosts gym-cpu-1 gym-cpu-2
 The option accepts one or more hosts, and each CPU simulation batch uses all
 configured hosts. Tests that do not use remote simulation can run without it.
 
-The complete agentic benchmark starts one bounded Codex transform search for
-each registered NAKB workload. Pin the model and budgets when comparing backend
-revisions:
+The complete ladder benchmark replays the current best public-transform ladder
+for each registered NAKB workload:
 
 ```bash
-NKIGYM_AGENTIC_MODEL=<codex-model> \
-NKIGYM_AGENTIC_TRACE_ROOT=/tmp/nkigym-agentic \
+NKIGYM_AGENTIC_TRACE_ROOT=/tmp/nkigym-ladder-replay \
 PYTHONPATH="$PWD:$PWD/nkigym/src" python -m pytest \
   test/test_agentic_ladder_build.py \
   --trn2-hosts gym-trn2-1
 ```
 
-Each subagent receives only the objective to use current NKIGym transforms to
-find the fastest kernel and may inspect Neuron Explorer profiler information.
-The harness records every retained state, the winning kernel and ladder, and
-the confirmed latency. The final kernel must pass the workload's copied NAKB
-accuracy checks on Trn2. The aggregate metric is:
+The development skill owns adaptive exploration and records confirmed ladders
+in `kernel_library/_best_nkigym.py`. Pytest starts from the current canonical
+IR, requires every recorded option to remain legal, renders the replayed
+endpoint, and checks the workload's copied NAKB accuracy contract on Trn2. The
+aggregate metric is:
 
 ```text
 relative_latency = sum(confirmed NKIGym latency) / sum(NAKB latency)
@@ -130,15 +128,15 @@ reductions. Unsupported operations raise `ValueError`.
 
 Every runtime workload contains a copied NAKB PyTorch golden reference, tensor
 input specifications, seeded input generator, correctness tolerances, a fixed
-NAKB baseline in `nakb_latency_ms`, and three best-NKIGym fields:
-`best_nkigym_kernel`, `best_nkigym_latency_ms`, and `best_nkigym_ladder`.
-Untuned workloads have no kernel or ladder artifact. Optional committed
-compatibility artifacts live in `kernel_library/_best_nkigym.py`.
+NAKB baseline in `nakb_latency_ms`, recorded best latency metadata in
+`best_nkigym_latency_ms`, and an optional `best_nkigym_ladder`. Committed
+replayable ladders live in `kernel_library/_best_nkigym.py`; a missing artifact
+means the canonical empty ladder.
 
-The agentic relative-latency benchmark does not use those records as per-workload
-performance thresholds. It starts from the current canonical lowering, derives
-a fresh ladder using the current backend, and records results under its trace
-root. Final acceptance calls the unified
+The relative-latency benchmark synthesizes the current canonical lowering and
+programmatically replays each recorded ladder by matching every serialized step
+to exactly one currently legal public-transform option. Final acceptance calls
+the unified
 `nkigym.profile.profile_metrics` backend with exact inputs, which compiles
 once, captures outputs, and profiles that same NEFF. It compares each output
 with the copied Torch golden using
