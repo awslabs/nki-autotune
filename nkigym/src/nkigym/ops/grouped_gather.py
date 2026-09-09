@@ -26,6 +26,7 @@ class NKIGroupedGather(NKIOp):
     FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {"G": "groups", "P": "partitions"}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"G": 1, "P": 1, "F": 1, "N": 1}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"G": 1, "P": 128, "F": None, "N": None}
+    NON_TILABLE_AXES: ClassVar[frozenset[str]] = frozenset({"F"})
     CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"groups", "partitions"})
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 

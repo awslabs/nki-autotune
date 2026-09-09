@@ -12,13 +12,19 @@ from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.base import AxisRole, CopyContract, NKIOp, PointwiseContract, ReductionContract
 from nkigym.ops.range_select import NKIRangeSelect
 from nkigym.ops.range_select_reduce import NKIRangeSelectReduce
+from nkigym.ops.scalar_tensor_tensor import NKIScalarTensorTensor
+from nkigym.ops.tensor_scalar import NKITensorScalar
 from nkigym.ops.tensor_scalar_reduce import NKITensorScalarReduce
+from nkigym.ops.tensor_tensor import NKITensorTensor
 from nkigym.transforms.base import (
+    ActivationComposition,
     Transform,
     TransformLegalityError,
     TransformOption,
+    active_block_axes_align,
     copy_for_rewrite,
     intersects_software_pipeline,
+    resolve_activation_composition,
     software_pipeline_overlap_nodes,
 )
 from nkigym.transforms.helper.canonical_rewrite import block_chain, finalize_rewrite, remove_buffers, single_leaf
@@ -70,6 +76,20 @@ class _PointwiseCopyMatch:
     output_operand: str
     intermediate: BufferRegion
     destination: BufferRegion
+
+
+@dataclass(frozen=True)
+class _PointwiseSequenceMatch:
+    """Resolved operands for one exact two-instruction pointwise fusion."""
+
+    option: FusePointwiseOption
+    consumer_leaf_nid: int
+    data: BufferRegion
+    operand0: BufferRegion | None
+    other: BufferRegion
+    intermediate: BufferRegion
+    destination: BufferRegion
+    kwargs: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -133,7 +153,15 @@ class FusePointwise(Transform[FusePointwiseOption]):
         option: FusePointwiseOption,
         overlap_nodes: frozenset[int] | None = None,
         adjacent: bool | None = None,
-    ) -> _BroadcastActivationMatch | _PointwiseActivationMatch | _PointwiseCopyMatch | _ReductionFusion | None:
+    ) -> (
+        _BroadcastActivationMatch
+        | _PointwiseActivationMatch
+        | ActivationComposition
+        | _PointwiseCopyMatch
+        | _PointwiseSequenceMatch
+        | _ReductionFusion
+        | None
+    ):
         """Resolve one adjacent pair to exactly one native fusion."""
         if adjacent is None:
             adjacent = self._are_adjacent(ir, option.pointwise_block_nid, option.consumer_block_nid)
@@ -148,9 +176,15 @@ class FusePointwise(Transform[FusePointwiseOption]):
             return None
         fusion = self._resolve_copy(ir, option)
         if fusion is None:
+            fusion = resolve_activation_composition(
+                ir, option.pointwise_block_nid, option.consumer_block_nid, self._has_unique_consumer
+            )
+        if fusion is None:
             fusion = self._resolve_activation(ir, option)
         if fusion is None:
             fusion = self._resolve_broadcast_activation(ir, option)
+        if fusion is None:
+            fusion = self._resolve_sequence(ir, option)
         if fusion is None:
             fusion = self._resolve_reduction(ir, option)
         return fusion
@@ -182,17 +216,180 @@ class FusePointwise(Transform[FusePointwiseOption]):
     def _rewrite(
         self,
         ir: KernelIR,
-        fusion: _BroadcastActivationMatch | _PointwiseActivationMatch | _PointwiseCopyMatch | _ReductionFusion,
+        fusion: (
+            _BroadcastActivationMatch
+            | _PointwiseActivationMatch
+            | ActivationComposition
+            | _PointwiseCopyMatch
+            | _PointwiseSequenceMatch
+            | _ReductionFusion
+        ),
     ) -> None:
         """Apply one resolved native fusion."""
         if isinstance(fusion, _PointwiseCopyMatch):
             self._rewrite_copy(ir, fusion)
+        elif isinstance(fusion, ActivationComposition):
+            self._rewrite_activation_composition(ir, fusion)
         elif isinstance(fusion, _PointwiseActivationMatch):
             self._rewrite_activation(ir, fusion)
         elif isinstance(fusion, _BroadcastActivationMatch):
             self._rewrite_broadcast_activation(ir, fusion)
+        elif isinstance(fusion, _PointwiseSequenceMatch):
+            self._rewrite_sequence(ir, fusion)
         else:
             self._rewrite_reduction(ir, fusion)
+
+    def _rewrite_activation_composition(self, ir: KernelIR, match: ActivationComposition) -> None:
+        """Absorb one pointwise producer into one activation."""
+        consumer = ir.tree.isa(match.consumer_leaf_nid)
+        bindings = dict(consumer.operand_bindings)
+        bindings["data"] = match.data
+        bindings.pop("bias", None)
+        ir.tree.graph.nodes[match.consumer_leaf_nid]["data"] = replace(
+            consumer, op_cls=NKIActivation, operand_bindings=bindings, kwargs=match.kwargs
+        )
+        block = ir.tree.block(match.consumer_block_nid)
+        ir.tree.graph.nodes[match.consumer_block_nid]["data"] = replace(block, reads=(match.data,))
+        self._remove_pointwise_block(ir, match.producer_block_nid)
+        remove_buffers(ir, {match.intermediate.tensor})
+        finalize_rewrite(ir)
+
+    def _resolve_sequence(self, ir: KernelIR, option: FusePointwiseOption) -> _PointwiseSequenceMatch | None:
+        """Resolve one affine pointwise result consumed by one binary pointwise op."""
+        producer_nid = option.pointwise_block_nid
+        consumer_nid = option.consumer_block_nid
+        producer_leaf_nid = single_leaf(ir.tree, producer_nid)
+        consumer_leaf_nid = self._owned_leaf(ir, consumer_nid)
+        if producer_leaf_nid is None or consumer_leaf_nid is None:
+            return None
+        producer_leaf = ir.tree.isa(producer_leaf_nid)
+        consumer_leaf = ir.tree.isa(consumer_leaf_nid)
+        if (
+            consumer_leaf.op_cls is not NKITensorTensor
+            or producer_leaf.access_patterns
+            or consumer_leaf.access_patterns
+        ):
+            return None
+        producer = producer_leaf.op_cls.algebraic_contract(producer_leaf.kwargs)
+        consumer = consumer_leaf.op_cls.algebraic_contract(consumer_leaf.kwargs)
+        producer_block = ir.tree.block(producer_nid)
+        consumer_block = ir.tree.block(consumer_nid)
+        if (
+            not isinstance(producer, PointwiseContract)
+            or not isinstance(consumer, PointwiseContract)
+            or consumer.operator not in {"add", "subtract", "multiply", "maximum"}
+            or consumer.input_operands != ("data1", "data2")
+            or not active_block_axes_align(producer_leaf, producer_block, consumer_block)
+            or any(
+                buffer.name != producer_leaf.operand_bindings[producer.output_operand].tensor
+                for buffer in producer_block.alloc_buffers
+            )
+        ):
+            return None
+        data = producer_leaf.operand_bindings.get("data")
+        operand0 = producer_leaf.operand_bindings.get("operand0")
+        intermediate = producer_leaf.operand_bindings.get(producer.output_operand)
+        left = consumer_leaf.operand_bindings.get("data1")
+        right = consumer_leaf.operand_bindings.get("data2")
+        destination = consumer_leaf.operand_bindings.get(consumer.output_operand)
+        if None in {data, intermediate, left, right, destination}:
+            return None
+        data = cast(BufferRegion, data)
+        intermediate = cast(BufferRegion, intermediate)
+        left = cast(BufferRegion, left)
+        right = cast(BufferRegion, right)
+        destination = cast(BufferRegion, destination)
+        if (left == intermediate) == (right == intermediate):
+            return None
+        other, reverse1 = (right, False) if left == intermediate else (left, True)
+        kwargs = self._sequence_kwargs(producer_leaf, producer, consumer.operator, operand0)
+        if kwargs is None:
+            return None
+        buffers = ir.all_buffers()
+        legal = (
+            data.ranges == intermediate.ranges == destination.ranges
+            and tuple(width for _lower, width in other.ranges) == tuple(width for _lower, width in destination.ranges)
+            and intermediate.tensor not in ir.param_buffers
+            and intermediate.tensor not in ir.return_names
+            and buffers[data.tensor].location in NKIScalarTensorTensor.INPUT_LOCATIONS["data"]
+            and (
+                operand0 is None
+                or buffers[operand0.tensor].location in NKIScalarTensorTensor.INPUT_LOCATIONS["operand0"]
+            )
+            and buffers[other.tensor].location in NKIScalarTensorTensor.INPUT_LOCATIONS["operand1"]
+            and buffers[destination.tensor].location == NKIScalarTensorTensor.OUTPUT_LOCATION
+            and not (buffers[data.tensor].location == buffers[other.tensor].location == "psum")
+            and self._has_unique_consumer(ir, intermediate.tensor, producer_leaf_nid, consumer_leaf_nid)
+        )
+        if not legal:
+            return None
+        if reverse1:
+            kwargs["reverse1"] = True
+        return _PointwiseSequenceMatch(
+            option=option,
+            consumer_leaf_nid=consumer_leaf_nid,
+            data=data,
+            operand0=operand0,
+            other=other,
+            intermediate=intermediate,
+            destination=destination,
+            kwargs=kwargs,
+        )
+
+    def _sequence_kwargs(
+        self, producer_leaf: ISANode, producer: PointwiseContract, consumer_operator: str, operand0: BufferRegion | None
+    ) -> dict[str, Any] | None:
+        """Return native sequence kwargs for one activation or tensor-scalar producer."""
+        kwargs: dict[str, Any] | None = None
+        if producer_leaf.op_cls is NKIActivation and producer.operator == "copy":
+            scalar = self._affine_scalar(producer)
+            if scalar is not None:
+                op0, literal, reverse0 = scalar
+                kwargs = {"op0": op0, "operand0": literal, "op1": consumer_operator}
+                if reverse0:
+                    kwargs["reverse0"] = True
+        elif (
+            producer_leaf.op_cls is NKITensorScalar
+            and producer.operator in {"add", "subtract", "multiply", "maximum"}
+            and producer.input_operands == ("data", "operand0")
+            and producer.broadcast_operands == frozenset({"operand0"})
+        ):
+            literal = producer_leaf.kwargs.get("operand0")
+            if (operand0 is None) == isinstance(literal, float):
+                kwargs = {"op0": producer.operator, "op1": consumer_operator}
+                if operand0 is None:
+                    kwargs["operand0"] = literal
+                if producer.reverse:
+                    kwargs["reverse0"] = True
+        return kwargs
+
+    def _affine_scalar(self, contract: PointwiseContract) -> tuple[str, float, bool] | None:
+        """Represent one affine copy as a single scalar operation."""
+        result: tuple[str, float, bool] | None = None
+        if contract.scale == 1.0 and contract.bias != 0.0:
+            result = ("add", contract.bias, False)
+        elif contract.scale == -1.0:
+            result = ("subtract", contract.bias, True)
+        elif contract.bias == 0.0 and contract.scale != 1.0:
+            result = ("multiply", contract.scale, False)
+        return result
+
+    def _rewrite_sequence(self, ir: KernelIR, match: _PointwiseSequenceMatch) -> None:
+        """Replace two exact pointwise instructions by their native sequence ISA."""
+        bindings = {"data": match.data, "operand1": match.other, "dst": match.destination}
+        if match.operand0 is not None:
+            bindings["operand0"] = match.operand0
+        ir.tree.graph.nodes[match.consumer_leaf_nid]["data"] = ISANode(
+            op_cls=NKIScalarTensorTensor, operand_bindings=bindings, kwargs=match.kwargs
+        )
+        consumer = ir.tree.block(match.option.consumer_block_nid)
+        reads = tuple(
+            dict.fromkeys((match.data, *((match.operand0,) if match.operand0 is not None else ()), match.other))
+        )
+        ir.tree.graph.nodes[match.option.consumer_block_nid]["data"] = replace(consumer, reads=reads)
+        remove_buffers(ir, {match.intermediate.tensor})
+        self._remove_pointwise_block(ir, match.option.pointwise_block_nid)
+        finalize_rewrite(ir)
 
     def _resolve_copy(self, ir: KernelIR, option: FusePointwiseOption) -> _PointwiseCopyMatch | None:
         """Resolve a pointwise result followed by one value-preserving copy."""
@@ -222,11 +419,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
                 copy_contract = copy_leaf.op_cls.algebraic_contract(copy_leaf.kwargs)
                 pointwise_block = ir.tree.block(pointwise_nid)
                 copy_block = ir.tree.block(copy_nid)
-                aligned = (
-                    pointwise_block.iter_vars == copy_block.iter_vars
-                    and pointwise_block.iter_values == copy_block.iter_values
-                    and pointwise_block.axis_map == copy_block.axis_map
-                )
+                aligned = active_block_axes_align(pointwise_leaf, pointwise_block, copy_block)
                 if (
                     aligned
                     and isinstance(pointwise, PointwiseContract)
@@ -399,7 +592,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
             and isinstance(ir.tree.data(activation_nid), BlockNode)
         ):
             pointwise_leaf_nid = single_leaf(ir.tree, pointwise_nid)
-            activation_leaf_nid = single_leaf(ir.tree, activation_nid)
+            activation_leaf_nid = self._owned_leaf(ir, activation_nid)
             if pointwise_leaf_nid is not None and activation_leaf_nid is not None:
                 pointwise_leaf = ir.tree.isa(pointwise_leaf_nid)
                 activation_leaf = ir.tree.isa(activation_leaf_nid)
@@ -708,13 +901,28 @@ class FusePointwise(Transform[FusePointwiseOption]):
 
     def _blocks_align(self, pointwise: BlockNode, reduction: BlockNode, contract: ReductionContract) -> bool:
         """Return whether both blocks describe the same iteration domain."""
-        pointwise_axes = tuple((iter_var.axis, iter_var.dom) for iter_var in pointwise.iter_vars)
-        reduction_axes = tuple((iter_var.axis, iter_var.dom) for iter_var in reduction.iter_vars)
+        pointwise_axes = tuple(
+            (iter_var.axis, iter_var.dom, iter_value)
+            for iter_var, iter_value in zip(pointwise.iter_vars, pointwise.iter_values, strict=True)
+            if iter_var.dom[1] - iter_var.dom[0] > 1
+        )
+        reduction_axes = tuple(
+            (iter_var.axis, iter_var.dom, iter_value)
+            for iter_var, iter_value in zip(reduction.iter_vars, reduction.iter_values, strict=True)
+            if iter_var.dom[1] - iter_var.dom[0] > 1
+        )
+        pointwise_concrete = {axis for axis, _dom, _value in pointwise_axes}
+        reduction_concrete = {axis for axis, _dom, _value in reduction_axes}
+        pointwise_map = {
+            abstract: concrete for abstract, concrete in pointwise.axis_map.items() if concrete in pointwise_concrete
+        }
+        reduction_map = {
+            abstract: concrete for abstract, concrete in reduction.axis_map.items() if concrete in reduction_concrete
+        }
         return (
-            pointwise.axis_map == reduction.axis_map
-            and contract.reduction_axis in pointwise.axis_map
+            pointwise_map == reduction_map
+            and contract.reduction_axis in pointwise_map
             and pointwise_axes == reduction_axes
-            and pointwise.iter_values == reduction.iter_values
         )
 
     def _native_fusion(

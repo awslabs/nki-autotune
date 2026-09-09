@@ -20,7 +20,6 @@ class NKITensorScalarCumulative(NKIOp):
     NON_TILABLE_AXES: ClassVar[frozenset[str]] = frozenset({"F"})
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 1, "F": 1}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
-    PREFERRED_TILE_SIZE: ClassVar[dict[str, int]] = {"F": 2048}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def _check_roles(self, **kwargs: Any) -> None:

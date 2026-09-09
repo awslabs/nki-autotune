@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from functools import cache
-from math import isqrt
+from math import gcd, isqrt, prod
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.analyzer import Analyzer
-from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var
+from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var, to_affine
 from nkigym.ir.dependency_rebind import rebind_exact_retile
+from nkigym.ir.program_sharding import configured_program_shards
 from nkigym.ir.tree import BlockNode, Buffer, ForNode, ISANode, KernelTree
 from nkigym.ops.base import ReductionContract
-from nkigym.search.program_sharding import program_sharded_loops
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -22,13 +23,7 @@ from nkigym.transforms.base import (
     software_pipeline_overlap_nodes,
 )
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
-from nkigym.transforms.helper.normalize import (
-    _dim_loops,
-    _iter_value,
-    _recompute_bindings,
-    _rename_dense,
-    _substitute_block_regions,
-)
+from nkigym.transforms.helper.normalize import _dim_loops, _iter_value, _rename_dense, _substitute_block_regions
 from nkigym.transforms.helper.tile_region import retile_region
 from nkigym.transforms.helper.tree_ops import _block_local_descendants, _replace_in_parent_children
 
@@ -60,7 +55,7 @@ class Split(Transform[SplitOption]):
         options: list[SplitOption] = []
         buffers = ir.all_buffers()
         overlap_nodes = software_pipeline_overlap_nodes(ir)
-        sharded_loops = program_sharded_loops(ir)
+        sharded_loops = configured_program_shards(ir)
         for nid in ir.tree.preorder():
             data = ir.tree.data(nid)
             if nid in overlap_nodes or nid in sharded_loops:
@@ -117,7 +112,7 @@ class Split(Transform[SplitOption]):
         target = _resolve(ir.tree, option.target_nid)
         if intersects_software_pipeline(ir, (option.target_nid,)):
             raise TransformLegalityError("Split cannot alter an active software-pipeline scope")
-        if option.target_nid in program_sharded_loops(ir):
+        if option.target_nid in configured_program_shards(ir):
             raise TransformLegalityError("Split cannot replace a loop assigned to logical NeuronCores")
         if subtree_has_access_patterns(ir.tree, option.target_nid):
             raise TransformLegalityError("Split cannot rewrite a loop or ISA operand with an explicit access pattern")
@@ -253,7 +248,7 @@ class Split(Transform[SplitOption]):
             return lo, new_width
 
         new_bindings = {
-            slot: retile_region(region, leaf.op_cls.OPERAND_AXES[slot], abstract_axis, _set_width)
+            slot: retile_region(region, leaf.op_cls.operand_axis_groups(slot), abstract_axis, _set_width)
             for slot, region in leaf.operand_bindings.items()
         }
         ir.tree.graph.nodes[leaf_nid]["data"] = ISANode(
@@ -263,7 +258,9 @@ class Split(Transform[SplitOption]):
         """Block reads/writes are keyed by tensor name, not slot; map tensor->axes via the leaf
         so each region uses its own operand's axes. A region whose tensor is not an operand
         gets () axes -> no-op."""
-        tensor_to_axes = {leaf.operand_bindings[s].tensor: leaf.op_cls.OPERAND_AXES[s] for s in leaf.operand_bindings}
+        tensor_to_axes = {
+            leaf.operand_bindings[slot].tensor: leaf.op_cls.operand_axis_groups(slot) for slot in leaf.operand_bindings
+        }
         new_block = BlockNode(
             iter_vars=block.iter_vars,
             iter_values=block.iter_values,
@@ -280,26 +277,14 @@ class Split(Transform[SplitOption]):
         ir.tree.graph.nodes[block_nid]["data"] = new_block
 
         _normalize_split_block(ir.tree, block_nid)
-        current_block = ir.tree.block(block_nid)
-        dim_loops = _dim_loops(ir.tree, block_nid, current_block)
-        iter_values = tuple(
-            _iter_value(iter_var.axis, dim_loops) if iter_var.axis == option.target_axis else value
-            for iter_var, value in zip(current_block.iter_vars, current_block.iter_values)
-        )
-        ir.tree.graph.nodes[block_nid]["data"] = replace(current_block, iter_values=iter_values)
-        current_leaf = ir.tree.isa(leaf_nid)
-        tensor_axes = {
-            region.tensor: current_leaf.op_cls.OPERAND_AXES[slot].index(abstract_axis)
-            for slot, region in current_leaf.operand_bindings.items()
-            if abstract_axis in current_leaf.op_cls.OPERAND_AXES[slot]
-        }
-        _recompute_bindings(ir.tree, block_nid, tensor_axes=tensor_axes)
+        assert abstract_axis is not None
+        _rebind_tensorized_split(ir.tree, block_nid, leaf_nid, top_nid, option.target_axis, abstract_axis)
         offset_spec = getattr(leaf.op_cls, "SPLIT_OFFSET_KWARGS", {}).get(abstract_axis)
         if offset_spec is not None:
             offset_key, output_slot = offset_spec
             current = ir.tree.isa(leaf_nid)
             kwargs = dict(current.kwargs)
-            output_axis = current.op_cls.OPERAND_AXES[output_slot].index(abstract_axis)
+            output_axis = current.op_cls.operand_dimension(output_slot, abstract_axis)
             kwargs[offset_key] = current.operand_bindings[output_slot].ranges[output_axis][0]
             ir.tree.graph.nodes[leaf_nid]["data"] = ISANode(
                 op_cls=current.op_cls,
@@ -335,6 +320,49 @@ def _normalize_split_block(tree: KernelTree, block_nid: int) -> None:
                     substitutions[old_name] = Var(name=new_name)
         if substitutions:
             _substitute_block_regions(tree, nested_block, substitutions)
+
+
+def _rebind_tensorized_split(
+    tree: KernelTree, block_nid: int, leaf_nid: int, loop_nid: int, target_axis: str, abstract_axis: str
+) -> None:
+    """Add one tensorized tile coordinate relative to each existing region."""
+    block = tree.block(block_nid)
+    dim_loops = _dim_loops(tree, block_nid, block)
+    iter_values = tuple(
+        _iter_value(iter_var.axis, dim_loops) if iter_var.axis == target_axis else value
+        for iter_var, value in zip(block.iter_vars, block.iter_values)
+    )
+    leaf = tree.isa(leaf_nid)
+    loop_value = Var(name=tree.loop(loop_nid).loop_var)
+    analyzer = Analyzer()
+
+    def rebind(slot: str):
+        """Offset one operand's selected axis within its prior tile."""
+        region = leaf.operand_bindings[slot]
+        groups = leaf.op_cls.operand_axis_groups(slot)
+        if not any(abstract_axis in group for group in groups):
+            return region
+        axis_index = leaf.op_cls.operand_dimension(slot, abstract_axis)
+        ranges = list(region.ranges)
+        lower, width = ranges[axis_index]
+        offset = Mul(left=loop_value, right=width)
+        ranges[axis_index] = (analyzer.simplify(Add(left=lower, right=offset)), width)
+        return replace(region, ranges=tuple(ranges))
+
+    bindings = {slot: rebind(slot) for slot in leaf.operand_bindings}
+    rmw = leaf.op_cls.rmw_operands(leaf.kwargs)
+    reads = tuple(
+        bindings[slot]
+        for slot in leaf.op_cls.OPERAND_AXES
+        if slot in bindings and (slot in leaf.op_cls.INPUT_OPERANDS or slot in rmw)
+    )
+    writes = tuple(
+        bindings[slot]
+        for slot in leaf.op_cls.OPERAND_AXES
+        if slot in bindings and slot not in leaf.op_cls.INPUT_OPERANDS
+    )
+    tree.graph.nodes[block_nid]["data"] = replace(block, iter_values=iter_values, reads=reads, writes=writes)
+    tree.graph.nodes[leaf_nid]["data"] = replace(leaf, operand_bindings=bindings)
 
 
 def _enclosing_block_of(tree: KernelTree, nid: int) -> int | None:
@@ -440,11 +468,12 @@ def _current_tensorize_width(leaf: ISANode, block: BlockNode, concrete_axis: str
     width: int | None = None
     if abstract is not None:
         op_cls = leaf.op_cls
-        for slot, axes in op_cls.OPERAND_AXES.items():
-            if abstract not in axes or slot not in leaf.operand_bindings:
+        for slot in op_cls.OPERAND_AXES:
+            groups = op_cls.operand_axis_groups(slot)
+            if not any(abstract in group for group in groups) or slot not in leaf.operand_bindings:
                 continue
             region = leaf.operand_bindings[slot]
-            axis_index = axes.index(abstract)
+            axis_index = op_cls.operand_dimension(slot, abstract)
             if axis_index < len(region.ranges):
                 _lo, hi = region.ranges[axis_index]
                 if isinstance(hi, Const):
@@ -453,11 +482,52 @@ def _current_tensorize_width(leaf: ISANode, block: BlockNode, concrete_axis: str
     return width
 
 
+def _tensorized_loop_element_stride(tree: KernelTree, block_nid: int, loop_nid: int) -> Fraction:
+    """Return one loop's element stride, including factors absorbed by Fuse."""
+    block = tree.block(block_nid)
+    loop_var = tree.loop(loop_nid).loop_var
+    matches = [
+        (iter_var, to_affine(value))
+        for iter_var, value in zip(block.iter_vars, block.iter_values)
+        if loop_var in to_affine(value)
+    ]
+    if len(matches) != 1:
+        raise TransformLegalityError(
+            f"loop {loop_nid} ({loop_var!r}) must bind exactly one iter_var in block {block_nid}"
+        )
+    iter_var, affine = matches[0]
+    leaves = [
+        nid
+        for nid in tree.preorder(block_nid)
+        if isinstance(tree.data(nid), ISANode)
+        and next(ancestor for ancestor in reversed(tree.ancestors(nid)) if isinstance(tree.data(ancestor), BlockNode))
+        == block_nid
+    ]
+    if len(leaves) != 1:
+        raise TransformLegalityError(f"block {block_nid} must own exactly one ISA leaf; found {leaves}")
+    width = _current_tensorize_width(tree.isa(leaves[0]), block, iter_var.axis)
+    coefficients = tuple(abs(coefficient) for name, coefficient in affine.items() if name is not None and coefficient)
+    coordinate_scale = gcd(*coefficients)
+    if width is not None and coordinate_scale and width % coordinate_scale == 0:
+        stride = Fraction(affine[loop_var] * width, coordinate_scale)
+    else:
+        bound_names = {name for name in affine if name is not None}
+        extents = {
+            loop.loop_var: loop.extent
+            for nid in tree.ancestors(leaves[0])
+            if isinstance((loop := tree.data(nid)), ForNode) and loop.loop_var in bound_names
+        }
+        if extents.keys() != bound_names:
+            raise TransformLegalityError(f"block {block_nid} has no execution loops for bindings {sorted(bound_names)}")
+        stride = Fraction(affine[loop_var] * (iter_var.dom[1] - iter_var.dom[0]), prod(extents.values()))
+    return stride
+
+
 def _is_static_axis(leaf: ISANode, block: BlockNode, concrete_axis: str) -> bool:
     """Return whether ``concrete_axis`` is fixed, non-tileable, or statically sliced."""
     abstract = next((axis for axis, concrete in block.axis_map.items() if concrete == concrete_axis), None)
     sliced = any(
-        leaf.op_cls.OPERAND_AXES[slot][index] == abstract
+        abstract in leaf.op_cls.operand_axis_groups(slot)[index]
         for slot, specs in getattr(leaf.op_cls, "INPUT_SLICES", {}).items()
         for index, _start, _width, *_alignment in specs
     )

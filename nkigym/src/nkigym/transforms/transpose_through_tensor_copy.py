@@ -5,12 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
+from nkigym.ir.buffer_placement import layout_satisfies_alignment
 from nkigym.ir.tree import ISANode
 from nkigym.ops.dma_transpose import NKIDMATranspose
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.transpose import NKITranspose
-from nkigym.search.buffer_placement import layout_satisfies_alignment
-from nkigym.search.state_facts import operation_facts
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, is_canonical_block, replace_buffer, single_leaf
 from nkigym.transforms.helper.transpose_pattern import TransposeChain, match_transpose_chain
@@ -28,9 +27,6 @@ class TransposeThroughTensorCopy(Transform[TransposeThroughTensorCopyOption]):
 
     def analyze(self, ir: KernelIR) -> list[TransposeThroughTensorCopyOption]:
         """Return every logical transpose eligible for DMA execution."""
-        facts = operation_facts(ir)
-        if not facts.has_copy or not ({NKITranspose, NKIDMATranspose} & facts.op_classes):
-            return []
         options: list[TransposeThroughTensorCopyOption] = []
         root_children = ir.tree.children(ir.tree.root)
         for index, block_nid in enumerate(root_children[:-1]):
@@ -62,9 +58,11 @@ def _match(ir: KernelIR, option: TransposeThroughTensorCopyOption) -> tuple[Tran
         if index + 1 < len(root_children):
             result = match_transpose_chain(ir, option.transpose_nid, root_children[index + 1], adjacent=True)
             if result is not None:
+                source = ir.buffer(result.source)
                 candidate = replace(ir.buffer(result.psum), location="sbuf")
                 alignment = NKIDMATranspose.OUTPUT_TILE_ALIGNMENT_BYTES["dst"]
-                if not layout_satisfies_alignment(candidate, alignment):
+                valid = NKIDMATranspose.accepts_input_storage_dtypes({"src": source.physical_dtype()})
+                if not valid or not layout_satisfies_alignment(candidate, alignment):
                     result = None
             else:
                 result = _match_dma_transpose_chain(ir, option.transpose_nid, root_children[index + 1])

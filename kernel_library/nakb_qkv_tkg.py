@@ -370,7 +370,7 @@ WORKLOADS = (
         "atol": 0.05,
         "rtol": 0.05,
         "nakb_latency_ms": 0.044084931,
-        "best_historical_latency_ms": 0.044084931,
+        "best_nkigym_latency_ms": 0.044084931,
     },
     {
         "torch_ref": _torch_ref_1,
@@ -379,7 +379,7 @@ WORKLOADS = (
         "atol": 0.05,
         "rtol": 0.05,
         "nakb_latency_ms": 0.053449917,
-        "best_historical_latency_ms": 0.053449917,
+        "best_nkigym_latency_ms": 0.053449917,
     },
     {
         "torch_ref": _torch_ref_2,
@@ -388,7 +388,7 @@ WORKLOADS = (
         "atol": 0.05,
         "rtol": 0.05,
         "nakb_latency_ms": 0.049799089,
-        "best_historical_latency_ms": 0.049799089,
+        "best_nkigym_latency_ms": 0.049799089,
     },
     {
         "torch_ref": _torch_ref_3,
@@ -401,7 +401,7 @@ WORKLOADS = (
         "atol": 0.05,
         "rtol": 0.05,
         "nakb_latency_ms": 0.348356955,
-        "best_historical_latency_ms": 0.348356955,
+        "best_nkigym_latency_ms": 0.348356955,
     },
     {
         "torch_ref": _torch_ref_4,
@@ -415,7 +415,7 @@ WORKLOADS = (
         "atol": 0.05,
         "rtol": 0.05,
         "nakb_latency_ms": 0.035203278,
-        "best_historical_latency_ms": 0.035203278,
+        "best_nkigym_latency_ms": 0.035203278,
     },
     {
         "torch_ref": _torch_ref_5,
@@ -429,7 +429,7 @@ WORKLOADS = (
         "atol": 0.05,
         "rtol": 0.05,
         "nakb_latency_ms": 0.053429083,
-        "best_historical_latency_ms": 0.053429083,
+        "best_nkigym_latency_ms": 0.053429083,
     },
     {
         "torch_ref": _torch_ref_6,
@@ -444,7 +444,7 @@ WORKLOADS = (
         "atol": 0.05,
         "rtol": 0.05,
         "nakb_latency_ms": 0.051194087,
-        "best_historical_latency_ms": 0.051194087,
+        "best_nkigym_latency_ms": 0.051194087,
     },
     {
         "torch_ref": _torch_ref_7,
@@ -459,7 +459,7 @@ WORKLOADS = (
         "atol": 0.05,
         "rtol": 0.05,
         "nakb_latency_ms": 0.053172416,
-        "best_historical_latency_ms": 0.053172416,
+        "best_nkigym_latency_ms": 0.053172416,
     },
     {
         "torch_ref": _torch_ref_8,
@@ -473,7 +473,7 @@ WORKLOADS = (
         "atol": 0.05,
         "rtol": 0.05,
         "nakb_latency_ms": 0.083299037,
-        "best_historical_latency_ms": 0.083299037,
+        "best_nkigym_latency_ms": 0.083299037,
     },
     {
         "torch_ref": _torch_ref_9,
@@ -488,6 +488,6 @@ WORKLOADS = (
         "atol": 0.05,
         "rtol": 0.05,
         "nakb_latency_ms": 0.042026601,
-        "best_historical_latency_ms": 0.042026601,
+        "best_nkigym_latency_ms": 0.042026601,
     },
 )

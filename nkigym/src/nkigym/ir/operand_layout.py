@@ -1,4 +1,4 @@
-"""Flattened operand-axis regions and explicit ISA tensor views."""
+"""Build canonical operand regions and explicit ISA tensor views."""
 
 from __future__ import annotations
 
@@ -236,7 +236,7 @@ def access_pattern_allocation_view(access_pattern: AccessPattern, buf: Buffer) -
     logical_span = buf.tiles_per_list() * free
     full_stride = buf.logical_tile_count() * free
     first_stride, extent = access_pattern.pattern[0]
-    valid = first_stride == Const(value=full_stride) or first_stride == Const(value=0) and extent == Const(value=1)
+    valid = first_stride == Const(value=full_stride) or extent == Const(value=1)
     if not valid:
         raise AssertionError(f"{buf.name}: access pattern must expose the on-chip partition axis first")
     pattern = ((Const(value=logical_span * buf.versions), extent), *access_pattern.pattern[1:])

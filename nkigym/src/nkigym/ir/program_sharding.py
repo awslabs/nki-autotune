@@ -1,11 +1,11 @@
-"""Shared analysis for one-dimensional SPMD loop sharding."""
+"""Analyze materialized one-dimensional SPMD loop sharding."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 
-from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Expr, Var, substitute, to_affine
+from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var, substitute, to_affine
+from nkigym.ir.ir import KernelIR
 from nkigym.ir.tree import BlockNode, ForNode, ISANode
 
 PROGRAM_SHARDS_ANNOTATION = "program_shards"
@@ -24,14 +24,6 @@ def configured_program_shards(ir: KernelIR) -> dict[int, int]:
     ):
         raise ValueError(f"invalid {PROGRAM_SHARDS_ANNOTATION} annotation: {value!r}")
     return dict(value)
-
-
-program_sharded_loops = configured_program_shards
-
-
-def block_has_axis(ir: KernelIR, block_nid: int, axis: str) -> bool:
-    """Return whether one block declares ``axis``."""
-    return any(iter_var.axis == axis for iter_var in ir.tree.block(block_nid).iter_vars)
 
 
 def axis_loop_for_block(ir: KernelIR, block_nid: int, axis: str) -> int | None:
@@ -60,9 +52,9 @@ def operation_axis_iterations(
     values = [value for iter_var, value in zip(block.iter_vars, block.iter_values) if iter_var.axis == concrete_axis]
     if len(values) != 1:
         raise ValueError(f"operation axis {abstract_axis!r} has {len(values)} bindings")
-    variables = to_affine(values[0])
+    variables, shards = to_affine(values[0]), configured_program_shards(ir)
     return tuple(
-        substitutions.get(node.loop_var, Var(name=node.loop_var))
+        _local_iteration(substitutions.get(node.loop_var, Var(name=node.loop_var)), node, nid in shards)
         for nid in ir.tree.ancestors(leaf_nid)
         if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var in variables
     )
@@ -87,20 +79,20 @@ def _direct_leaf(ir: KernelIR, block_nid: int) -> int | None:
     return leaves[0] if len(leaves) == 1 else None
 
 
+def _local_iteration(value: Expr, loop: ForNode, sharded: bool) -> Expr:
+    """Return a reduction iteration relative to the current program."""
+    offset = Var(name=f"nl.program_id(0) * ({loop.extent} // nl.num_programs(0))")
+    return Add(left=value, right=Mul(left=Const(value=-1), right=offset)) if sharded else value
+
+
 def _axis_loop(ir: KernelIR, block_nid: int, leaf_nid: int, block: BlockNode, axis: str) -> int | None:
     """Return the outermost enclosing loop contributing to one concrete axis."""
     values = [value for iter_var, value in zip(block.iter_vars, block.iter_values) if iter_var.axis == axis]
-    result: int | None = None
-    if len(values) == 1:
-        variables = set(to_affine(values[0]))
-        ancestors = ir.tree.ancestors(leaf_nid)
-        if block_nid in ancestors:
-            result = next(
-                (
-                    nid
-                    for nid in ancestors
-                    if isinstance(ir.tree.data(nid), ForNode) and ir.tree.loop(nid).loop_var in variables
-                ),
-                None,
-            )
-    return result
+    ancestors = ir.tree.ancestors(leaf_nid)
+    if len(values) != 1 or block_nid not in ancestors:
+        return None
+    variables = set(to_affine(values[0]))
+    return next(
+        (nid for nid in ancestors if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var in variables),
+        None,
+    )

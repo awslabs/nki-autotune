@@ -38,7 +38,7 @@ class NKIGroupedRangeSelectReduce(NKIOp):
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {axis: 1 for axis in "GQTPF"}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"G": 1, "Q": 1, "T": 1, "P": 128, "F": 512}
     CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"groups", "queries", "tiles", "partitions", "width"})
-    SPLIT_OFFSET_KWARGS: ClassVar[dict[str, tuple[str, str]]] = {"F": ("range_start", "dst")}
+    SPLIT_OFFSET_KWARGS: ClassVar[dict[str, tuple[str, str]]] = {"F": ("range_start", "on_true_tile")}
     OUTPUT_DTYPES: ClassVar[dict[str, str]] = {"dst": "float32", "reduce_res": "float32"}
     OUTPUT_STORAGE_DTYPES: ClassVar[dict[str, str]] = {"dst": "float32", "reduce_res": "float32"}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"

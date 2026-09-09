@@ -54,7 +54,7 @@ WORKLOADS = (
         "atol": 0.0,
         "rtol": 0.0,
         "nakb_latency_ms": 0.017452472,
-        "best_historical_latency_ms": 0.017452472,
+        "best_nkigym_latency_ms": 0.017452472,
     },
     {
         "torch_ref": _torch_ref_0,
@@ -63,7 +63,7 @@ WORKLOADS = (
         "atol": 0.0,
         "rtol": 0.0,
         "nakb_latency_ms": 0.014358311,
-        "best_historical_latency_ms": 0.014358311,
+        "best_nkigym_latency_ms": 0.014358311,
     },
     {
         "torch_ref": _torch_ref_0,
@@ -72,7 +72,7 @@ WORKLOADS = (
         "atol": 0.0,
         "rtol": 0.0,
         "nakb_latency_ms": 0.015344143,
-        "best_historical_latency_ms": 0.015344143,
+        "best_nkigym_latency_ms": 0.015344143,
     },
     {
         "torch_ref": _torch_ref_0,
@@ -81,7 +81,7 @@ WORKLOADS = (
         "atol": 0.0,
         "rtol": 0.0,
         "nakb_latency_ms": 0.023373297,
-        "best_historical_latency_ms": 0.023373297,
+        "best_nkigym_latency_ms": 0.023373297,
     },
     {
         "torch_ref": _torch_ref_0,
@@ -90,7 +90,7 @@ WORKLOADS = (
         "atol": 0.0,
         "rtol": 0.0,
         "nakb_latency_ms": 0.02359163,
-        "best_historical_latency_ms": 0.02359163,
+        "best_nkigym_latency_ms": 0.02359163,
     },
     {
         "torch_ref": _torch_ref_0,
@@ -99,7 +99,7 @@ WORKLOADS = (
         "atol": 0.0,
         "rtol": 0.0,
         "nakb_latency_ms": 0.0210808,
-        "best_historical_latency_ms": 0.0210808,
+        "best_nkigym_latency_ms": 0.0210808,
     },
     {
         "torch_ref": _torch_ref_0,
@@ -108,7 +108,7 @@ WORKLOADS = (
         "atol": 0.0,
         "rtol": 0.0,
         "nakb_latency_ms": 0.021144967,
-        "best_historical_latency_ms": 0.021144967,
+        "best_nkigym_latency_ms": 0.021144967,
     },
     {
         "torch_ref": _torch_ref_0,
@@ -117,6 +117,6 @@ WORKLOADS = (
         "atol": 0.0,
         "rtol": 0.0,
         "nakb_latency_ms": 0.027949956,
-        "best_historical_latency_ms": 0.027949956,
+        "best_nkigym_latency_ms": 0.027949956,
     },
 )

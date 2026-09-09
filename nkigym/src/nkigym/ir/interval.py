@@ -6,7 +6,7 @@ loop-var symbols (``coeffs`` in :func:`nkigym.ir.arith.expr.to_affine` form)
 and ``width`` is a constant. Two intervals on the same axis are
 *provably disjoint* iff the integer range of ``a.base - b.base`` over
 the loop-var box (each var in ``[0, extent)``) cannot fall in the open
-overlap window ``(-b.width, a.width)``.
+overlap window ``(-a.width, b.width)``.
 
 Soundness: when the difference range straddles the window (e.g. two
 independent loop vars), we conservatively report *not disjoint* — never
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from nkigym.ir.arith.expr import Const, to_affine
+from nkigym.ir.arith.expr import Const, NonAffineError, to_affine
 from nkigym.ir.tree import PARTITION_DIM, Buffer, BufferRegion
 
 
@@ -39,14 +39,14 @@ def intervals_disjoint(a: AffineInterval, b: AffineInterval, loop_extents: dict[
 
     ``loop_extents`` maps each loop-var name to its trip count (the var
     ranges over ``[0, extent)``). Overlap requires
-    ``-b.width < (a.base - b.base) < a.width``. We compute the integer
+    ``-a.width < (a.base - b.base) < b.width``. We compute the integer
     range of ``a.base - b.base`` over the box and check it cannot intersect
     that open window.
     """
     diff = _sub(a.coeffs, b.coeffs)
     lo, hi = _affine_range(diff, loop_extents)
-    """Open overlap window: (-b.width, a.width). Overlap iff lo < a.width and hi > -b.width."""
-    overlaps = lo < a.width and hi > -b.width
+    """Open overlap window: (-a.width, b.width). Overlap iff lo < b.width and hi > -a.width."""
+    overlaps = lo < b.width and hi > -a.width
     return not overlaps
 
 
@@ -113,13 +113,13 @@ def _interval_for_axis(axis_range: tuple, axis_index: int, buf: Buffer) -> Affin
     lo_expr, width_expr = axis_range
     if not isinstance(width_expr, Const):
         raise ValueError(f"region width must be Const; got {width_expr!r}")
-    base = to_affine(lo_expr)
+    try:
+        base = to_affine(lo_expr)
+    except NonAffineError:
+        return AffineInterval(coeffs={None: 0}, width=buf.shape[axis_index])
     width = width_expr.value
     is_partition = axis_index == 0 and buf.location in ("sbuf", "psum")
     if is_partition:
         """Convert a bare physical partition-tile index to element space."""
         base = {var: coeff * buf.partition_extent() for var, coeff in base.items()}
     return AffineInterval(coeffs=base, width=width)
-
-
-__all__ = ["AffineInterval", "intervals_disjoint", "regions_disjoint"]

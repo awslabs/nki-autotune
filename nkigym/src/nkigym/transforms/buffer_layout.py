@@ -1,11 +1,4 @@
-"""``BufferLayout`` transform — re-factorize a buffer's logical tile axis into a
-``list_len x tiles_per_list`` form whose product is the logical tile count.
-
-A pure field-set on :attr:`Buffer.list_len`: it changes neither regions nor
-tree structure, only allocation granularity. Pipeline versions remain a separate
-multiplier within every list entry. Mirrors :class:`SoftwarePipeline`, which sets
-the sibling :attr:`Buffer.versions`.
-"""
+"""Change one on-chip buffer's logical tile storage layout."""
 
 from __future__ import annotations
 
@@ -13,10 +6,9 @@ from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Add, Const, Mul, to_affine
+from nkigym.ir.buffer_placement import layout_satisfies_output_alignment
 from nkigym.ir.dependency_rebind import rebind_unchanged_dependency
 from nkigym.ir.tree import BlockNode, Buffer, ISANode
-from nkigym.search.buffer_placement import layout_satisfies_output_alignment
-from nkigym.search.serialization import inherit_analysis_result
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.access_pattern import tensor_has_access_pattern
 
@@ -72,7 +64,6 @@ class BufferLayout(Transform[BufferLayoutOption]):
         new_ir = copy_for_rewrite(ir)
         self._set_list_len(new_ir, option.tensor, option.list_len)
         new_ir.dependency = rebind_unchanged_dependency(ir.dependency, new_ir.tree)
-        inherit_analysis_result(ir, new_ir, "code-motion")
         return new_ir
 
     def _check_legality(self, ir: KernelIR, option: BufferLayoutOption) -> None:

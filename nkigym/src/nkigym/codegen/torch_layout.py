@@ -23,7 +23,14 @@ def input_layouts(graph_module: GraphModule) -> Layouts:
             logits, targets = cast(tuple[Node, Node], node.args[:2])
             while targets.op == "call_method" and targets.target in {"long", "to"}:
                 targets = cast(Node, targets.args[0])
-            if logits.op == targets.op == "placeholder":
+            if logits.op == targets.op == "placeholder" and operation == "cross_entropy":
+                rows, vocab = _graph_shape(logits)
+                divisors = filter(lambda extent: rows % extent == 0, range(1, min(32, rows // 2) + 1))
+                partitions = max(divisors, default=rows)
+                groups = rows // partitions
+                layouts[str(logits.target)] = (("cross_entropy_rows", groups), (partitions, groups * vocab))
+                layouts[str(targets.target)] = (("cross_entropy_targets", groups, vocab), (partitions, groups))
+            elif logits.op == targets.op == "placeholder":
                 layouts[str(targets.target)] = (("one_hot",), _graph_shape(logits))
             continue
         if node.op == "call_function" and operation in {"conv1d", "conv2d", "conv3d"}:
@@ -61,8 +68,7 @@ def input_layouts(graph_module: GraphModule) -> Layouts:
 
 def head_grouped_layouts(graph_module: GraphModule) -> Layouts:
     """Find broadcasted rank-four half rotations that share one matrix ABI."""
-    nodes = tuple(graph_module.graph.nodes)
-    operations = {_graph_operation(node) for node in nodes}
+    nodes, operations = tuple(graph_module.graph.nodes), {_graph_operation(node) for node in graph_module.graph.nodes}
     if "cat" not in operations or not any(node.op == "call_method" and node.target == "unsqueeze" for node in nodes):
         return {}
     data = tuple(node for node in nodes if node.op == "placeholder" and len(_graph_shape(node)) == 4)
@@ -83,8 +89,7 @@ def head_grouped_layouts(graph_module: GraphModule) -> Layouts:
 
 def standard_rope_layouts(graph_module: GraphModule) -> Layouts:
     """Find a statically unrolled rotary complex multiply."""
-    nodes = tuple(graph_module.graph.nodes)
-    operations = {_graph_operation(node) for node in nodes}
+    nodes, operations = tuple(graph_module.graph.nodes), {_graph_operation(node) for node in graph_module.graph.nodes}
     if not {"empty_like", "setitem", "stack"}.issubset(operations):
         return {}
     data = tuple(node for node in nodes if node.op == "placeholder" and len(_graph_shape(node)) == 4)

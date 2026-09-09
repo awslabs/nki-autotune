@@ -17,10 +17,7 @@ from nkigym.ops.grouped_store import rotational_topk_config
 from nkigym.ops.grouped_tensor_copy import grouped_attention
 
 InputSpecs = dict[str, tuple[tuple[int, ...], str]]
-OUTPUT_LAYOUTS = (
-    "block_diagonal grouped_context head_grouped metadata_groups nonzero_flat rope_data routed_tokens "
-    "token_attention".split()
-)
+OUTPUT_LAYOUTS = "block_diagonal cross_entropy_rows grouped_context head_grouped metadata_groups nonzero_flat rope_data routed_tokens token_attention".split()
 
 
 class _TraceParameter:
@@ -103,14 +100,12 @@ def block_diagonal(array: np.ndarray, shape: tuple[int, ...], transpose: bool) -
     """Pack one batched matrix into a block-diagonal rank-two ABI."""
     if array.ndim != 3 or len(shape) != 2:
         raise ValueError(f"block-diagonal layout requires rank three, got {array.shape}")
-    batch = array.shape[0]
-    if transpose or (batch * array.shape[1], batch * array.shape[2]) != shape:
+    if transpose or ((batch := array.shape[0]) * array.shape[1], batch * array.shape[2]) != shape:
         array = array.transpose(0, 2, 1)
     batch, rows, columns = array.shape
     if (batch * rows, batch * columns) != shape:
         raise ValueError(f"cannot normalize batched matrix shape {array.shape} to {shape}")
-    output = np.zeros(shape, dtype=array.dtype)
-    indices = np.arange(batch)
+    output, indices = np.zeros(shape, dtype=array.dtype), np.arange(batch)
     output.reshape(batch, rows, batch, columns)[indices, :, indices, :] = array
     return output
 
@@ -140,8 +135,7 @@ def standard_rope_coeff(array: np.ndarray, shape: tuple[int, ...]) -> np.ndarray
     if array.ndim != 3 or shape[1] != array.shape[0]:
         raise ValueError(f"cannot normalize standard RoPE coefficient shape {array.shape} to {shape}")
     width, batch, sequence = array.shape
-    heads = shape[0] // (batch * sequence)
-    if shape != (batch * heads * sequence, width):
+    if shape != (batch * (heads := shape[0] // (batch * sequence)) * sequence, width):
         raise ValueError(f"cannot repeat standard RoPE coefficient shape {array.shape} to {shape}")
     return np.repeat(array.transpose(1, 2, 0)[:, None, :, :], heads, axis=1).reshape(shape)
 
@@ -327,18 +321,21 @@ def moe_gate_up_input(array: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
 
 def direct_hbm_placeholder(node: Node) -> bool:
     """Return whether one routed placeholder is consumed directly from HBM."""
-    cumsum_users = node.users and all(user.target is torch.cumsum for user in node.users)
-    if str(node.target) == "expert_down_weights" or cumsum_users:
+    if str(node.target) == "expert_down_weights" or (
+        node.users and all(user.target is torch.cumsum for user in node.users)
+    ):
         return True
-    return any(
-        str(getattr(user.target, "__name__", user.target)).removeprefix("wrapped_") == "getitem"
-        and isinstance(user.args[1], tuple)
-        and (
-            user.args[1][:2] in {("routed_tokens", "data"), ("routed_tokens", "hidden")}
-            or user.args[1][:1] in {("grouped_context",), ("moe_gate_up",), ("rotational_topk",)}
+    for user in node.users:
+        operation = str(getattr(user.target, "__name__", user.target)).removeprefix("wrapped_")
+        index = next(iter(user.args[1:]), None)
+        routed = isinstance(index, tuple) and (
+            index[:2] in {("routed_tokens", "data"), ("routed_tokens", "hidden")}
+            or index[:1] in {("grouped_context",), ("metadata_groups",), ("moe_gate_up",), ("rotational_topk",)}
         )
-        for user in node.users
-    )
+        target = operation == "long" and any(getattr(c.target, "__name__", 0) == "cross_entropy" for c in user.users)
+        if (operation == "cross_entropy" and user.args[0] is node) or (operation == "getitem" and routed) or target:
+            return True
+    return False
 
 
 def synthetic_graph(input_specs: InputSpecs) -> tuple[torch.fx.Graph, dict[str, Node], Callable[..., Node]]:

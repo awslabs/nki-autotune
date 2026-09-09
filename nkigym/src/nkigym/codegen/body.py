@@ -20,10 +20,15 @@ from functools import partial
 from typing import Any, cast
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Add, Const, Expr, Mod, Mul, Var, _format_raw, format_expr, substitute, to_affine
+from nkigym.ir.arith.expr import Add, Const, Expr, Mod, Mul, Var, _format_raw, expr_variables, format_expr, substitute
+from nkigym.ir.operand_layout import access_pattern_allocation_view
+from nkigym.ir.program_sharding import (
+    configured_program_shards,
+    operation_axis_iterations,
+    operation_axis_value,
+    owning_block,
+)
 from nkigym.ir.tree import AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
-from nkigym.search.axis_groups import access_pattern_allocation_view
-from nkigym.search.program_sharding import operation_axis_iterations, operation_axis_value, program_sharded_loops
 
 _INDENT = "    "
 
@@ -34,7 +39,7 @@ class _RenderIR:
     def __init__(self, ir: KernelIR) -> None:
         """Snapshot buffers after all schedule transformations are complete."""
         self.ir = ir
-        self.buffers, self.shard_loops = ir.all_buffers(), program_sharded_loops(ir)
+        self.buffers, self.shard_loops = ir.all_buffers(), configured_program_shards(ir)
 
     def __getattr__(self, name: str) -> Any:
         """Delegate immutable schedule metadata to the source IR."""
@@ -190,7 +195,7 @@ def _carried_loop_vars(tree: KernelTree, name: str, leaves: list[int]) -> set[st
             if region.tensor != name:
                 continue
             for lo, _width in region.ranges:
-                carried |= {var for var in to_affine(lo) if var is not None}
+                carried |= expr_variables(lo)
     return carried
 
 
@@ -551,8 +556,16 @@ def _emit_isa_call(
             else:
                 rendered = render_access_pattern(region.tensor, access_pattern, buf, rotation)
             parts.append(f"{slot}={rendered}")
-    internal_kwargs = getattr(op_cls, "CODEGEN_ONLY_KWARGS", frozenset())
-    for k, v in node.kwargs.items():
+    kwargs = dict(node.kwargs)
+    for abstract, (offset_key, extent_key, multiplier_key) in op_cls.ITERATION_OFFSET_KWARGS.items():
+        concrete = ir.tree.block(owning_block(ir, leaf_nid)).axis_map[abstract]
+        base = int(kwargs.get(offset_key, 0))
+        scale = int(kwargs[extent_key]) * int(kwargs.get(multiplier_key, 0))
+        if scale:
+            dynamic = Mul(left=operation_axis_value(ir, leaf_nid, concrete, {}), right=Const(value=scale))
+            kwargs[offset_key] = dynamic if base == 0 else Add(left=Const(value=base), right=dynamic)
+    internal_kwargs = getattr(op_cls, "CODEGEN_ONLY_KWARGS", frozenset()) | {"program_ownership"}
+    for k, v in kwargs.items():
         if k not in internal_kwargs:
             rendered = (
                 _render_first_write(ir, leaf_nid, cast(tuple[str, ...], v), substitutions)
@@ -561,18 +574,19 @@ def _emit_isa_call(
             )
             parts.append(f"{k}={rendered}")
     call = f"nisa.{op_cls.NAME}({', '.join(parts)})"
-    ownership = node.kwargs.get("program_ownership")
-    if isinstance(ownership, tuple):
-        axis, programs = cast(tuple[str, int], ownership)
-        iteration = format_expr(operation_axis_value(ir, leaf_nid, axis, substitutions))
-        call = f"if nl.num_programs(0) == 1 or {iteration} % {programs} == nl.program_id(0):\n" f"{_INDENT}{call}"
-    elif getattr(op_cls, "SINGLE_PROGRAM_ZERO", False):
+    if getattr(op_cls, "SHARDED_SINGLE_PROGRAM_ZERO", False) and cast(_RenderIR, ir).shard_loops:
         destination = next(part for part in parts if part.startswith("dst="))
         call = (
             f"if nl.num_programs(0) == 1:\n"
             f"{_INDENT}nisa.memset({destination}, value=0.0)\n"
             f"else:\n{_INDENT}{call}"
         )
+    ownership = node.kwargs.get("program_ownership")
+    if isinstance(ownership, tuple):
+        axis, programs = cast(tuple[str, int], ownership)
+        iteration = format_expr(operation_axis_value(ir, leaf_nid, axis, substitutions))
+        indented = "\n".join(f"{_INDENT}{line}" for line in call.splitlines())
+        call = f"if nl.num_programs(0) == 1 or ({iteration}) % {programs} == nl.program_id(0):\n" f"{indented}"
     return call
 
 
@@ -641,8 +655,9 @@ def _render_kwarg(key: str, value: Any) -> str:
     value = "maximum" if key in {"op", "reduce_op"} and value == "max" else value
     if key == "reduce_cmd" or key in {"send_to_rank", "recv_from_rank"} and value == "program_peer":
         return f"nisa.reduce_cmd.{value}" if key == "reduce_cmd" else "1 - nl.program_id(0)"
-    if key in _NL_OP_KWARGS and isinstance(value, str):
-        return f"nl.{value}"
+    if key in _NL_OP_KWARGS | {"engine"} and isinstance(value, str):
+        namespace = "nisa.engine" if key == "engine" else "nl"
+        return f"{namespace}.{value}"
     if isinstance(value, float) and (math.isinf(value) or math.isnan(value)):
         return f"float('{value}')"
     return format_expr(value) if isinstance(value, Expr) else repr(value)
@@ -659,20 +674,19 @@ def _render_first_write(
 def _format_tile_index(lo: Expr, rotation: Expr | None) -> str:
     """Render the SBUF/PSUM tile-axis index, optionally + a version rotation.
 
-    ``format_expr`` normalises through ``to_affine``, which RAISES
-    ``NonAffineError`` on ``Mod(Var, Const)`` (a version rotation like
-    ``i_d1_0 % 2``) — the modulo of a variable is not affine. So the rotation
-    is rendered with the non-normalising ``_format_raw`` and combined with the
-    (affine) ``lo`` here, dropping ``lo`` when it is the rebased ``Const(0)``.
+    The non-normalising ``_format_raw`` handles both affine tile coordinates
+    and program-local modulo coordinates while preserving precedence. The
+    rotation is combined with that coordinate, dropping ``lo`` when it is the
+    rebased ``Const(0)``.
     """
     if rotation is None:
-        result = format_expr(lo)
+        result = _format_raw(lo)
     else:
         rot_str = _format_rotation(rotation)
         if isinstance(lo, Const) and lo.value == 0:
             result = rot_str
         else:
-            result = f"{format_expr(lo)} + {rot_str}"
+            result = f"{_format_raw(lo)} + {rot_str}"
     return result
 
 
@@ -749,8 +763,8 @@ def render_buffer_region(region: BufferRegion, buf: Buffer, rotation: Expr | Non
                 parts.append(f"0:{partition_extent}")
                 parts.append(_format_local_tile_index(f"{tile} % {a}", rotation))
         else:
-            lo_str = format_expr(lo)
-            hi_str = format_expr(hi)
+            lo_str = _format_raw(lo)
+            hi_str = _format_raw(hi)
             parts.append(f"{lo_str}:{lo_str} + {hi_str}")
     return f"{region.tensor}{list_subscript}[{', '.join(parts)}]"
 
@@ -772,7 +786,7 @@ def render_access_pattern(tensor: str, access_pattern: AccessPattern, buf: Buffe
 
 def _format_access_pattern_offset(offset: Expr, buf: Buffer, rotation: Expr | None) -> str:
     """Render a flattened access-pattern offset with an optional tile rotation."""
-    result = _format_raw(offset) if isinstance(offset, Mod) else format_expr(offset)
+    result = _format_raw(offset)
     if rotation is not None:
         free = buf.per_tile_physical_shape()[2]
         flattened = rotation if free == 1 else Mul(left=rotation, right=Const(value=free))

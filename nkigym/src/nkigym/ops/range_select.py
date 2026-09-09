@@ -35,9 +35,8 @@ class NKIRangeSelect(NKIOp):
     REQUIRED_INPUT_STORAGE_DTYPES: ClassVar[dict[str, str]] = {"bound0": "float32", "bound1": "float32"}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 1, "F": 1}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
-    PREFERRED_TILE_SIZE: ClassVar[dict[str, int]] = {"F": 512}
     CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"width"})
-    SPLIT_OFFSET_KWARGS: ClassVar[dict[str, tuple[str, str]]] = {"F": ("range_start", "dst")}
+    SPLIT_OFFSET_KWARGS: ClassVar[dict[str, tuple[str, str]]] = {"F": ("range_start", "on_true_tile")}
     SUPPORTED_REDUCERS: ClassVar[frozenset[str]] = frozenset({"maximum"})
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 

@@ -45,17 +45,18 @@ def _capture_stderr() -> Generator[Path, None, None]:
         path.unlink(missing_ok=True)
 
 
-def _run_compiler(kernel: Kernel, inputs: dict[str, np.ndarray], options: CompileOptions) -> None:
-    """Trace the NKI function and lower it to a NEFF artifact."""
+def _run_compiler(kernel: Kernel, inputs: dict[str, np.ndarray], options: CompileOptions) -> tuple[Any, ...]:
+    """Trace the NKI function, lower it to NEFF, and return output specifications."""
     with _capture_stderr() as stderr_path:
         try:
             bir = compile_to_bir(kernel, frontend=TracerFrontend(), inputs=inputs, compile_opts=options)
             input_specs = bir.descriptor.input_specs
             output_specs = bir.descriptor.output_specs
-            input_arrays = [np.zeros(spec.shape, dtype=np.dtype(spec.dtype)) for spec in input_specs]
+            input_arrays = [inputs[spec.name].astype(np.dtype(spec.dtype), copy=False) for spec in input_specs]
             compile_bir_to_neff(
                 options, bir, input_arrays, [spec.name for spec in input_specs], [spec.name for spec in output_specs]
             )
+            return tuple(output_specs)
         except Exception as error:
             stderr = stderr_path.read_text(encoding="utf-8").strip()
             if stderr:
@@ -71,8 +72,8 @@ def compile_kernel(
     neuronx_cc_args: tuple[str, ...],
     lnc: int,
     compiler_jobs: int | None,
-) -> Path:
-    """Compile one NKI source file for Trn2 and return its NEFF path."""
+) -> tuple[Path, tuple[Any, ...]]:
+    """Compile one NKI source file for Trn2 and return its NEFF and output specifications."""
     if compiler_jobs is not None and compiler_jobs <= 0:
         raise ValueError("compiler jobs must be positive")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -87,9 +88,9 @@ def compile_kernel(
         if neuronx_cc_args:
             options = options.set_pipeline_options(*neuronx_cc_args)
         kernel = Kernel(load_kernel(kernel_path, func_name))
-        _run_compiler(kernel, inputs, options)
+        output_specs = _run_compiler(kernel, inputs, options)
     finally:
         tempfile.tempdir = previous_tempdir
     if not neff_path.is_file():
         raise RuntimeError(f"compiler returned without creating {neff_path}")
-    return neff_path
+    return neff_path, output_specs

@@ -4,7 +4,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.codegen.torch_values import TorchValue
+from nkigym.codegen.torch_values import TorchSegments, TorchValue
 from nkigym.ops.base import NKIOp
 
 
@@ -33,7 +33,9 @@ class NKIIndexIota(NKIOp):
         return np.asarray(values + channels * int(kwargs.get("channel_multiplier", 0)), dtype=np.uint32)
 
 
-def emit_packed_topk_indices(source: TorchValue, k: int, stem: str, body: list[str], imports: set[str]) -> TorchValue:
+def emit_packed_topk_indices(
+    source: TorchValue, k: int, stem: str, body: list[str], imports: set[str]
+) -> TorchSegments:
     """Emit destructive repeated top-eight selection into one index tensor."""
     rows, width = source.shape
     if rows > 128 or k % 8 or k > width:
@@ -55,7 +57,7 @@ def emit_packed_topk_indices(source: TorchValue, k: int, stem: str, body: list[s
                 f"dst={source.name}, dst_idx={positions.name})",
             )
         )
-    return positions
+    return TorchSegments((positions,))
 
 
 __all__ = ["NKIIndexIota", "emit_packed_topk_indices"]

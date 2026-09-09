@@ -218,6 +218,17 @@ class BatchedPermutationContract:
 
 
 @dataclass(frozen=True)
+class PartitionTileBatchingContract:
+    """Hardware support for one call spanning contiguous partition tiles.
+
+    ``operands`` lists every tensor slot whose one-tile region expands to the
+    corresponding complete physical allocation when its loop is batched.
+    """
+
+    operands: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class PermutationContract:
     """Algebraic contract for an axis permutation."""
 
@@ -230,6 +241,14 @@ class PermutationContract:
 @dataclass(frozen=True)
 class CopyContract:
     """Algebraic contract for a value-preserving copy."""
+
+    input_operand: str
+    output_operand: str
+
+
+@dataclass(frozen=True)
+class PeerExchangeContract:
+    """Algebraic contract for exchanging one local value with a peer program."""
 
     input_operand: str
     output_operand: str
@@ -250,6 +269,7 @@ OperatorContract = (
     | BilinearReductionContract
     | PermutationContract
     | CopyContract
+    | PeerExchangeContract
     | InitializerContract
 )
 
@@ -547,12 +567,8 @@ class NKIOp:
     Empty = no cap for any axis.
     """
 
-    PREFERRED_TILE_SIZE: ClassVar[dict[str, int]] = {}
-    """Preferred innermost-tile extent per abstract axis.
-
-    This is a performance hint for search, not a legality constraint. Empty
-    means no operation-specific preference.
-    """
+    TENSORIZE_MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {}
+    """Per-axis Fuse override for widening an already materialized tile."""
 
     RMW_OPERANDS: ClassVar[frozenset[str]] = frozenset()
     """Operand slot names that this op reads AND writes (RMW semantics).
@@ -622,10 +638,22 @@ class NKIOp:
     for direct DSL calls.
     """
 
+    ITERATION_OFFSET_KWARGS: ClassVar[dict[str, tuple[str, str, str]]] = {}
+    """ISA offsets derived from one operation-axis iteration.
+
+    Each entry maps an abstract axis to ``(offset, extent, multiplier)`` kwarg
+    names. Codegen adds ``iteration * extent * multiplier`` to the base offset.
+    """
+
     @classmethod
     def operand_axis_groups(cls, operand: str) -> tuple[tuple[str, ...], ...]:
         """Return abstract axes folded into each physical operand dimension."""
         return cls.OPERAND_AXIS_GROUPS.get(operand, tuple((axis,) for axis in cls.OPERAND_AXES[operand]))
+
+    @classmethod
+    def operand_dimension(cls, operand: str, axis: str) -> int:
+        """Return the physical operand dimension containing one abstract axis."""
+        return next(index for index, group in enumerate(cls.operand_axis_groups(operand)) if axis in group)
 
     @classmethod
     def operand_view_axis_groups(cls, operand: str) -> tuple[tuple[str, ...], ...] | None:
@@ -671,6 +699,12 @@ class NKIOp:
         Contract-driven transforms reject such operations when they occur on a
         candidate path.
         """
+        _ = kwargs
+        return None
+
+    @classmethod
+    def partition_tile_batching_contract(cls, kwargs: Mapping[str, Any]) -> PartitionTileBatchingContract | None:
+        """Return hardware support for batching a loop of partition tiles."""
         _ = kwargs
         return None
 

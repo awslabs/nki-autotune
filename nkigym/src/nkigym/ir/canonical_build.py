@@ -10,7 +10,7 @@ Every compute op (including memset) becomes a sibling leaf block under
 the root block, preserving source order.
 
 Buffer placement is delegated to
-:func:`nkigym.search.buffer_placement.place_buffers`.
+:func:`nkigym.ir.buffer_placement.place_buffers`.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
     Build leaf blocks under it, seed all Buffers on the root, then run
     LCA placement to distribute them to their lifetime-dominating blocks.
     """
-    from nkigym.search.buffer_placement import collect_buffers, place_buffers
+    from nkigym.ir.buffer_placement import collect_buffers, place_buffers
 
     tree = KernelTree()
     op_records = list(analysis.ops)
@@ -49,7 +49,7 @@ def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
 
 def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysis: "_AnalysisResult") -> int:
     """Construct one :class:`BlockNode` + its loop chain + ISA leaf; return the block's nid."""
-    from nkigym.search.axis_groups import build_access_patterns, canonical_tile_size, canonical_trip_count
+    from nkigym.ir.operand_layout import build_access_patterns, canonical_tile_size, canonical_trip_count
 
     iter_vars: list[IterVar] = []
     iter_values: list = []
@@ -161,10 +161,7 @@ def _build_region(
     rec: "_OpRecord", slot: str, axes: tuple[str, ...], loop_var_names: dict[str, str], analysis: "_AnalysisResult"
 ) -> BufferRegion:
     """Construct one dependency region from the operation's physical axis groups."""
-    from nkigym.search.axis_groups import build_operand_region, canonical_tile_size, canonical_trip_count
+    from nkigym.ir.operand_layout import build_operand_region, canonical_tile_size, canonical_trip_count
 
     _ = axes
     return build_operand_region(rec, slot, loop_var_names, analysis, canonical_tile_size, canonical_trip_count)
-
-
-__all__ = ["build_canonical_blocknode_tree"]

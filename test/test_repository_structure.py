@@ -5,7 +5,6 @@ nkigym/src/nkigym/
 |-- ir/**/*.py                       at most 3,000 code lines total
 |-- codegen/**/*.py                  at most 2,000 code lines total
 |-- profile/**/*.py                  at most 2,000 code lines total
-|-- search/**/*.py                   at most 2,000 code lines total
 |-- synthesis/**/*.py                at most 1,000 code lines total
 |-- ops/
 |   |-- __init__.py                  at most 100 code lines
@@ -22,6 +21,7 @@ nkigym/src/nkigym/
 
 kernel_library/
 |-- __init__.py
+|-- _best_nkigym.py                  recorded kernels and transform ladders
 `-- nakb_<workload>.py               one direct Python module per workload
 
 Only the files shown above are allowed under ops and transforms. Every transform
@@ -30,13 +30,13 @@ together must have fewer than 1,000 code lines. Blank lines, comments, and
 documentation strings do not count. Public transforms must directly define
 typed, synchronous analyze and apply methods. Formatter-control comments are
 forbidden because they permit multiple statements to be hidden on one line.
-Only the package initializer and direct workload Python modules are allowed
-under kernel_library; helper files and subdirectories are forbidden. No Python
-source files are allowed outside the documented nkigym implementation
-directories.
+Only the package initializer, the best-NKIGym artifact module, and direct
+workload Python modules are allowed under kernel_library; helper subdirectories
+are forbidden. No Python source files are allowed outside the documented
+nkigym implementation directories.
 
 Required package initializers: nkigym, codegen, ir, ir/arith, ops, profile,
-search, synthesis, transforms, and transforms/helper.
+synthesis, transforms, and transforms/helper.
 
 Allowed repository imports:
 
@@ -47,9 +47,7 @@ test           -> kernel_library, nkigym
 The top-level developer package must not exist.
 
 Exact transform schedules and reproduction traces are allowed only in
-kernel_library. Search owns generic iterative refinement infrastructure and
-consumes runtime legal actions without importing or constructing concrete
-transform options.
+kernel_library.
 """
 
 from __future__ import annotations
@@ -70,14 +68,13 @@ TRANSFORM_HELPER_LINE_LIMIT = 1000
 MAX_IR_IMPLEMENTATION_LINES = 3000
 MAX_CODEGEN_IMPLEMENTATION_LINES = 2000
 MAX_PROFILE_IMPLEMENTATION_LINES = 2000
-MAX_SEARCH_IMPLEMENTATION_LINES = 2000
 MAX_SYNTHESIS_IMPLEMENTATION_LINES = 1000
 OP_FILE_LINE_LIMIT = 100
 OP_BASE_FILE_LINE_LIMIT = 500
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_IMPORT_ROOTS = {"developer", "kernel_library", "nkigym"}
 FORMATTER_TARGETS = ("nkigym/src", "kernel_library", "test")
-NKIGYM_IMPLEMENTATION_DIRECTORIES = frozenset({"codegen", "ir", "ops", "profile", "search", "synthesis", "transforms"})
+NKIGYM_IMPLEMENTATION_DIRECTORIES = frozenset({"codegen", "ir", "ops", "profile", "synthesis", "transforms"})
 REQUIRED_PACKAGE_INITIALIZERS = frozenset(
     {
         "nkigym/src/nkigym/__init__.py",
@@ -86,7 +83,6 @@ REQUIRED_PACKAGE_INITIALIZERS = frozenset(
         "nkigym/src/nkigym/ir/arith/__init__.py",
         "nkigym/src/nkigym/ops/__init__.py",
         "nkigym/src/nkigym/profile/__init__.py",
-        "nkigym/src/nkigym/search/__init__.py",
         "nkigym/src/nkigym/synthesis/__init__.py",
         "nkigym/src/nkigym/transforms/__init__.py",
         "nkigym/src/nkigym/transforms/helper/__init__.py",
@@ -356,18 +352,18 @@ def _operation_structure_violations() -> tuple[list[str], int, int, int]:
 
 
 def _kernel_library_structure_violations() -> list[str]:
-    """Allow only the initializer and direct NAKB workload modules."""
+    """Allow the initializer, artifact records, and direct NAKB workload modules."""
     kernel_library_directory = REPOSITORY_ROOT / "kernel_library"
     violations: list[str] = []
     for relative_path in _repository_files(kernel_library_directory):
-        is_initializer = relative_path == Path("__init__.py")
+        is_infrastructure = relative_path in {Path("__init__.py"), Path("_best_nkigym.py")}
         is_workload_module = (
             len(relative_path.parts) == 1 and relative_path.suffix == ".py" and relative_path.name.startswith("nakb_")
         )
-        if not is_initializer and not is_workload_module:
+        if not is_infrastructure and not is_workload_module:
             violations.append(
-                f"kernel_library/{relative_path.as_posix()} is not allowed; keep only __init__.py and direct "
-                "nakb_*.py workload modules"
+                f"kernel_library/{relative_path.as_posix()} is not allowed; keep only __init__.py, "
+                "_best_nkigym.py, and direct nakb_*.py workload modules"
             )
     return violations
 
@@ -424,34 +420,6 @@ def _dependency_violations() -> list[str]:
     return violations
 
 
-def _search_schedule_violations() -> list[str]:
-    """Reject concrete transform ownership from generic search infrastructure."""
-    search_directory = REPOSITORY_ROOT / "nkigym/src/nkigym/search"
-    violations: list[str] = []
-    for path in sorted(search_directory.rglob("*.py")):
-        relative = path.relative_to(REPOSITORY_ROOT)
-        module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(module):
-            if isinstance(node, ast.ImportFrom) and node.module is not None:
-                if node.module.startswith("nkigym.transforms"):
-                    imports_generic_api = node.module == "nkigym.transforms" and all(
-                        alias.name in {"Transform", "TransformOption", "public_transforms"} for alias in node.names
-                    )
-                    if not imports_generic_api:
-                        violations.append(
-                            f"{relative}:{node.lineno} imports concrete transform APIs from {node.module}"
-                        )
-            elif isinstance(node, ast.Import):
-                forbidden = sorted(alias.name for alias in node.names if alias.name.startswith("nkigym.transforms"))
-                if forbidden:
-                    violations.append(f"{relative}:{node.lineno} imports concrete transform APIs {forbidden}")
-            elif isinstance(node, ast.Call) and _base_name(node.func).endswith("Option"):
-                violations.append(
-                    f"{relative}:{node.lineno} constructs a transform option; runtime legal actions own payloads"
-                )
-    return violations
-
-
 def test_repository_structure() -> None:
     """Repository structure, source growth, dependencies, and APIs remain valid."""
     format_violations = _repository_format_violations()
@@ -471,9 +439,6 @@ def test_repository_structure() -> None:
     profile_violation, profile_lines = _source_size_violation(
         source_root / "profile", "profile implementation", MAX_PROFILE_IMPLEMENTATION_LINES
     )
-    search_violation, search_lines = _source_size_violation(
-        source_root / "search", "search implementation", MAX_SEARCH_IMPLEMENTATION_LINES
-    )
     synthesis_violation, synthesis_lines = _source_size_violation(
         source_root / "synthesis", "synthesis implementation", MAX_SYNTHESIS_IMPLEMENTATION_LINES
     )
@@ -486,7 +451,6 @@ def test_repository_structure() -> None:
         *_kernel_library_structure_violations(),
         *_formatter_control_violations(source_root),
         *_dependency_violations(),
-        *_search_schedule_violations(),
     ]
     if ir_violation is not None:
         violations.append(ir_violation)
@@ -494,14 +458,12 @@ def test_repository_structure() -> None:
         violations.append(codegen_violation)
     if profile_violation is not None:
         violations.append(profile_violation)
-    if search_violation is not None:
-        violations.append(search_violation)
     if synthesis_violation is not None:
         violations.append(synthesis_violation)
     print(
         f"public_transforms={transform_count} largest_transform_file={largest_transform_file} " f"ir_lines={ir_lines}",
         f"codegen_lines={codegen_lines} profile_lines={profile_lines}",
-        f"search_lines={search_lines} synthesis_lines={synthesis_lines} public_ops={operation_count}",
+        f"synthesis_lines={synthesis_lines} public_ops={operation_count}",
         f"largest_op_file={largest_operation_file} op_base_lines={operation_base_lines}",
         f"transform_helper_lines={helper_lines}",
         flush=True,

@@ -1,0 +1,5 @@
+interface:
+  display_name: "Develop NKIGym"
+  short_description: "Debug NKIGym until all tests pass"
+policy:
+  allow_implicit_invocation: false

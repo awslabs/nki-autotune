@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
-from nkigym.search.state_facts import operation_facts
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -36,9 +35,6 @@ class SetFirstWriteOverwrite(Transform[SetFirstWriteOverwriteOption]):
 
     def analyze(self, ir: KernelIR) -> list[SetFirstWriteOverwriteOption]:
         """Return reductions whose preceding identity makes overwrite equivalent."""
-        facts = operation_facts(ir)
-        if not facts.has_initializer or not facts.has_reduction:
-            return []
         matcher = EliminateIdentityInitializer()
         options: list[SetFirstWriteOverwriteOption] = []
         overlap_nodes = software_pipeline_overlap_nodes(ir)

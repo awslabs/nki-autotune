@@ -18,6 +18,9 @@ class NKIGroupedIota(NKIOp):
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"G": 1, "P": 1, "F": 1}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"G": 1, "P": 128, "F": None}
     CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"groups", "partitions", "width"})
+    ITERATION_OFFSET_KWARGS: ClassVar[dict[str, tuple[str, str, str]]] = {
+        "G": ("offset", "partitions", "channel_multiplier")
+    }
     OUTPUT_DTYPE: ClassVar[str | None] = "float32"
     OUTPUT_STORAGE_DTYPE: ClassVar[str | None] = "float32"
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
@@ -29,7 +32,9 @@ class NKIGroupedIota(NKIOp):
         values = np.sum([step * grid[axis] for axis, (step, _size) in enumerate(pattern)], axis=0)
         channels = int(kwargs["groups"]) * int(kwargs["partitions"])
         offsets = np.arange(channels, dtype=np.int64)[:, None] * int(kwargs.get("channel_multiplier", 0))
-        return np.asarray(values.reshape(1, int(kwargs["width"])) + offsets, dtype=np.float32)
+        return np.asarray(
+            values.reshape(1, int(kwargs["width"])) + offsets + int(kwargs.get("offset", 0)), dtype=np.float32
+        )
 
 
 __all__ = ["NKIGroupedIota"]

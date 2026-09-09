@@ -12,13 +12,14 @@ from typing import cast
 from weakref import WeakKeyDictionary
 
 from nkigym.ir import KernelIR, to_affine
-from nkigym.ir.arith.expr import Add, Const, Expr, Var, substitute
+from nkigym.ir.arith.expr import Add, Const, Expr, Var, expr_variables, substitute
+from nkigym.ir.buffer_placement import layout_satisfies_output_alignment
 from nkigym.ir.dependency import _tensor_carried_across
 from nkigym.ir.dependency_rebind import rebind_unchanged_dependency
 from nkigym.ir.interval import regions_disjoint
+from nkigym.ir.program_sharding import configured_program_shards
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
-from nkigym.search.buffer_placement import layout_satisfies_output_alignment
-from nkigym.search.program_sharding import configured_program_shards
+from nkigym.ops.sendrecv import NKISendRecv
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -206,7 +207,11 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
         else:
             loop = ir.tree.loop(option.loop_nid)
             programs = configured_program_shards(ir).get(option.loop_nid, 1)
-            if loop.extent // programs <= max(option.stages):
+            if any(
+                ir.tree.isa(leaf).op_cls is NKISendRecv for child in children for leaf in self._unit_leaves(ir, child)
+            ):
+                result = False
+            elif loop.extent // programs <= max(option.stages):
                 result = False
             if any(
                 option.stages[source] > option.stages[target]
@@ -356,7 +361,7 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
 
     def _region_axes_using(self, region: BufferRegion, loop_var: str) -> tuple[int, ...]:
         """Return region axes whose lower bound references ``loop_var``."""
-        return tuple(axis for axis, (lower, _extent) in enumerate(region.ranges) if loop_var in to_affine(lower))
+        return tuple(axis for axis, (lower, _extent) in enumerate(region.ranges) if loop_var in expr_variables(lower))
 
     def _regions_match_axes(self, write_region: BufferRegion, read_region: BufferRegion, axes: tuple[int, ...]) -> bool:
         """Return whether ``read_region`` matches the selected axes of ``write_region``."""

@@ -5,10 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from nkigym.ir import KernelIR
+from nkigym.ir.buffer_placement import buffer_placement_targets, place_buffer
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, KernelTree
-from nkigym.search.buffer_placement import buffer_placement_targets, place_buffer
-from nkigym.search.serialization import inherit_analysis_result
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 
 
@@ -27,7 +26,7 @@ class BufferPlacement(Transform[BufferPlacementOption]):
     """Move only one selected on-chip declaration to its lifetime-safe LCA scope."""
 
     def analyze(self, ir: KernelIR) -> list[BufferPlacementOption]:
-        """Offer on-chip buffers whose declaration would move."""
+        """Offer on-chip buffers whose allocation frame would move."""
         tensors = tuple(name for name, buffer in ir.all_buffers().items() if buffer.location in ("sbuf", "psum"))
         changed = self._would_change_many(ir.tree, tensors)
         return [BufferPlacementOption(tensor=tensor) for tensor in tensors if tensor in changed]
@@ -38,7 +37,6 @@ class BufferPlacement(Transform[BufferPlacementOption]):
         new_ir = copy_for_rewrite(ir)
         place_buffer(new_ir.tree, option.tensor)
         new_ir.dependency = Dependency(new_ir.tree)
-        inherit_analysis_result(ir, new_ir, "code-motion")
         return new_ir
 
     def _check_legality(self, ir: KernelIR, option: BufferPlacementOption) -> None:

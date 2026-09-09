@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Expr, Var, to_affine
+from nkigym.ir.arith.expr import Expr, Var, affine_terms, expr_variables, to_affine
 from nkigym.ir.dependency import Dependency
-from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, KernelTree, role_of
+from nkigym.ir.program_sharding import PROGRAM_SHARDS_ANNOTATION, configured_program_shards
+from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree, role_of
 from nkigym.ops.base import AxisRole
-from nkigym.search.program_sharding import configured_program_shards
+from nkigym.ops.sendrecv import NKISendRecv
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -60,6 +61,7 @@ class Reorder(Transform[ReorderOption]):
         new_ir.tree.graph.nodes[option.outer_nid]["data"] = inner_data
         new_ir.tree.graph.nodes[option.inner_nid]["data"] = outer_data
         self._renormalize_same_axis_swap(new_ir, option, same_axis)
+        _move_program_shard(new_ir, option)
         new_ir.dependency = Dependency(new_ir.tree)
         return new_ir
 
@@ -103,8 +105,7 @@ class Reorder(Transform[ReorderOption]):
         if intersects_software_pipeline(ir, (option.outer_nid, option.inner_nid), overlap_nodes):
             raise TransformLegalityError("Reorder cannot alter an active software-pipeline scope")
         shards = configured_program_shards(ir)
-        if option.outer_nid in shards or option.inner_nid in shards:
-            raise TransformLegalityError("Reorder cannot alter a program-sharded loop")
+        _check_program_shard_swap(ir, option, shards)
         outer = ir.tree.data(option.outer_nid)
         inner = ir.tree.data(option.inner_nid)
         if not isinstance(outer, ForNode) or not isinstance(inner, ForNode):
@@ -175,7 +176,7 @@ def _check_internal_dependency_accesses(
 def _regions_depend_on(regions: tuple[BufferRegion, ...], loop_vars: frozenset[str]) -> bool:
     """Return whether any region bound depends on a swapped loop."""
     return any(
-        bool(loop_vars & {name for expression in (lower, width) for name in to_affine(expression) if name is not None})
+        bool(loop_vars & {name for expression in (lower, width) for name in expr_variables(expression)})
         for region in regions
         for lower, width in region.ranges
     )
@@ -187,13 +188,44 @@ def _region_signatures(regions: tuple[BufferRegion, ...]) -> tuple[str, ...]:
     for region in regions:
         ranges = tuple(
             (
-                tuple(sorted(to_affine(lower).items(), key=lambda item: str(item[0]))),
-                tuple(sorted(to_affine(width).items(), key=lambda item: str(item[0]))),
+                tuple(sorted(affine_terms(lower).items(), key=lambda item: repr(item[0]))),
+                tuple(sorted(affine_terms(width).items(), key=lambda item: repr(item[0]))),
             )
             for lower, width in region.ranges
         )
         signatures.append(repr((region.tensor, ranges)))
     return tuple(sorted(signatures))
+
+
+def _check_program_shard_swap(ir: KernelIR, option: ReorderOption, shards: dict[int, int]) -> None:
+    """Allow one shard annotation to follow its reordered loop payload."""
+    sharded = {nid for nid in (option.outer_nid, option.inner_nid) if nid in shards}
+    if not sharded:
+        return
+    if len(sharded) != 1 or _axis_of_loop(ir.tree, option.outer_nid) == _axis_of_loop(ir.tree, option.inner_nid):
+        raise TransformLegalityError("Reorder requires exactly one differently-axed program-sharded loop")
+    nested_shards = (set(ir.tree.descendants(option.outer_nid)) & set(shards)) - sharded
+    if nested_shards:
+        raise TransformLegalityError(f"Reorder cannot cross nested program shards {sorted(nested_shards)}")
+    for nid in ir.tree.preorder(option.outer_nid):
+        data = ir.tree.data(nid)
+        if isinstance(data, ISANode) and (data.op_cls is NKISendRecv or "program_ownership" in data.kwargs):
+            raise TransformLegalityError("Reorder cannot alter a collective or program-owned store scope")
+
+
+def _move_program_shard(ir: KernelIR, option: ReorderOption) -> None:
+    """Move one shard annotation with the loop payload that owns it."""
+    shards = configured_program_shards(ir)
+    source = next((nid for nid in (option.outer_nid, option.inner_nid) if nid in shards), None)
+    if source is None:
+        return
+    target = option.inner_nid if source == option.outer_nid else option.outer_nid
+    programs = shards.pop(source)
+    shards[target] = programs
+    root = ir.tree.block(ir.tree.root)
+    annotations = dict(root.annotations)
+    annotations[PROGRAM_SHARDS_ANNOTATION] = shards
+    ir.tree.graph.nodes[ir.tree.root]["data"] = replace(root, annotations=annotations)
 
 
 def _axis_of_loop(tree: KernelTree, loop_nid: int) -> str | None:

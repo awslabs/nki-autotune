@@ -1,14 +1,20 @@
 """Folded batch/tile DMA load."""
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import CopyContract, NKIOp, _operand_role
 
 
 class NKIFoldedLoad(NKIOp):
-    """Load independent two-dimensional tiles from one packed HBM tensor."""
+    """Load independent two-dimensional tiles from one packed HBM tensor.
+
+    Canonical lowering keeps logical tiles separate. Fuse may widen the
+    contiguous tile axis because all grouped tile coordinates share one
+    physical DMA free dimension.
+    """
 
     NAME: ClassVar[str] = "dma_copy"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"src": ("P", "G", "T", "F"), "dst": ("P", "G", "T", "F")}
@@ -19,6 +25,7 @@ class NKIFoldedLoad(NKIOp):
     FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {"G": "groups", "T": "tiles"}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {axis: 1 for axis in "PGTF"}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "G": 1, "T": 1, "F": None}
+    TENSORIZE_MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"T": None}
     CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"groups", "tiles"})
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
@@ -27,6 +34,12 @@ class NKIFoldedLoad(NKIOp):
         if groups < 1 or tiles < 1:
             raise ValueError("folded load extents must be positive")
         super().__init__(groups=groups, tiles=tiles)
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> CopyContract:
+        """Return the value-preserving load contract."""
+        _ = kwargs
+        return CopyContract(input_operand="src", output_operand="dst")
 
     def _check_roles(self, **kwargs: Any) -> None:
         """Require one HBM parameter source."""

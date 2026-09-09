@@ -10,19 +10,19 @@ from nkigym.ir.tree import BufferRegion
 
 def retile_region(
     region: BufferRegion,
-    axes: tuple[str, ...],
+    axis_groups: tuple[tuple[str, ...], ...],
     abstract_axis: str | None,
     rewrite: Callable[[Expr, int], tuple[Expr, int]],
 ) -> BufferRegion:
     """Apply a width rewrite to the region range for one abstract axis."""
-    if abstract_axis is None or abstract_axis not in axes:
+    if abstract_axis is None:
         return region
-    idx = axes.index(abstract_axis)
-    if idx >= len(region.ranges):
+    index = next((i for i, group in enumerate(axis_groups) if abstract_axis in group), None)
+    if index is None or index >= len(region.ranges):
         return region
-    lo, width = region.ranges[idx]
+    lo, width = region.ranges[index]
     assert isinstance(width, Const), f"region width must be Const; got {width!r}"
     new_lo, new_width = rewrite(lo, width.value)
     new_ranges = list(region.ranges)
-    new_ranges[idx] = (new_lo, Const(value=new_width))
+    new_ranges[index] = (new_lo, Const(value=new_width))
     return BufferRegion(tensor=region.tensor, ranges=tuple(new_ranges))

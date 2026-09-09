@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from math import prod
 
-from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Const, Expr, Var, substitute, to_affine
+from nkigym.ir import AccessPattern, BufferRegion, KernelIR
+from nkigym.ir.arith.analyzer import Analyzer
+from nkigym.ir.arith.expr import Const, Expr, Mod, Mul, NonAffineError, Var, expr_variables, substitute, to_affine
 from nkigym.ir.dependency import Dependency
+from nkigym.ir.program_sharding import PROGRAM_SHARDS_ANNOTATION, configured_program_shards
 from nkigym.ir.tree import BlockNode, Buffer, ForNode, ISANode, KernelTree
+from nkigym.ops.base import AxisRole, PartitionTileBatchingContract
 from nkigym.ops.dma_transpose import NKIDMATranspose
 from nkigym.transforms.base import (
     Transform,
@@ -30,15 +33,27 @@ class FuseOption(TransformOption):
     """Per-application payload for :class:`Fuse`.
 
     Attributes:
-        target_nids: Exactly two adjacent axis-chain entries to fuse, in
-            parent-to-child order.
+        target_nids: Two adjacent axis-chain entries to fuse.
         target_axis: ``None`` for outer-trip flavour. The concrete iter_var
             axis name (e.g. ``"d1"``) for tensorize flavour; matches
             ``IterVar.axis``.
+        operation_batch: Whether to batch one operation's declared contiguous
+            partition-tile loop into a single ISA call.
     """
 
     target_nids: tuple[int, ...]
     target_axis: str | None = None
+    operation_batch: bool = False
+
+
+@dataclass(frozen=True)
+class _OperationBatchMatch:
+    """One operation loop covered by a declared partition-tile contract."""
+
+    block_nid: int
+    loop_nid: int
+    leaf_nid: int
+    contract: PartitionTileBatchingContract
 
 
 class Fuse(Transform[FuseOption]):
@@ -64,6 +79,9 @@ class Fuse(Transform[FuseOption]):
                     if self._is_legal(ir, option, overlap_nodes, buffers):
                         options.append(option)
             elif isinstance(kid_data, ISANode):
+                batch = FuseOption(target_nids=(nid, kids[0]), operation_batch=True)
+                if self._is_legal(ir, batch, overlap_nodes, buffers):
+                    options.append(batch)
                 _block_nid, block = _find_enclosing_block(ir.tree, kids[0])
                 target_axes = [
                     iter_var.axis
@@ -77,9 +95,14 @@ class Fuse(Transform[FuseOption]):
         return options
 
     def apply(self, ir: KernelIR, option: FuseOption) -> KernelIR:
-        self._check_legality(ir, option)
+        try:
+            self._check_legality(ir, option)
+        except NonAffineError as error:
+            raise TransformLegalityError("Fuse requires affine loop coordinates") from error
         new_ir = copy_for_rewrite(ir)
-        if option.target_axis is None:
+        if option.operation_batch:
+            self._do_operation_batch(new_ir, option)
+        elif option.target_axis is None:
             self._do_outer_trip(new_ir, option)
         else:
             self._do_tensorize(new_ir, option)
@@ -93,6 +116,9 @@ class Fuse(Transform[FuseOption]):
         overlap_nodes: frozenset[int] | None = None,
         buffers: dict[str, Buffer] | None = None,
     ) -> None:
+        if option.operation_batch:
+            self._operation_batch_match(ir, option, overlap_nodes, buffers)
+            return
         if len(option.target_nids) != 2:
             raise TransformLegalityError(
                 f"Fuse.target_nids must contain exactly two adjacent entries; got {option.target_nids}"
@@ -105,8 +131,8 @@ class Fuse(Transform[FuseOption]):
         if subtree_has_access_patterns(ir.tree, option.target_nids[0]):
             raise TransformLegalityError("Fuse cannot rewrite a loop or ISA operand with an explicit access pattern")
         nodes = [ir.tree.data(nid) for nid in option.target_nids]
-        shards = ir.tree.block(ir.tree.root).annotations.get("program_shards", {})
-        sharded_targets = [nid for nid in option.target_nids if isinstance(shards, dict) and nid in shards]
+        shards = configured_program_shards(ir)
+        sharded_targets = [nid for nid in option.target_nids if nid in shards]
         if option.target_axis is None:
             if not all(isinstance(n, ForNode) for n in nodes):
                 raise TransformLegalityError(
@@ -136,8 +162,8 @@ class Fuse(Transform[FuseOption]):
                     raise TransformLegalityError(
                         f"Fuse tensorize flavour: prefix must be all ForNodes; got {type(n).__name__}"
                     )
-            if sharded_targets:
-                raise TransformLegalityError("Fuse cannot absorb a program-sharded loop into an ISA tile")
+            if len(sharded_targets) > 1 or (sharded_targets and len(shards) == 1):
+                raise TransformLegalityError("Fuse cannot remove every active program shard or absorb multiple shards")
             for parent_nid, child_nid in zip(option.target_nids, option.target_nids[1:]):
                 kids = ir.tree.children(parent_nid)
                 if kids != [child_nid]:
@@ -151,11 +177,15 @@ class Fuse(Transform[FuseOption]):
                 if iter_var.axis == option.target_axis
             ]
             loop_var = ir.tree.loop(option.target_nids[0]).loop_var
-            if len(target_values) != 1 or loop_var not in to_affine(target_values[0]):
+            if len(target_values) != 1 or loop_var not in expr_variables(target_values[0]):
                 raise TransformLegalityError(
                     f"Fuse.target_axis={option.target_axis!r} is not bound by loop {option.target_nids[0]}"
                 )
-            self._check_tensorize_loop_uses(leaf, block, loop_var, option.target_axis)
+            programs = shards.get(option.target_nids[0], 1)
+            loop_extent = ir.tree.loop(option.target_nids[0]).extent
+            if loop_extent % programs:
+                raise TransformLegalityError(f"Fuse cannot divide loop extent {loop_extent} across {programs} programs")
+            self._check_tensorize_loop_uses(leaf, block, loop_var, option.target_axis, loop_extent // programs)
             current_width = _current_tensorize_width(leaf, block, option.target_axis)
             if current_width is None:
                 raise TransformLegalityError(
@@ -168,7 +198,7 @@ class Fuse(Transform[FuseOption]):
             if buffers is None:
                 buffers = ir.all_buffers()
             max_tile = _maximum_tensorize_width(leaf, abstract_axis, buffers)
-            absorbed_extent = prod(ir.tree.loop(nid).extent for nid in option.target_nids[:-1])
+            absorbed_extent = prod(ir.tree.loop(nid).extent for nid in option.target_nids[:-1]) // programs
             fused_width = current_width * absorbed_extent
             if max_tile is not None and fused_width > max_tile:
                 raise TransformLegalityError(
@@ -176,23 +206,25 @@ class Fuse(Transform[FuseOption]):
                 )
             self._check_tensorize_buffer_bounds(buffers, leaf, abstract_axis, absorbed_extent)
 
-    def _check_tensorize_loop_uses(self, leaf: ISANode, block: BlockNode, loop_var: str, target_axis: str) -> None:
+    def _check_tensorize_loop_uses(
+        self, leaf: ISANode, block: BlockNode, loop_var: str, target_axis: str, local_extent: int
+    ) -> None:
         """Reject loop uses that widening the selected operand axis cannot absorb."""
         abstract_axis = next(
             (abstract for abstract, concrete in block.axis_map.items() if concrete == target_axis), None
         )
         invalid_uses: list[str] = []
         for iter_var, value in zip(block.iter_vars, block.iter_values):
-            if iter_var.axis != target_axis and loop_var in to_affine(value):
+            if iter_var.axis != target_axis and loop_var in expr_variables(value):
                 invalid_uses.append(f"iter_var {iter_var.axis}")
         for slot, region in leaf.operand_bindings.items():
-            axes = leaf.op_cls.OPERAND_AXES[slot]
-            target_index = axes.index(abstract_axis) if abstract_axis in axes else None
+            axes = leaf.op_cls.operand_axis_groups(slot)
+            target_index = next((index for index, group in enumerate(axes) if abstract_axis in group), None)
             for index, (lower, width) in enumerate(region.ranges):
-                if (loop_var in to_affine(lower) or loop_var in to_affine(width)) and index != target_index:
+                if loop_var in (expr_variables(lower) | expr_variables(width)) and index != target_index:
                     invalid_uses.append(f"operand {slot}[{index}]")
                 if index == target_index:
-                    coefficient = to_affine(lower).get(loop_var, 0)
+                    coefficient = to_affine(_local_loop_expr(lower, loop_var, local_extent)).get(loop_var, 0)
                     width_terms = to_affine(width)
                     if coefficient and (set(width_terms) != {None} or coefficient != width_terms[None]):
                         invalid_uses.append(f"non-contiguous operand {slot}[{index}]")
@@ -205,8 +237,8 @@ class Fuse(Transform[FuseOption]):
     ) -> None:
         """Reject widened on-chip regions that exceed compacted allocations."""
         for slot, region in leaf.operand_bindings.items():
-            axes = leaf.op_cls.OPERAND_AXES[slot]
-            axis_index = axes.index(abstract_axis) if abstract_axis in axes else None
+            axes = leaf.op_cls.operand_axis_groups(slot)
+            axis_index = next((index for index, group in enumerate(axes) if abstract_axis in group), None)
             if axis_index is None or axis_index >= len(region.ranges):
                 continue
             width = region.ranges[axis_index][1]
@@ -222,6 +254,69 @@ class Fuse(Transform[FuseOption]):
                     f"beyond its compacted extent {buffer.shape[axis_index]}"
                 )
 
+    def _operation_batch_match(
+        self,
+        ir: KernelIR,
+        option: FuseOption,
+        overlap_nodes: frozenset[int] | None = None,
+        buffers: dict[str, Buffer] | None = None,
+    ) -> _OperationBatchMatch:
+        """Resolve one loop covered by an operation's partition batching contract."""
+        if option.target_axis is not None or len(option.target_nids) != 2:
+            raise TransformLegalityError("Fuse operation batching requires one loop and one ISA target")
+        loop_nid, leaf_nid = option.target_nids
+        if loop_nid not in ir.tree.graph or leaf_nid not in ir.tree.graph:
+            raise TransformLegalityError("Fuse operation batching target does not exist")
+        loop = ir.tree.data(loop_nid)
+        leaf = ir.tree.data(leaf_nid)
+        block_nid = ir.tree.parent(loop_nid)
+        if (
+            not isinstance(loop, ForNode)
+            or not isinstance(leaf, ISANode)
+            or block_nid is None
+            or not isinstance(ir.tree.data(block_nid), BlockNode)
+            or ir.tree.children(block_nid) != [loop_nid]
+            or ir.tree.children(loop_nid) != [leaf_nid]
+        ):
+            raise TransformLegalityError("Fuse operation batching requires one complete loop-operation block")
+        if intersects_software_pipeline(ir, option.target_nids, overlap_nodes) or leaf.access_patterns:
+            raise TransformLegalityError("Fuse operation batching cannot alter a pipeline or explicit operand view")
+        if loop_nid in configured_program_shards(ir):
+            raise TransformLegalityError("Fuse operation batching requires an unsharded local tile loop")
+        contract = leaf.op_cls.partition_tile_batching_contract(leaf.kwargs)
+        if contract is None or set(contract.operands) != set(leaf.operand_bindings):
+            raise TransformLegalityError("Fuse operation has no complete partition-tile batching contract")
+        block = ir.tree.block(block_nid)
+        roles = [
+            iter_var.role
+            for iter_var, value in zip(block.iter_vars, block.iter_values)
+            if loop.loop_var in expr_variables(value)
+        ]
+        if roles != [AxisRole.PARALLEL]:
+            raise TransformLegalityError("Fuse operation batching requires one parallel tile axis")
+        buffer_map = ir.all_buffers() if buffers is None else buffers
+        analyzer = Analyzer()
+        for slot in contract.operands:
+            region = leaf.operand_bindings[slot]
+            buffer = buffer_map[region.tensor]
+            partition = buffer.partition_extent() if buffer.location != "shared_hbm" else 0
+            valid = bool(
+                buffer.location in {"sbuf", "psum"}
+                and len(buffer.shape) == 2
+                and buffer.list_len == 1
+                and buffer.versions == 1
+                and loop.extent == buffer.logical_tile_count()
+                and len(region.ranges) == 2
+                and region.ranges[0][1] == Const(value=partition)
+                and region.ranges[1] == (Const(value=0), Const(value=buffer.shape[1]))
+                and analyzer.can_prove_equal(region.ranges[0][0], Var(name=loop.loop_var))
+            )
+            if not valid:
+                raise TransformLegalityError(
+                    f"Fuse {leaf.op_cls.__name__}.{slot} is not one contiguous partition-tile family"
+                )
+        return _OperationBatchMatch(block_nid, loop_nid, leaf_nid, contract)
+
     def _is_legal(
         self,
         ir: KernelIR,
@@ -232,9 +327,39 @@ class Fuse(Transform[FuseOption]):
         """Return whether ``option`` passes the same checks used by :meth:`apply`."""
         try:
             self._check_legality(ir, option, overlap_nodes, buffers)
-        except TransformLegalityError:
+        except (TransformLegalityError, NonAffineError):
             return False
         return True
+
+    def _do_operation_batch(self, ir: KernelIR, option: FuseOption) -> None:
+        """Replace one declared partition-tile loop with one full-view ISA call."""
+        match = self._operation_batch_match(ir, option)
+        loop = ir.tree.loop(match.loop_nid)
+        leaf = ir.tree.isa(match.leaf_nid)
+        buffers = ir.all_buffers()
+        bindings = {
+            slot: _tile_regions(buffers[leaf.operand_bindings[slot].tensor])[0] for slot in match.contract.operands
+        }
+        patterns = {
+            slot: _full_buffer_pattern(buffers[leaf.operand_bindings[slot].tensor]) for slot in match.contract.operands
+        }
+
+        def expand(regions: tuple[BufferRegion, ...]) -> tuple[BufferRegion, ...]:
+            """Replace each one-tile footprint with its complete logical family."""
+            return tuple(tile for region in regions for tile in _tile_regions(buffers[region.tensor]))
+
+        block = ir.tree.block(match.block_nid)
+        ir.tree.graph.nodes[match.block_nid]["data"] = replace(
+            block,
+            iter_values=tuple(
+                Analyzer().simplify(substitute(value, {loop.loop_var: Const(value=0)})) for value in block.iter_values
+            ),
+            reads=expand(block.reads),
+            writes=expand(block.writes),
+        )
+        ir.tree.graph.nodes[match.leaf_nid]["data"] = replace(leaf, operand_bindings=bindings, access_patterns=patterns)
+        _replace_in_parent_children(ir.tree, match.block_nid, [match.loop_nid], [match.leaf_nid])
+        ir.tree.graph.remove_node(match.loop_nid)
 
     def _do_outer_trip(self, ir: KernelIR, option: FuseOption) -> None:
         """Outer-trip Fuse: merge two parent-child same-dim ForNodes into one loop.
@@ -262,9 +387,22 @@ class Fuse(Transform[FuseOption]):
             ir.tree.graph.remove_node(nid)
 
         nested_blocks = {nid for nid in ir.tree.preorder(new_nid) if isinstance(ir.tree.data(nid), BlockNode)}
+        outside_paths = {
+            nid: _loop_path_names(ir.tree, block_nid, nid)
+            for nid in ir.tree.preorder(block_nid)
+            if nid != block_nid and nid not in nested_blocks and isinstance(ir.tree.data(nid), BlockNode)
+        }
         substitutions: dict[str, Expr] = {loop_var: Const(value=0) for loop_var in old_loop_vars}
         substitutions[old_loop_vars[-1]] = Var(name=ir.tree.loop(new_nid).loop_var)
         _normalize_block_hierarchy(ir.tree, block_nid, substitutions, nested_blocks)
+        for nested_block, path_names in outside_paths.items():
+            renames: dict[str, Expr] = {
+                old_name: Var(name=ir.tree.loop(nid).loop_var)
+                for nid, old_name in path_names.items()
+                if nid in ir.tree.graph and ir.tree.loop(nid).loop_var != old_name
+            }
+            if renames:
+                _substitute_block_regions(ir.tree, nested_block, renames)
         _refresh_intrinsic_offsets(ir.tree, new_nid)
 
     def _do_tensorize(self, ir: KernelIR, option: FuseOption) -> None:
@@ -285,10 +423,18 @@ class Fuse(Transform[FuseOption]):
         assert chain_root_parent is not None
         block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
 
-        absorbed_extent = prod(ir.tree.loop(nid).extent for nid in for_chain)
+        programs = configured_program_shards(ir).get(chain_root, 1)
+        local_extent = ir.tree.loop(chain_root).extent // programs
+        absorbed_extent = prod(ir.tree.loop(nid).extent for nid in for_chain) // programs
         substitutions: dict[str, Expr] = {ir.tree.loop(nid).loop_var: Const(value=0) for nid in for_chain}
+        if programs > 1:
+            substitutions[ir.tree.loop(chain_root).loop_var] = Mul(
+                left=Var(name="nl.program_id(0)"), right=Const(value=local_extent)
+            )
         ir.tree.graph.remove_edge(for_chain[-1], leaf_nid)
         _replace_in_parent_children(ir.tree, chain_root_parent, [chain_root], [leaf_nid])
+        if programs > 1:
+            _remove_program_shard(ir, chain_root)
         for nid in for_chain:
             ir.tree.graph.remove_node(nid)
 
@@ -298,10 +444,10 @@ class Fuse(Transform[FuseOption]):
 
         def _widen(lo: Expr, width: int) -> tuple[Expr, int]:
             """Remove absorbed-loop offsets and grow the selected tile width."""
-            return substitute(lo, substitutions), width * absorbed_extent
+            return Analyzer().simplify(substitute(lo, substitutions)), width * absorbed_extent
 
         new_bindings = {
-            slot: retile_region(region, leaf.op_cls.OPERAND_AXES[slot], abstract_axis, _widen)
+            slot: retile_region(region, leaf.op_cls.operand_axis_groups(slot), abstract_axis, _widen)
             for slot, region in leaf.operand_bindings.items()
         }
         ir.tree.graph.nodes[leaf_nid]["data"] = ISANode(
@@ -310,10 +456,12 @@ class Fuse(Transform[FuseOption]):
 
         """Block reads/writes are keyed by tensor name, not slot; map tensor->axes via the leaf
         so each region uses its own operand's axes (matmul stationary lacks N -> no-op)."""
-        tensor_to_axes = {leaf.operand_bindings[s].tensor: leaf.op_cls.OPERAND_AXES[s] for s in leaf.operand_bindings}
+        tensor_to_axes = {
+            leaf.operand_bindings[slot].tensor: leaf.op_cls.operand_axis_groups(slot) for slot in leaf.operand_bindings
+        }
         new_block = BlockNode(
             iter_vars=block.iter_vars,
-            iter_values=tuple(substitute(value, substitutions) for value in block.iter_values),
+            iter_values=tuple(Analyzer().simplify(substitute(value, substitutions)) for value in block.iter_values),
             reads=tuple(retile_region(r, tensor_to_axes.get(r.tensor, ()), abstract_axis, _widen) for r in block.reads),
             writes=tuple(
                 retile_region(w, tensor_to_axes.get(w.tensor, ()), abstract_axis, _widen) for w in block.writes
@@ -326,16 +474,21 @@ class Fuse(Transform[FuseOption]):
 
         offset_spec = getattr(leaf.op_cls, "SPLIT_OFFSET_KWARGS", {}).get(abstract_axis)
         if offset_spec is not None:
+            assert abstract_axis is not None
             offset_key, output_slot = offset_spec
             current = ir.tree.isa(leaf_nid)
-            output_axis = current.op_cls.OPERAND_AXES[output_slot].index(abstract_axis)
+            output_axis = current.op_cls.operand_dimension(output_slot, abstract_axis)
             kwargs = {**current.kwargs, offset_key: current.operand_bindings[output_slot].ranges[output_axis][0]}
             ir.tree.graph.nodes[leaf_nid]["data"] = replace(current, kwargs=kwargs)
 
 
 def _maximum_tensorize_width(leaf: ISANode, abstract_axis: str | None, buffers: dict[str, Buffer]) -> int | None:
     """Return the hardware tile limit for one tensorized operation axis."""
-    maximum = leaf.op_cls.MAX_TILE_SIZE.get(abstract_axis) if abstract_axis is not None else None
+    maximum = (
+        leaf.op_cls.TENSORIZE_MAX_TILE_SIZE.get(abstract_axis, leaf.op_cls.MAX_TILE_SIZE.get(abstract_axis))
+        if abstract_axis is not None
+        else None
+    )
     if leaf.op_cls is NKIDMATranspose and abstract_axis is not None:
         source = leaf.operand_bindings["src"].tensor
         if buffers[source].location == "shared_hbm":
@@ -351,7 +504,7 @@ def _refresh_intrinsic_offsets(tree: KernelTree, root_nid: int) -> None:
             continue
         kwargs = dict(node.kwargs)
         for abstract_axis, (key, output_slot) in getattr(node.op_cls, "SPLIT_OFFSET_KWARGS", {}).items():
-            output_axis = node.op_cls.OPERAND_AXES[output_slot].index(abstract_axis)
+            output_axis = node.op_cls.operand_dimension(output_slot, abstract_axis)
             kwargs[key] = node.operand_bindings[output_slot].ranges[output_axis][0]
         tree.graph.nodes[leaf_nid]["data"] = replace(node, kwargs=kwargs)
 
@@ -370,6 +523,29 @@ def _retarget_program_shard(tree: KernelTree, old_nids: tuple[int, ...], new_nid
     updated[new_nid] = programs[0]
     annotations["program_shards"] = updated
     tree.graph.nodes[tree.root]["data"] = replace(root, annotations=annotations)
+
+
+def _remove_program_shard(ir: KernelIR, loop_nid: int) -> None:
+    """Remove one materialized shard after its local iterations become one ISA tile."""
+    root = ir.tree.block(ir.tree.root)
+    annotations = dict(root.annotations)
+    shards = configured_program_shards(ir)
+    del shards[loop_nid]
+    annotations[PROGRAM_SHARDS_ANNOTATION] = shards
+    ir.tree.graph.nodes[ir.tree.root]["data"] = replace(root, annotations=annotations)
+
+
+def _local_loop_expr(expr: Expr, loop_var: str, local_extent: int) -> Expr:
+    """Replace a program-local modulo coordinate by its local loop value."""
+    if expr == Mod(left=Var(name=loop_var), right=Const(value=local_extent)):
+        return Var(name=loop_var)
+    if isinstance(expr, (Const, Var)):
+        return expr
+    return replace(
+        expr,
+        left=_local_loop_expr(expr.left, loop_var, local_extent),
+        right=_local_loop_expr(expr.right, loop_var, local_extent),
+    )
 
 
 def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
@@ -494,6 +670,31 @@ def _binding_and_access_offsets(node: BlockNode | ForNode | ISANode) -> list[Exp
         regions = ()
     expressions.extend(lower for region in regions for lower, _width in region.ranges)
     return expressions
+
+
+def _tile_regions(buffer: Buffer) -> tuple[BufferRegion, ...]:
+    """Return every logical partition tile of one packed on-chip buffer."""
+    partition, free = buffer.partition_extent(), buffer.shape[1]
+    return tuple(
+        BufferRegion(
+            tensor=buffer.name,
+            ranges=((Const(value=tile), Const(value=partition)), (Const(value=0), Const(value=free))),
+        )
+        for tile in range(buffer.logical_tile_count())
+    )
+
+
+def _full_buffer_pattern(buffer: Buffer) -> AccessPattern:
+    """Return the complete physical ndarray view of one packed on-chip buffer."""
+    partition, tiles, free = buffer.per_tile_physical_shape()
+    return AccessPattern(
+        pattern=(
+            (Const(value=tiles * free), Const(value=partition)),
+            (Const(value=free), Const(value=tiles)),
+            (Const(value=1), Const(value=free)),
+        ),
+        offset=Const(value=0),
+    )
 
 
 __all__ = ["Fuse", "FuseOption"]

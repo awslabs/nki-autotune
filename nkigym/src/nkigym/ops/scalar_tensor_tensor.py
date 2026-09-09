@@ -21,11 +21,12 @@ class NKIScalarTensorTensor(NKIOp):
     NAME: ClassVar[str] = "scalar_tensor_tensor"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {
         "data": ("P", "F"),
-        "operand0": ("P",),
+        "operand0": ("P", "B"),
         "operand1": ("P", "F"),
         "dst": ("P", "F"),
     }
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data", "operand0", "operand1"})
+    FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {"B": 1}
     INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {
         operand: frozenset({"sbuf", "psum"}) for operand in INPUT_OPERANDS
     }

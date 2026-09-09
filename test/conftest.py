@@ -1,4 +1,4 @@
-"""Pytest configuration for caller-selected remote acceptance-test hosts."""
+"""Pytest configuration for caller-selected remote validation hosts."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=None,
         dest="trn2_hosts",
         metavar="HOST",
-        help="SSH destinations for Trn2 profiling tests",
+        help="SSH destinations for Trn2 correctness and latency tests",
     )
     group.addoption(
         "--cpu-hosts",

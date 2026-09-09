@@ -6,13 +6,12 @@ from dataclasses import dataclass, replace
 
 from nkigym.ir import BlockNode, Buffer, BufferRegion, Const, FloorDiv, ISANode, KernelIR, Mul
 from nkigym.ir.arith.analyzer import Analyzer
+from nkigym.ir.buffer_placement import layout_satisfies_output_alignment
 from nkigym.ops.dma_transpose import NKIDMATranspose
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.memset import NKIMemset
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.transpose import NKITranspose
-from nkigym.search.buffer_placement import layout_satisfies_output_alignment
-from nkigym.search.state_facts import operation_facts
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.canonical_rewrite import (
     block_chain,
@@ -71,23 +70,8 @@ class _ScheduledRewrite:
 class TransposeThroughMatmul(Transform[TransposeThroughMatmulOption]):
     """Apply ``T(A.T @ B) = B.T @ A`` to one adjacent transpose."""
 
-    SPLIT_PREPARATION_DEPTH = 3
-
-    def split_preparation_applicable(self, ir: KernelIR) -> bool:
-        """Return whether only retained tile legality blocks one commute."""
-        children = tuple(ir.tree.children(ir.tree.root))
-        return any(
-            _match(ir, TransposeThroughMatmulOption(block), children, index, require_legal_tiles=False) is not None
-            for index, block in enumerate(children)
-        )
-
     def analyze(self, ir: KernelIR) -> list[TransposeThroughMatmulOption]:
         """Return every transpose that can commute through a canonical matmul."""
-        facts = operation_facts(ir)
-        if not facts.has_ops(NKIMatmul, NKIMemset, NKITensorCopy) or not {NKITranspose, NKIDMATranspose}.intersection(
-            facts.op_classes
-        ):
-            return []
         options: list[TransposeThroughMatmulOption] = []
         root_children = tuple(ir.tree.children(ir.tree.root))
         for index, block_nid in enumerate(root_children):

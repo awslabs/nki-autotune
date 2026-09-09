@@ -139,6 +139,12 @@ def adapt_inputs(
                 source = array
                 array = np.full(shape, transform[2], dtype=array.dtype)
                 array[:, : cast(int, transform[1])] = np.tile(source.reshape(1, -1), (shape[0], 1))
+            elif transform[0] == "cross_entropy_rows":
+                groups = cast(int, transform[1])
+                array = array.reshape(groups, shape[0], -1).transpose(1, 0, 2).reshape(shape)
+            elif transform[0] == "cross_entropy_targets":
+                groups, vocab = cast(tuple[int, int], transform[1:])
+                array = array.reshape(groups, shape[0]).T + np.arange(groups, dtype=array.dtype)[None, :] * vocab
             elif transform[0] in {"moe_gate_up", "moe_down"}:
                 array = moe_gate_up_input(array, shape)
             elif transform[0] in {"wide_topk", "rotational_topk"}:
@@ -211,7 +217,7 @@ def adapt_output(
     flatten: bool,
     output_shapes: tuple[tuple[int, ...], ...],
     output_groups: tuple[int, ...],
-    sort_topk_output: bool,
+    sort_topk_output: bool | None,
     channels_last_output: bool,
     output_layout: str | None,
     topk_source: np.ndarray | None = None,
@@ -238,6 +244,9 @@ def adapt_output(
                 )
             elif output_layout == "head_grouped" and array.ndim == 4:
                 array = head_grouped(array, logical_output_shape(output_shapes, output_groups, len(leaves)), False)
+            elif output_layout == "cross_entropy_rows" and array.ndim == 1:
+                shape = logical_output_shape(output_shapes, output_groups, len(leaves))
+                array = array.reshape(shape[1], shape[0]).T
             elif output_layout is not None and output_layout.startswith("rope_data") and array.ndim == 4:
                 array = standard_rope_data(
                     array,
@@ -247,7 +256,7 @@ def adapt_output(
             elif channels_last_output and array.ndim > 2:
                 array = np.moveaxis(array, 1, -1).reshape(-1, array.shape[1])
             elif flatten and array.ndim > 2:
-                array = _flatten_output_array(array)
+                array = _flatten_output_array(array, logical_output_shape(output_shapes, output_groups, len(leaves)))
             leaves.append(array)
         elif value is not None:
             raise ValueError(f"Torch output leaf {value!r} is not a tensor")
@@ -267,7 +276,7 @@ def adapt_output(
         array[1, start:] = array[0, :start].sum()
         result = tuple(array[index : index + 1] for index in range(3))
     append(result)
-    if len(leaves) == 2 and leaves[0].shape == leaves[1].shape and leaves[1].dtype.kind in "iu":
+    if sort_topk_output is not None and len(leaves) == 2 and leaves[0].shape == leaves[1].shape:
         leaves[:2] = normalize_topk_output(leaves[0], leaves[1], sort_topk_output, topk_source)
     if len(leaves) != len(output_groups):
         raise ValueError(f"Torch output has {len(leaves)} tensors, expected {len(output_groups)} logical outputs")
@@ -298,7 +307,7 @@ def kernel_adapters(
     flatten: bool,
     output_shapes: tuple[tuple[int, ...], ...],
     output_groups: tuple[int, ...],
-    sort_topk_output: bool,
+    sort_topk_output: bool | None,
     channels_last_output: bool,
     output_layout: str | None,
 ) -> tuple[

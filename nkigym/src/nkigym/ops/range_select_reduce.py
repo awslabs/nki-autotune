@@ -32,9 +32,8 @@ class NKIRangeSelectReduce(NKIOp):
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 1, "F": 1}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
-    PREFERRED_TILE_SIZE: ClassVar[dict[str, int]] = {"F": 512}
     CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"width"})
-    SPLIT_OFFSET_KWARGS: ClassVar[dict[str, tuple[str, str]]] = {"F": ("range_start", "dst")}
+    SPLIT_OFFSET_KWARGS: ClassVar[dict[str, tuple[str, str]]] = {"F": ("range_start", "on_true_tile")}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def __init__(self, width: int, **kwargs: Any) -> None:

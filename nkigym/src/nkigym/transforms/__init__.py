@@ -41,6 +41,7 @@ _EXPORT_MODULES = {
     "BufferLayoutOption": "buffer_layout",
     "BufferPlacement": "buffer_placement",
     "BufferPlacementOption": "buffer_placement",
+    "BufferAxisFoldOption": "buffer_region_normalization",
     "BufferRegionNormalization": "buffer_region_normalization",
     "BufferRegionNormalizationOption": "buffer_region_normalization",
     "CancelTransposePairOption": "transpose_pair",
@@ -95,6 +96,7 @@ BufferLayout: type[Transform[Any]]
 BufferLayoutOption: type[TransformOption]
 BufferPlacement: type[Transform[Any]]
 BufferPlacementOption: type[TransformOption]
+BufferAxisFoldOption: type[TransformOption]
 BufferRegionNormalization: type[Transform[Any]]
 BufferRegionNormalizationOption: type[TransformOption]
 CancelTransposePairOption: type[TransformOption]
@@ -183,6 +185,7 @@ __all__ = [
     "BufferLayoutOption",
     "BufferPlacement",
     "BufferPlacementOption",
+    "BufferAxisFoldOption",
     "BufferRegionNormalization",
     "BufferRegionNormalizationOption",
     "CancelTransposePairOption",

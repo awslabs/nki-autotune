@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import statistics
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import cast
 
 
 def _run(stage: str, command: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -19,57 +22,108 @@ def _run(stage: str, command: list[str], environment: dict[str, str]) -> subproc
     return completed
 
 
-def _environment(lnc: int, visible_core: int) -> dict[str, str]:
+def _environment(lnc: int, visible_core: int | None) -> dict[str, str]:
     """Return an isolated Neuron runtime environment for one logical core."""
-    if lnc not in {1, 2}:
-        raise ValueError("lnc must be 1 or 2")
-    if not isinstance(visible_core, int) or isinstance(visible_core, bool) or visible_core < 0:
-        raise ValueError("visible core must be a non-negative integer")
-    environment = dict(os.environ)
-    path_entries = (
-        str(Path(sys.executable).parent),
-        "/opt/aws/neuron/bin",
-        *environment.get("PATH", "").split(os.pathsep),
+    invalid_core = visible_core is not None and (
+        not isinstance(visible_core, int) or isinstance(visible_core, bool) or visible_core < 0
     )
-    environment["PATH"] = os.pathsep.join(dict.fromkeys(path_entries))
+    if lnc not in {1, 2} or invalid_core:
+        raise ValueError("invalid Neuron runtime configuration")
+    environment = dict(os.environ)
+    entries = (str(Path(sys.executable).parent), "/opt/aws/neuron/bin", *environment.get("PATH", "").split(os.pathsep))
+    environment["PATH"] = os.pathsep.join(dict.fromkeys(entries))
     environment["NEURON_LOGICAL_NC_CONFIG"] = str(lnc)
-    environment["NEURON_RT_VISIBLE_CORES"] = str(visible_core)
+    if visible_core is not None:
+        environment["NEURON_RT_VISIBLE_CORES"] = str(visible_core)
     return environment
 
 
-def benchmark_kernel(neff_path: Path, artifacts_dir: Path, lnc: int, visible_core: int) -> dict[str, object]:
-    """Capture one NEFF execution and return its Neuron Explorer summary."""
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    ntff_path = artifacts_dir / "profile.ntff"
-    environment = _environment(lnc, visible_core)
-    _run(
-        "Neuron Explorer capture",
-        ["neuron-explorer", "capture", "--neff", str(neff_path), "--session-file", str(ntff_path)],
-        environment,
+def available_logical_cores(lnc: int) -> tuple[int, ...]:
+    """Return logical core IDs on devices with no active Neuron process."""
+    completed = _run("neuron-ls", ["neuron-ls", "--json-output"], _environment(lnc, None))
+    payload = json.loads(completed.stdout)
+    if not isinstance(payload, list):
+        raise RuntimeError("neuron-ls output must be a JSON array")
+    cores = tuple(
+        core
+        for device in payload
+        if isinstance(device, dict) and not device.get("neuron_processes")
+        for core in device.get("neuroncore_ids", ())
+        if isinstance(core, int) and not isinstance(core, bool)
     )
-    if not ntff_path.is_file():
-        raise RuntimeError(f"Neuron Explorer returned without creating {ntff_path}")
+    if not cores:
+        raise RuntimeError("neuron-ls reported no unoccupied logical NeuronCores")
+    return cores
+
+
+def _summary(neff_path: Path, ntff_path: Path, environment: dict[str, str]) -> dict[str, object]:
+    """Return one execution summary from a multi-execution capture."""
     completed = _run(
         "Neuron Explorer summary",
-        [
-            "neuron-explorer",
-            "view",
-            "--neff-path",
-            str(neff_path),
-            "--session-file",
-            str(ntff_path),
-            "--output-format",
-            "summary-json",
-        ],
+        ["neuron-explorer", "view", "-n", str(neff_path), "-s", str(ntff_path), "--output-format", "summary-json"],
         environment,
     )
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
-        raise RuntimeError(f"Neuron Explorer returned invalid summary JSON: {error}") from error
-    if not isinstance(payload, dict) or len(payload) != 1:
-        raise RuntimeError("Neuron Explorer summary must contain exactly one model")
-    raw_summary = next(iter(payload.values()))
+    payload = json.loads(completed.stdout)
+    raw_summary = next(iter(payload.values()), None) if isinstance(payload, dict) and len(payload) == 1 else None
     if not isinstance(raw_summary, dict):
         raise RuntimeError("Neuron Explorer returned a non-object model summary")
     return dict(raw_summary)
+
+
+def _aggregate(summaries: tuple[dict[str, object], ...]) -> dict[str, object]:
+    """Return a fixed trimmed-mean summary across captured executions."""
+    result = dict(summaries[0])
+    for name in result:
+        values = [
+            float(value)
+            for summary in summaries
+            if isinstance((value := summary.get(name)), (int, float)) and not isinstance(value, bool)
+        ]
+        if len(values) == len(summaries):
+            result[name] = statistics.fmean(sorted(values)[1:-1])
+    result["nkigym_execution_total_times"] = [summary["total_time"] for summary in summaries]
+    return result
+
+
+def _execution_paths(path: Path, count: int) -> tuple[Path, ...]:
+    """Return every execution trace path in one capture."""
+    return (path,) + tuple(path.with_name(f"{path.stem}_exec_{index}{path.suffix}") for index in range(2, count + 1))
+
+
+def _confirmation_capture(summaries: tuple[dict[str, object], ...]) -> dict[str, object]:
+    """Estimate one repeatable best latency from a fixed execution capture."""
+    times = tuple(cast(float, summary["total_time"]) for summary in summaries)
+    startup_mode = times[0] <= 0.85 * statistics.median(times[1:])
+    estimate = times[0] if startup_mode else statistics.quantiles(times, n=20, method="inclusive")[0]
+    result = dict(min(summaries, key=lambda summary: abs(cast(float, summary["total_time"]) - estimate)))
+    result["total_time"] = estimate
+    return result
+
+
+def _capture(neff_path: Path, ntff_path: Path, executions: int, environment: dict[str, str], stage: str) -> None:
+    """Capture a fixed number of executions into one trace session."""
+    values = neff_path, executions, ntff_path
+    flags = "--neff", "--num-exec", "--session-file"
+    _run(stage, ["neuron-explorer", "capture", *(f"{flag}={value}" for flag, value in zip(flags, values))], environment)
+
+
+def benchmark_kernel(
+    neff_path: Path, artifacts_dir: Path, lnc: int, visible_core: int, confirmation: bool
+) -> dict[str, object]:
+    """Capture repeated NEFF executions and return their robust summary."""
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    environment = _environment(lnc, visible_core)
+    _capture(neff_path, artifacts_dir / "warmup.ntff", 20, environment, "Neuron Explorer warmup")
+    captures, execution_count = (3, 20) if confirmation else (5, 1)
+    capture_paths = tuple(artifacts_dir / f"profile_capture_{index}.ntff" for index in range(captures))
+    for path in capture_paths:
+        _capture(neff_path, path, execution_count, environment, "Neuron Explorer capture")
+    ntff_paths = tuple(path for capture in capture_paths for path in _execution_paths(capture, execution_count))
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        summaries = tuple(executor.map(lambda path: _summary(neff_path, path, environment), ntff_paths))
+    if confirmation:
+        summaries = tuple(
+            _confirmation_capture(summaries[index : index + execution_count])
+            for index in range(0, len(summaries), execution_count)
+        )
+    return _aggregate(summaries)

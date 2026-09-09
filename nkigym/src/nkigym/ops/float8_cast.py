@@ -1,11 +1,12 @@
 """Float8 cast through ``nisa.activation``."""
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import ml_dtypes
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import CopyContract, NKIOp, _operand_role
 
 
 class NKIFloat8Cast(NKIOp):
@@ -24,6 +25,12 @@ class NKIFloat8Cast(NKIOp):
     def __init__(self) -> None:
         """Configure the native activation as an explicit float8 copy."""
         super().__init__(op="copy")
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> CopyContract:
+        """Return the cast's copy dataflow contract."""
+        _ = kwargs
+        return CopyContract(input_operand="data", output_operand="dst")
 
     def _check_roles(self, **kwargs: Any) -> None:
         """Require an on-chip source tensor."""

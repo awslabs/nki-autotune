@@ -154,7 +154,7 @@ def _clone_block(context: _Lowering, nid: int, remap: Mapping[str, str], output_
     kwargs = dict(leaf.kwargs)
     for abstract, (key, slot) in getattr(leaf.op_cls, "SPLIT_OFFSET_KWARGS", {}).items():
         if old_block.axis_map.get(abstract) == context.match.progress_axis:
-            local = bindings[slot].ranges[leaf.op_cls.OPERAND_AXES[slot].index(abstract)][0]
+            local = bindings[slot].ranges[leaf.op_cls.operand_dimension(slot, abstract)][0]
             kwargs[key] = Add(left=Mul(left=context.progress_index, right=Const(value=context.chunk_size)), right=local)
     reads, writes = _access_regions(leaf.op_cls, bindings, kwargs)
     for index, iter_var in enumerate(old_block.iter_vars):

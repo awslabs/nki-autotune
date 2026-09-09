@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import argparse
 import ast
 import copy
 import json
 import multiprocessing
 import pickle
 import re
+import sys
 import threading
 import traceback
 from collections.abc import Iterator
@@ -20,31 +20,24 @@ from typing import Any, cast
 import nki
 import numpy as np
 
-_FP_DTYPES_NON_FP32 = (
-    "bfloat16",
-    "float16",
-    "float8_e4m3",
-    "float8_e4m3fn",
-    "float8_e4m3fn_x4",
-    "float8_e5m2",
-    "float8_e5m2_x4",
-    "float4_e2m1fn_x4",
-    "tfloat32",
-)
+_FP_DTYPES_NON_FP32 = """
+bfloat16 float16 float8_e4m3 float8_e4m3fn float8_e4m3fn_x4
+float8_e5m2 float8_e5m2_x4 float4_e2m1fn_x4 tfloat32
+""".split()
 ArrayResult = np.ndarray | tuple[np.ndarray, ...]
 _SerializedCase = tuple[int, str, str, str, dict[str, np.ndarray], ArrayResult]
 _FailurePayload = dict[str, int | str]
 _Provenance = dict[tuple[object, ...], dict[str, Any]]
 _ProvenanceStore = dict[tuple[object, ...], _Provenance]
 _WORKER_CASES: list[_SerializedCase] = []
-_WORKER_ATOL = 0.0
-_WORKER_RTOL = 0.0
+_WORKER_ATOL, _WORKER_RTOL = 0.0, 0.0
 _SIMULATION_LOCK = threading.Lock()
+_LNC2 = re.compile(r"(?s)(?:(\w+)=nl\.program_id\(0\).*?\[[^\n]*\b\1|\[[^\n]*nl\.program_id\(0\)[^\n]*)")
 
 
 def _fp32_source(source: str) -> str:
     """Rewrite reduced-precision NKI language dtypes to fp32."""
-    preserved = set(re.findall(r"\b(sbuf_semantic_\w+)\s*=", source))
+    preserved = set(re.findall(r"\b(sbuf_semantic_\w+|\w+(?=\s*=.*float8_\w+.*shared_hbm))\s*=", source))
     pairs = re.findall(r"nisa\.(?:dma_transpose|nc_matmul)\((?:src|stationary)=(\w+).*?(?:dst|moving)=(\w+)", source)
     preserved.update(right for left, right in pairs if left in preserved)
     for name in preserved:
@@ -59,25 +52,26 @@ def _node_names(node: ast.AST) -> set[str]:
     return {item.id for item in ast.walk(node) if isinstance(item, ast.Name)}
 
 
-def _coefficient(node: ast.AST, variable: str) -> int | None:
-    """Return one variable's coefficient in a generated affine expression."""
-    if variable not in _node_names(node):
-        return 0
+def _affine_form(node: ast.AST) -> dict[str | None, int] | None:
+    """Return one generated affine expression as variable coefficients."""
     if isinstance(node, ast.Name):
-        return 1 if node.id == variable else None
-    if not isinstance(node, ast.BinOp):
-        return None
-    if isinstance(node.op, (ast.Add, ast.Sub)):
-        left, right = _coefficient(node.left, variable), _coefficient(node.right, variable)
-        if left is not None and right is not None:
-            return left + right if isinstance(node.op, ast.Add) else left - right
-    elif isinstance(node.op, ast.Mult):
-        constant, expression = (
-            (node.left, node.right) if isinstance(node.left, ast.Constant) else (node.right, node.left)
-        )
+        return {node.id: 1}
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return {None: int(node.value)}
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
+        left, right = _affine_form(node.left), _affine_form(node.right)
+        if left is None or right is None:
+            return None
+        sign = 1 if isinstance(node.op, ast.Add) else -1
+        for name, value in right.items():
+            left[name] = left.get(name, 0) + sign * value
+        return {name: value for name, value in left.items() if value}
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        constant = node.left if isinstance(node.left, ast.Constant) else node.right
+        expression = node.right if constant is node.left else node.left
         if isinstance(constant, ast.Constant) and isinstance(constant.value, int):
-            coefficient = _coefficient(expression, variable)
-            return None if coefficient is None else int(constant.value) * coefficient
+            form = _affine_form(expression)
+            return None if form is None else {name: int(constant.value) * value for name, value in form.items()}
     return None
 
 
@@ -109,7 +103,8 @@ def _coalesced_operand(node: ast.expr, loops: tuple[tuple[str, int], ...]) -> tu
     lower, width = target.lower, int(upper.right.value)
     if names & (_node_names(result) - _node_names(target)):
         return None
-    coefficients = [_coefficient(lower, name) for name, _ in loops]
+    form = _affine_form(lower)
+    coefficients = [None if form is None else form.get(name, 0) for name, _ in loops]
     if any(value is None or value <= 0 or value % width for value in coefficients):
         return None
     digits = sorted(
@@ -144,6 +139,9 @@ def _coalescible_call(node: ast.stmt) -> tuple[ast.Call, tuple[str, ...]] | None
     function = None if call is None else call.func
     if isinstance(call, ast.Call) and isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name):
         operands = {"dma_copy": ("src", "dst"), "memset": ("dst",)}.get(function.attr)
+        operands = ("src", "dst") if function.attr == "tensor_copy" else operands
+        if function.attr == "range_select":
+            operands = ("on_true_tile", "dst")
         if function.value.id == "nisa" and operands is not None:
             return call, operands
     return None
@@ -160,13 +158,26 @@ def _coalesced_call(node: ast.For) -> ast.stmt | None:
     result, (_call, operand_names) = copy.deepcopy(statement), info
     bindings = {keyword.arg: keyword for keyword in cast(ast.Call, cast(ast.Expr, result).value).keywords}
     names = {name for name, _ in loops}
-    if any(names & _node_names(keyword.value) for name, keyword in bindings.items() if name not in operand_names):
+    if any(
+        names & _node_names(keyword.value)
+        for name, keyword in bindings.items()
+        if name not in operand_names and name != "range_start"
+    ):
         return None
+    if "range_start" in bindings:
+        source = bindings[operand_names[0]].value
+        slices = [item for item in ast.walk(source) if isinstance(item, ast.Slice) and names & _node_names(item)]
+        if len(slices) != 1 or _affine_form(cast(ast.expr, slices[0].lower)) != _affine_form(
+            bindings["range_start"].value
+        ):
+            return None
     operands = {name: _coalesced_operand(bindings[name].value, tuple(loops)) for name in operand_names}
     if any(value is None for value in operands.values()):
         return None
     for name, value in operands.items():
         bindings[name].value = cast(tuple[ast.expr, int], value)[0]
+    if "range_start" in bindings:
+        bindings["range_start"].value = cast(ast.expr, _ZeroLoops(names).visit(bindings["range_start"].value))
     return ast.copy_location(result, node)
 
 
@@ -234,17 +245,19 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
     """Group three hardware contraction tiles per FP32 reference matmul."""
     from nki._backends import simulator
     from nki._backends.simulator.dtypes import to_numpy_dtype
+    from nki._backends.simulator.lnc import LncContext
     from nki._backends.simulator.matmul import _flatten_to_2d
     from nki._backends.simulator.state import get_current_context
     from nki._backends.simulator.tensor_view import SimulatorTensorView
     from nki.language import _ops as language_ops
 
-    original_matmul, original_copy = simulator.nc_matmul, simulator.tensor_copy
+    original_matmul, original_copy, original_sendrecv = simulator.nc_matmul, simulator.tensor_copy, simulator.sendrecv
     original_tensor_tensor, original_reduce_op = simulator.tensor_tensor_arith, language_ops.get_numpy_reduce_op
     original_get, original_set = SimulatorTensorView.get_data, SimulatorTensorView.set_data
     pending, symbolic = cast(tuple[_ProvenanceStore, _ProvenanceStore], ({}, {}))
     materializing: set[tuple[object, ...]] = set()
     inverse_cache: dict[tuple[object, ...], tuple[np.ndarray, np.ndarray, np.ndarray] | None] = {}
+    peer_panels: dict[tuple[int, int, int, int], list[dict[str, Any]]] = {}
 
     def allocation(items: _ProvenanceStore, view: Any) -> _Provenance:
         """Return provenance views belonging to one allocation."""
@@ -257,16 +270,14 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
 
     def view_span(view: Any) -> tuple[int, int]:
         """Return inclusive storage bounds for one regular tensor view."""
-        deltas = [int(step) * (int(count) - 1) for step, count in view._get_pattern()]
-        offset = int(view.offset)
+        deltas, offset = [int(step) * (int(count) - 1) for step, count in view._get_pattern()], int(view.offset)
         return offset + sum(min(0, delta) for delta in deltas), offset + sum(max(0, delta) for delta in deltas)
 
     def remap_positions(view: Any, absolute: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Map storage indices to positions in one target view."""
         key = _view_key(view)
         if key not in inverse_cache:
-            pattern = np.asarray(view._get_pattern(), dtype=np.int64)
-            order = np.argsort(pattern[:, 0])
+            order = np.argsort((pattern := np.asarray(view._get_pattern(), dtype=np.int64))[:, 0])
             steps, counts = pattern[order].T
             strides = np.asarray([np.prod(pattern[dim + 1 :, 1]) for dim in order], dtype=np.int64)
             valid = view.scalar_offset is None and view.vector_offset is None and np.all(steps > 0)
@@ -275,6 +286,10 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
         if (inverse := inverse_cache[key]) is not None:
             steps, counts, strides = inverse
             relative = absolute - int(view.offset)
+            if len(steps) == 2 and steps[0] == 1:
+                rows, columns = np.divmod(relative, steps[1])
+                selected = (relative >= 0) & (rows < counts[1]) & (columns < counts[0])
+                return selected, np.where(selected, rows * counts[0] + columns, 0)
             coordinates = relative[:, None] // steps % counts
             selected = (relative >= 0) & (coordinates @ steps == relative)
             positions = coordinates @ strides
@@ -303,6 +318,14 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
             result += np.matmul(left.T, right)
         return result
 
+    def write_materialized(key: tuple[object, ...], view: Any, value: np.ndarray) -> None:
+        """Write one value without invalidating its provenance."""
+        materializing.add(key)
+        try:
+            original_set(view, value)
+        finally:
+            materializing.remove(key)
+
     def flush(view: Any) -> None:
         """Write every pending subview overlapping one read or write."""
         for key, item in tuple(allocation(pending, view).items()):
@@ -312,42 +335,58 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
             if item["base"] is not None:
                 result = item["base"] + result
             target = item["view"]
-            materializing.add(key)
-            try:
-                original_set(target, result.reshape(target.view_shape).astype(to_numpy_dtype(target.dtype)))
-            finally:
-                materializing.remove(key)
+            write_materialized(key, target, result.reshape(target.view_shape).astype(to_numpy_dtype(target.dtype)))
             item["dirty"] = False
 
     def flush_symbolic(view: Any) -> None:
-        """Materialize every symbolic RFactor result in one allocation."""
-        for key, item in tuple(allocation(symbolic, view).items()):
-            if not spans_overlap(view, item["view"]) or not item["dirty"]:
-                continue
-            data = original_get(item["view"]).copy().reshape(-1)
-            grouped: dict[bytes, list[dict[str, Any]]] = {}
-            for panel in item["panels"]:
-                grouped.setdefault(panel["positions"].tobytes(), []).append(panel)
-            for panels in grouped.values():
-                stationary = [array for panel in panels for array in panel["stationary"]]
-                moving = [array for panel in panels for array in panel["moving"]]
-                result = grouped_result(stationary, moving)
-                bases = [panel["base"] for panel in panels if panel["base"] is not None]
-                if bases:
-                    result += sum(bases[1:], start=bases[0].copy())
-                data[panels[0]["positions"]] = result.reshape(-1)
-            materializing.add(key)
-            try:
-                original_set(item["view"], data.reshape(item["view"].view_shape))
-            finally:
-                materializing.remove(key)
-            item["dirty"] = False
+        """Materialize only symbolic panels selected by one read."""
+        panels = take_symbolic(view)
+        if not panels:
+            return
+        data = original_get(view).copy().reshape(-1)
+        grouped: dict[bytes, list[dict[str, Any]]] = {}
+        for panel in panels:
+            grouped.setdefault(panel["positions"].tobytes(), []).append(panel)
+        for selected in grouped.values():
+            selected.sort(key=lambda panel: panel.get("rank", 0))
+            stationary = [array for panel in selected for array in panel["stationary"]]
+            moving = [array for panel in selected for array in panel["moving"]]
+            result = grouped_result(stationary, moving)
+            bases = [panel["base"] for panel in selected if panel["base"] is not None]
+            if bases:
+                result += sum(bases[1:], start=bases[0].copy())
+            data[selected[0]["positions"]] = result.reshape(-1)
+        write_materialized(_view_key(view), view, data.reshape(view.view_shape))
 
     def slice_panel(panel: dict[str, Any], columns: np.ndarray, positions: np.ndarray) -> dict[str, Any]:
         """Slice one symbolic matmul panel to complete result columns."""
         base = None if panel["base"] is None else panel["base"][:, columns]
         moving = [array[:, columns] for array in panel["moving"]]
         return panel | {"base": base, "moving": moving, "positions": positions}
+
+    def pending_panels(view: Any) -> list[dict[str, Any]]:
+        """Return pending contraction panels selected by one result subview."""
+        panels = []
+        for item in allocation(pending, view).values():
+            if spans_overlap(view, item["view"]):
+                selected, remapped = remap_positions(view, view_indices(item["view"]))
+                selected = selected.reshape(item["view"].view_shape)
+                columns = np.flatnonzero(selected[0])
+                complete = bool(columns.size and np.all(selected[:, columns]))
+                complete &= np.count_nonzero(selected) == selected.shape[0] * columns.size
+                if complete:
+                    panel = {"base": item["base"], "moving": item["moving"], "stationary": list(item["stationary"])}
+                    panels.append(slice_panel(panel, columns, remapped[selected.reshape(-1)]))
+        return panels
+
+    def matching_pending_panel(candidates: list[dict[str, Any]], peer: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the local contraction columns corresponding to one peer panel."""
+        for panel in candidates:
+            rows = panel["stationary"][0].shape[1]
+            selected = np.isin(panel["positions"], peer["positions"]).reshape(rows, -1)
+            if np.all(selected == selected[0]) and np.count_nonzero(selected) == peer["positions"].size:
+                return slice_panel(panel, np.flatnonzero(selected[0]), peer["positions"])
+        return None
 
     def take_symbolic(view: Any) -> list[dict[str, Any]]:
         """Remove and remap symbolic subviews contained by ``view``."""
@@ -356,8 +395,7 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
             return []
         panels: list[dict[str, Any]] = []
         for key, item in matches:
-            item_indices = view_indices(item["view"])
-            item_selected, item_remapped = remap_positions(view, item_indices)
+            item_selected, item_remapped = remap_positions(view, view_indices(item["view"]))
             remaining = []
             for panel in item["panels"]:
                 selected, remapped = (values[panel["positions"]] for values in (item_selected, item_remapped))
@@ -396,42 +434,45 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
             if candidates:
                 flush(view)
                 for pending_key, item in candidates:
-                    selected, _positions = remap_positions(view, view_indices(item["view"]))
-                    if np.any(selected):
+                    if np.any(remap_positions(view, view_indices(item["view"]))[0]):
                         del allocation(pending, view)[pending_key]
-            allocation(symbolic, view).pop(key, None)
+            take_symbolic(view)
         original_set(view, value)
 
     def tensor_copy(dst: Any, src: Any, engine: object, name: object) -> None:
         """Copy values and retain matmul provenance across an RFactor drain."""
-        panels = []
-        matches = [item for item in allocation(pending, src).values() if spans_overlap(item["view"], src)]
-        for item in matches:
-            indices = view_indices(item["view"])
-            selected, remapped = remap_positions(src, indices)
-            selected = selected.reshape(item["view"].view_shape)
-            columns = np.flatnonzero(selected[0])
-            if (
-                columns.size
-                and np.all(selected[:, columns])
-                and np.count_nonzero(selected) == selected.shape[0] * columns.size
-            ):
-                panel = {"base": item["base"], "moving": item["moving"], "stationary": list(item["stationary"])}
-                panels.append(slice_panel(panel, columns, remapped[selected.reshape(-1)]))
+        panels = pending_panels(src)
         original_copy(dst, src, engine, name)
         if panels:
             key = _view_key(dst)
             symbolic.setdefault(key[:2], {})[key] = {"dirty": True, "panels": panels, "view": dst}
 
+    def sendrecv(src: Any, dst: Any, *arguments: object, **keywords: object) -> None:
+        """Exchange peer data and exact symbolic matmul provenance."""
+        send_to, recv_from, pipe = (cast(int, keywords[name]) for name in ("send_to_rank", "recv_from_rank", "pipe_id"))
+        if (context := LncContext.get_current()) is None:
+            raise RuntimeError("sendrecv requires an active LNC context")
+        rank = context.get_program_id()
+        sequence = getattr(getattr(context, "_thread_local"), f"sendrecv_seq_{pipe}", 0)
+        peer_panels[(rank, send_to, pipe, sequence)] = panels = [panel | {"rank": rank} for panel in take_symbolic(src)]
+        original_sendrecv(src, dst, *arguments, **keywords)
+        if panels:
+            symbolic.setdefault((key := _view_key(src))[:2], {})[key] = {"dirty": True, "panels": panels, "view": src}
+        if received := peer_panels.pop((recv_from, rank, pipe, sequence)):
+            symbolic.setdefault((key := _view_key(dst))[:2], {})[key] = {"dirty": True, "panels": received, "view": dst}
+
     def tensor_tensor(dst: Any, data1: Any, data2: Any, op: object, engine: object, name: object) -> None:
         """Preserve RFactor provenance across its in-place SBUF add."""
-        destination = _view_key(dst)
-        panels = []
+        destination, panels = _view_key(dst), []
         if str(op) == "add" and destination == _view_key(data1):
-            right = take_symbolic(data2)
-            if right:
-                panels.extend(take_symbolic(data1))
-                panels.extend(right)
+            if right := take_symbolic(data2):
+                panels.extend(take_symbolic(data1) + right)
+        elif str(op) == "add":
+            local = pending_panels(data1)
+            if local and (right := take_symbolic(data2)) and "rank" in right[0]:
+                for peer in right:
+                    if (panel := matching_pending_panel(local, peer)) is not None:
+                        panels.extend((panel | {"rank": 1 - peer["rank"]}, peer))
         original_tensor_tensor(dst, data1, data2, op, engine, name)
         if panels:
             symbolic.setdefault(destination[:2], {})[destination] = {"dirty": True, "panels": panels, "view": dst}
@@ -451,8 +492,9 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
         if is_transpose or stationary.ti_state is not None or moving.ti_state is not None:
             original_matmul(dst, stationary, moving, is_transpose, row_pos, col_pos, perf_mode, accumulate, name)
             return
-        left = _flatten_to_2d(original_get(stationary).astype(np.float32), perf_mode)
-        right = _flatten_to_2d(original_get(moving).astype(np.float32), perf_mode)
+        left, right = (
+            _flatten_to_2d(original_get(operand).astype(np.float32), perf_mode) for operand in (stationary, moving)
+        )
         key, written = _view_key(dst), get_current_context().psum_written
         bucket = pending.setdefault(key[:2], {})
         should_accumulate = accumulate if accumulate is not None else key in written
@@ -487,6 +529,7 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
     with _SIMULATION_LOCK:
         language_ops.get_numpy_reduce_op = numpy_reduce_op
         simulator.nc_matmul, simulator.tensor_copy, simulator.tensor_tensor_arith = matmul, tensor_copy, tensor_tensor
+        simulator.sendrecv = sendrecv
         SimulatorTensorView.get_data, SimulatorTensorView.set_data = get_data, set_data
         try:
             yield
@@ -494,6 +537,7 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
             language_ops.get_numpy_reduce_op = original_reduce_op
             simulator.nc_matmul, simulator.tensor_copy = original_matmul, original_copy
             simulator.tensor_tensor_arith = original_tensor_tensor
+            simulator.sendrecv = original_sendrecv
             SimulatorTensorView.get_data, SimulatorTensorView.set_data = original_get, original_set
 
 
@@ -507,14 +551,14 @@ def _simulate_source_fp32(source: str, func_name: str, inputs: dict[str, np.ndar
     """Execute one standalone rendered kernel through the fp32 simulator."""
     namespace: dict = {}
     exec(compile(_fp32_source(source), f"<batch-case-{func_name}>", "exec"), namespace)  # noqa: S102
-    result = _simulate_kernel_fp32(namespace[func_name], ((), cast(dict[str, object], inputs)))
+    kernel = namespace[func_name][1 + bool(_LNC2.search(source.replace(" ", "")))]
+    result = _simulate_kernel_fp32(kernel, ((), cast(dict[str, object], inputs)))
     return tuple(np.asarray(value) for value in result) if isinstance(result, tuple) else np.asarray(result)
 
 
 def _assert_outputs(label: str, actual: ArrayResult, expected: ArrayResult) -> None:
     """Compare one simulated result with its reference outputs."""
-    actuals = actual if isinstance(actual, tuple) else (actual,)
-    expecteds = expected if isinstance(expected, tuple) else (expected,)
+    actuals, expecteds = (value if isinstance(value, tuple) else (value,) for value in (actual, expected))
     assert len(actuals) == len(expecteds), f"{label}: returned {len(actuals)} outputs, expected {len(expecteds)}"
     for pair in zip(actuals, expecteds, strict=True):
         np.testing.assert_allclose(*pair, atol=_WORKER_ATOL, rtol=_WORKER_RTOL, err_msg=label)
@@ -535,12 +579,6 @@ def _simulate_case(position: int) -> _FailurePayload | None:
     return None
 
 
-def _read_worker_request(request_path: Path) -> tuple[list[_SerializedCase], float, float, int]:
-    """Load one trusted controller-generated worker request."""
-    with request_path.open("rb") as request_file:
-        return cast(tuple[list[_SerializedCase], float, float, int], pickle.load(request_file))
-
-
 def _worker_result(
     cases: list[_SerializedCase], atol: float, rtol: float, worker_count: int
 ) -> dict[str, int | _FailurePayload | None]:
@@ -549,7 +587,7 @@ def _worker_result(
     input_bytes = max((sum(value.nbytes for value in case[4].values()) for case in cases), default=0)
     for inputs in {id(case[4]): case[4] for case in cases}.values():
         inputs.update({name: value.astype(np.float32) for name, value in inputs.items() if value.dtype.kind == "f"})
-    cases.sort(key=lambda case: len(case[2]) + sum(value.nbytes for value in case[4].values()) // 1024, reverse=True)
+    cases.sort(key=lambda c: sum(16 ** (s.find("nisa") // 4) for s in c[2].splitlines() if "nisa." in s), reverse=True)
     _WORKER_CASES, _WORKER_ATOL, _WORKER_RTOL = cases, atol, rtol
     failures: list[_FailurePayload | None] = []
     if cases:
@@ -566,21 +604,15 @@ def _worker_result(
 
 def _run_worker(request_path: Path, result_path: Path) -> None:
     """Run one remote request and atomically write its result metadata."""
-    cases, atol, rtol, worker_count = _read_worker_request(request_path)
+    payload = pickle.loads(request_path.read_bytes())
+    cases, atol, rtol, worker_count = cast(tuple[list[_SerializedCase], float, float, int], payload)
     result, temporary_path = _worker_result(cases, atol, rtol, worker_count), result_path.with_suffix(".tmp")
     temporary_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     temporary_path.replace(result_path)
 
 
-def _parse_args() -> argparse.Namespace:
-    """Parse the private remote-worker command line."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--worker", action="store_true", required=True)
-    parser.add_argument("request", type=Path)
-    parser.add_argument("result", type=Path)
-    return parser.parse_args()
-
-
 if __name__ == "__main__":
-    args = _parse_args()
-    _run_worker(args.request, args.result)
+    _script, marker, request, result = sys.argv
+    if marker != "--worker":
+        raise ValueError(f"expected --worker, got {marker!r}")
+    _run_worker(Path(request), Path(result))

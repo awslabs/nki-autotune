@@ -26,18 +26,47 @@ host must already have the Neuron driver, runtime, and tools.
 
 ## Tests
 
-Host-dependent acceptance tests have no repository defaults. Pass the Trn2 and
-CPU SSH destinations on every run:
+Host-dependent tests have no repository defaults. Pass CPU SSH destinations
+when running remote simulation coverage:
 
 ```bash
-pytest \
-  --trn2-hosts gym-trn2-1 gym-trn2-2 \
-  --cpu-hosts gym-cpu-1 gym-cpu-2
+pytest --cpu-hosts gym-cpu-1 gym-cpu-2
 ```
 
-Each option accepts one or more hosts. Search workloads are distributed across
-the Trn2 hosts, while each CPU simulation batch uses all CPU hosts. Tests that
-do not use remote hosts can run without these options.
+The option accepts one or more hosts, and each CPU simulation batch uses all
+configured hosts. Tests that do not use remote simulation can run without it.
+
+The complete agentic benchmark starts one bounded Codex transform search for
+each registered NAKB workload. Pin the model and budgets when comparing backend
+revisions:
+
+```bash
+NKIGYM_AGENTIC_MODEL=<codex-model> \
+NKIGYM_AGENTIC_TRACE_ROOT=/tmp/nkigym-agentic \
+PYTHONPATH="$PWD:$PWD/nkigym/src" python -m pytest \
+  test/test_agentic_ladder_build.py \
+  --trn2-hosts gym-trn2-1
+```
+
+Each subagent receives only the objective to use current NKIGym transforms to
+find the fastest kernel and may inspect Neuron Explorer profiler information.
+The harness records every retained state, the winning kernel and ladder, and
+the confirmed latency. The final kernel must pass the workload's copied NAKB
+accuracy checks on Trn2. The aggregate metric is:
+
+```text
+relative_latency = sum(confirmed NKIGym latency) / sum(NAKB latency)
+```
+
+Lower is better. Individual workloads may regress, but every workload must be
+correct and `relative_latency` must not exceed the fixed target of `0.9`. The
+trace root contains one `result.json` per workload and an aggregate
+`relative_latency.json`. A value of `0.9` means total confirmed NKIGym latency
+is at most 90% of total NAKB latency.
+
+Hardware correctness uses a fresh random 63-bit input seed on every benchmark
+run. The seed is printed and stored in all result files. Set
+`NKIGYM_NAKB_VALIDATION_SEED` to a recorded value only when reproducing a run.
 
 CPU checks use the official
 [`nki.simulate`](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.simulate.html)
@@ -69,22 +98,6 @@ compiler logs, `file.neff`, `profile.ntff`, and the JSON profiler summary. A
 failed compile or profile raises an exception after preserving available
 artifacts.
 
-Use `profile_many()` for independent kernels on the same Trn2 host. It uploads
-the batch once, compiles kernels in separate processes, and profiles each
-process on a distinct logical NeuronCore:
-
-```python
-from nkigym.profile import profile_many
-
-result = profile_many(
-    host="gym-1",
-    kernels={"candidate-0": Path("kernel.py").read_text()},
-    func_name="nki_kernel",
-    input_specs={"x": ((128, 512), "bfloat16")},
-    cache_dir="/tmp/kernel-profiles",
-)
-```
-
 ## Programmatic Synthesis
 
 The synthesis API traces supported NumPy math with shape-only symbolic tensors
@@ -115,10 +128,24 @@ reductions. Unsupported operations raise `ValueError`.
 
 ## Kernel Library
 
-Every workload is an exact seven-field dictionary containing a copied NAKB
-PyTorch golden reference, tensor input specifications, seeded input generator,
-correctness tolerances, a fixed NAKB baseline in `nakb_latency_ms`, and one
-best historical latency.
+Every runtime workload contains a copied NAKB PyTorch golden reference, tensor
+input specifications, seeded input generator, correctness tolerances, a fixed
+NAKB baseline in `nakb_latency_ms`, and three best-NKIGym fields:
+`best_nkigym_kernel`, `best_nkigym_latency_ms`, and `best_nkigym_ladder`.
+Untuned workloads have no kernel or ladder artifact. Optional committed
+compatibility artifacts live in `kernel_library/_best_nkigym.py`.
+
+The agentic relative-latency benchmark does not use those records as per-workload
+performance thresholds. It starts from the current canonical lowering, derives
+a fresh ladder using the current backend, and records results under its trace
+root. Final acceptance calls the unified
+`nkigym.profile.profile_metrics` backend with exact inputs, which compiles
+once, captures outputs, and profiles that same NEFF. It compares each output
+with the copied Torch golden using
+`abs(actual - expected) <= atol + rtol * max(abs(expected))`, and requires
+matching shapes, dtypes, and finiteness. The accepted source must also contain
+one derived `@nki.jit` entry point and must not use `nki.compiler` internals or
+manipulate `NEURON_CC_FLAGS`.
 
 `kernel_library.NAKB_WORKLOADS` contains 127 complete measured NAKB targets
 grouped into 26 flat, self-contained Python modules by workload type. Static
