@@ -1,27 +1,12 @@
-"""Recorded NKIGym kernels and transform ladders."""
+"""Recorded best NKIGym transform ladders."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TypedDict
+from typing import Any
+
+from nkigym.transforms import Transform, TransformOption
+
+BEST_NKIGYM_LADDERS: dict[str, tuple[tuple[Transform[Any], TransformOption], ...]] = {}
 
 
-class BestNKIGymLadderStep(TypedDict):
-    """One replayable public-transform application."""
-
-    transform: str
-    option: dict[str, object]
-
-
-@dataclass(frozen=True)
-class BestNKIGymArtifact:
-    """Compatibility source and transform ladder paired with one recorded latency."""
-
-    kernel: str
-    ladder: tuple[BestNKIGymLadderStep, ...]
-
-
-BEST_NKIGYM_ARTIFACTS: dict[str, BestNKIGymArtifact] = {}
-
-
-__all__ = ["BEST_NKIGYM_ARTIFACTS", "BestNKIGymArtifact", "BestNKIGymLadderStep"]
+__all__ = ["BEST_NKIGYM_LADDERS"]

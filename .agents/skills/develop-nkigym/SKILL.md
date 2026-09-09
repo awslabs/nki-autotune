@@ -1,6 +1,6 @@
 ---
 name: develop-nkigym
-description: Start or continue a persistent goal to debug and improve the NKIGym backend until all tests pass, modifying only nkigym/src/nkigym.
+description: Start or continue a persistent goal to debug and improve the NKIGym backend until all tests pass, modifying nkigym/src/nkigym and recording best ladders in kernel_library.
 ---
 
 # Develop NKIGym
@@ -12,12 +12,14 @@ When explicitly invoked:
 
    ```text
    Debug and improve the NKIGym backend until all repository tests pass.
-   Modify only files under nkigym/src/nkigym; do not modify any other
-   repository files.
+   Modify only files under nkigym/src/nkigym and kernel_library. Limit
+   kernel_library edits to recording best ladders. Do not modify any
+   other repository files.
    ```
 
 3. Continue an existing matching goal. Never replace an unrelated active goal.
 4. Work on the goal immediately. Reading files and running tests are allowed,
    but create, modify, move, delete, or format files only under
-   `nkigym/src/nkigym/`.
+   `nkigym/src/nkigym/` and `kernel_library/`. Limit `kernel_library/` edits to
+   recording best ladders.
 5. Call `update_goal` with `complete` only after all repository tests pass.
