@@ -1,8 +1,10 @@
 """JSON protocol for one local-to-Trn2 kernel profile request."""
 
-from __future__ import annotations
+from typing import TypeVar
 
 from nkigym.profile.types import ProfileConfig, ProfileRequest, ProfileResult
+
+_Scalar = TypeVar("_Scalar", str, int, bool)
 
 
 def request_payload(func_name: str, config: ProfileConfig) -> dict[str, object]:
@@ -24,10 +26,10 @@ def parse_request(payload: object) -> ProfileRequest:
     config = ProfileConfig(
         input_specs=_parse_input_specs(payload.get("input_specs")),
         neuronx_cc_args=_string_tuple(payload.get("neuronx_cc_args"), "neuronx_cc_args"),
-        lnc=_required_integer(payload, "lnc"),
-        confirmation=_required_boolean(payload, "confirmation"),
+        lnc=_required_scalar(payload, "lnc", int),
+        confirmation=_required_scalar(payload, "confirmation", bool),
     )
-    return ProfileRequest(func_name=_required_string(payload, "func_name"), config=config)
+    return ProfileRequest(func_name=_required_scalar(payload, "func_name", str), config=config)
 
 
 def parse_result(payload: object) -> ProfileResult:
@@ -46,24 +48,11 @@ def parse_result(payload: object) -> ProfileResult:
     )
 
 
-def _required_string(payload: dict[object, object], field: str) -> str:
-    """Read one required non-empty string."""
-    if not isinstance(value := payload.get(field), str) or not value:
-        raise ValueError(f"{field} must be a non-empty string")
-    return value
-
-
-def _required_integer(payload: dict[object, object], field: str) -> int:
-    """Read one required integer while rejecting JSON booleans."""
-    if not isinstance(value := payload.get(field), int) or isinstance(value, bool):
-        raise ValueError(f"{field} must be an integer")
-    return value
-
-
-def _required_boolean(payload: dict[object, object], field: str) -> bool:
-    """Read one required JSON boolean."""
-    if not isinstance(value := payload.get(field), bool):
-        raise ValueError(f"{field} must be a boolean")
+def _required_scalar(payload: dict[object, object], field: str, kind: type[_Scalar]) -> _Scalar:
+    """Read a typed JSON scalar, rejecting empty strings and boolean integers."""
+    value = payload.get(field)
+    if not isinstance(value, kind) or (kind is str and not value) or (kind is int and isinstance(value, bool)):
+        raise ValueError(f"{field} must contain a valid {kind.__name__} value")
     return value
 
 
@@ -100,6 +89,6 @@ def _parse_input_specs(value: object) -> dict[str, tuple[tuple[int, ...], str]]:
             raise ValueError("input_specs must map names to objects")
         specs[name] = (
             _positive_integer_tuple(raw_spec.get("shape"), f"input_specs.{name}.shape"),
-            _required_string(raw_spec, "dtype"),
+            _required_scalar(raw_spec, "dtype", str),
         )
     return specs

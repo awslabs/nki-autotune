@@ -5,16 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, cast
 
-from nkigym.ir import KernelIR
-from nkigym.ir.tree import BlockNode, BufferRegion, ISANode
+from nkigym.ir import Expr, KernelIR
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.base import AxisRole, CopyContract, NKIOp, PointwiseContract, ReductionContract
 from nkigym.ops.range_select import NKIRangeSelect
 from nkigym.ops.range_select_reduce import NKIRangeSelectReduce
 from nkigym.ops.scalar_tensor_tensor import NKIScalarTensorTensor
-from nkigym.ops.tensor_scalar import NKITensorScalar
+from nkigym.ops.tensor_scalar import _OPS, NKITensorScalar
 from nkigym.ops.tensor_scalar_reduce import NKITensorScalarReduce
+from nkigym.ops.tensor_scalar_sequence import NKITensorScalarSequence
 from nkigym.ops.tensor_tensor import NKITensorTensor
 from nkigym.transforms.base import (
     ActivationComposition,
@@ -84,9 +85,10 @@ class _PointwiseSequenceMatch:
 
     option: FusePointwiseOption
     consumer_leaf_nid: int
+    op_cls: type[NKIOp]
     data: BufferRegion
     operand0: BufferRegion | None
-    other: BufferRegion
+    other: BufferRegion | None
     intermediate: BufferRegion
     destination: BufferRegion
     kwargs: dict[str, Any]
@@ -111,15 +113,16 @@ class FusePointwise(Transform[FusePointwiseOption]):
     def analyze(self, ir: KernelIR) -> list[FusePointwiseOption]:
         """Enumerate adjacent pointwise-consumer pairs with a native fused ISA."""
         options: list[FusePointwiseOption] = []
+        buffers = ir.all_buffers()
         overlap_nodes = software_pipeline_overlap_nodes(ir)
         for parent_nid in ir.tree.preorder():
             children = ir.tree.children(parent_nid)
             for pointwise_nid, consumer_nid in zip(children, children[1:]):
                 option = FusePointwiseOption(pointwise_block_nid=pointwise_nid, consumer_block_nid=consumer_nid)
-                if self._resolve(ir, option, overlap_nodes, adjacent=True) is not None:
+                if self._resolve(ir, option, buffers, overlap_nodes, adjacent=True) is not None:
                     options.append(option)
         for consumer_nid in ir.tree.blocks():
-            consumer_leaf_nid = self._owned_leaf(ir, consumer_nid)
+            consumer_leaf_nid = ir.dependency._leaf_of_block.get(consumer_nid)
             parent = None if consumer_leaf_nid is None else ir.tree.parent(consumer_leaf_nid)
             siblings = [] if parent is None else ir.tree.children(parent)
             if consumer_leaf_nid not in siblings:
@@ -131,17 +134,17 @@ class FusePointwise(Transform[FusePointwiseOption]):
             if not isinstance(ir.tree.data(pointwise_nid), BlockNode):
                 continue
             option = FusePointwiseOption(pointwise_block_nid=pointwise_nid, consumer_block_nid=consumer_nid)
-            if option not in options and self._resolve(ir, option, overlap_nodes, adjacent=True) is not None:
+            if option not in options and self._resolve(ir, option, buffers, overlap_nodes, adjacent=True) is not None:
                 options.append(option)
         return options
 
     def apply(self, ir: KernelIR, option: FusePointwiseOption) -> KernelIR:
         """Re-check ``option``, replace the pair, and rebuild derived metadata."""
-        fusion = self._resolve(ir, option)
+        fusion = self._resolve(ir, option, ir.all_buffers())
         if fusion is None:
             raise TransformLegalityError(f"illegal FusePointwise option: {option}")
         new_ir = copy_for_rewrite(ir)
-        copied_fusion = self._resolve(new_ir, option)
+        copied_fusion = self._resolve(new_ir, option, new_ir.all_buffers())
         if copied_fusion is None:
             raise AssertionError(f"FusePointwise option disappeared after deepcopy: {option}")
         self._rewrite(new_ir, copied_fusion)
@@ -151,6 +154,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
         self,
         ir: KernelIR,
         option: FusePointwiseOption,
+        buffers: dict[str, Buffer],
         overlap_nodes: frozenset[int] | None = None,
         adjacent: bool | None = None,
     ) -> (
@@ -163,6 +167,14 @@ class FusePointwise(Transform[FusePointwiseOption]):
         | None
     ):
         """Resolve one adjacent pair to exactly one native fusion."""
+        producer = ir.dependency._leaf_of_block.get(option.pointwise_block_nid)
+        if producer is None:
+            return None
+        node = ir.tree.isa(producer)
+        if node.op_cls is not NKIRangeSelect and not isinstance(
+            node.op_cls.algebraic_contract(node.kwargs), PointwiseContract
+        ):
+            return None
         if adjacent is None:
             adjacent = self._are_adjacent(ir, option.pointwise_block_nid, option.consumer_block_nid)
         if not adjacent:
@@ -174,19 +186,40 @@ class FusePointwise(Transform[FusePointwiseOption]):
             not nested and not self._isolated_block(ir, option.consumer_block_nid)
         ):
             return None
-        fusion = self._resolve_copy(ir, option)
+        leaves = (
+            single_leaf(ir.tree, option.pointwise_block_nid),
+            ir.dependency._leaf_of_block.get(option.consumer_block_nid),
+        )
+        if any(leaf is None for leaf in leaves):
+            return None
+        leaf_nodes = [ir.tree.isa(leaf) for leaf in leaves if leaf is not None]
+        preserved_keys = ("program_ownership", "no_reorder")
+        if any(leaf_nodes[0].kwargs.get(key) != leaf_nodes[1].kwargs.get(key) for key in preserved_keys):
+            return None
+        loops = [
+            tuple(nid for nid in ir.tree.ancestors(leaf) if isinstance(ir.tree.data(nid), ForNode))
+            for leaf in leaves
+            if leaf is not None
+        ]
+        if loops[0] != loops[1]:
+            return None
+        fusion = self._resolve_copy(ir, option, buffers)
         if fusion is None:
             fusion = resolve_activation_composition(
-                ir, option.pointwise_block_nid, option.consumer_block_nid, self._has_unique_consumer
+                ir, option.pointwise_block_nid, option.consumer_block_nid, self._has_unique_consumer, buffers
             )
         if fusion is None:
-            fusion = self._resolve_activation(ir, option)
+            fusion = self._resolve_activation(ir, option, buffers)
         if fusion is None:
-            fusion = self._resolve_broadcast_activation(ir, option)
+            fusion = self._resolve_broadcast_activation(ir, option, buffers)
         if fusion is None:
-            fusion = self._resolve_sequence(ir, option)
+            fusion = self._resolve_sequence(ir, option, buffers)
         if fusion is None:
-            fusion = self._resolve_reduction(ir, option)
+            fusion = self._resolve_reduction(ir, option, buffers)
+        if isinstance(fusion, (ActivationComposition, _PointwiseSequenceMatch, _ReductionFusion)):
+            fusion.kwargs.update(
+                {key: leaf_nodes[0].kwargs[key] for key in preserved_keys if key in leaf_nodes[0].kwargs}
+            )
         return fusion
 
     def _isolated_block(self, ir: KernelIR, block_nid: int) -> bool:
@@ -194,24 +227,6 @@ class FusePointwise(Transform[FusePointwiseOption]):
         leaf = single_leaf(ir.tree, block_nid)
         leaves = [nid for nid in ir.tree.descendants(block_nid) if isinstance(ir.tree.data(nid), ISANode)]
         return leaf is not None and leaves == [leaf]
-
-    def _owned_leaf(self, ir: KernelIR, block_nid: int) -> int | None:
-        """Return the sole ISA leaf whose nearest block ancestor is ``block_nid``."""
-        leaves = [
-            nid
-            for nid in ir.tree.preorder(block_nid)
-            if isinstance(ir.tree.data(nid), ISANode)
-            and next(
-                (
-                    ancestor
-                    for ancestor in reversed(ir.tree.ancestors(nid))
-                    if isinstance(ir.tree.data(ancestor), BlockNode)
-                ),
-                None,
-            )
-            == block_nid
-        ]
-        return leaves[0] if len(leaves) == 1 else None
 
     def _rewrite(
         self,
@@ -254,22 +269,26 @@ class FusePointwise(Transform[FusePointwiseOption]):
         remove_buffers(ir, {match.intermediate.tensor})
         finalize_rewrite(ir)
 
-    def _resolve_sequence(self, ir: KernelIR, option: FusePointwiseOption) -> _PointwiseSequenceMatch | None:
+    def _resolve_sequence(
+        self, ir: KernelIR, option: FusePointwiseOption, buffers: dict[str, Buffer]
+    ) -> _PointwiseSequenceMatch | None:
         """Resolve one affine pointwise result consumed by one binary pointwise op."""
         producer_nid = option.pointwise_block_nid
         consumer_nid = option.consumer_block_nid
         producer_leaf_nid = single_leaf(ir.tree, producer_nid)
-        consumer_leaf_nid = self._owned_leaf(ir, consumer_nid)
+        consumer_leaf_nid = ir.dependency._leaf_of_block.get(consumer_nid)
         if producer_leaf_nid is None or consumer_leaf_nid is None:
             return None
         producer_leaf = ir.tree.isa(producer_leaf_nid)
         consumer_leaf = ir.tree.isa(consumer_leaf_nid)
-        if (
-            consumer_leaf.op_cls is not NKITensorTensor
-            or producer_leaf.access_patterns
-            or consumer_leaf.access_patterns
+        if consumer_leaf.op_cls not in {NKITensorTensor, NKITensorScalar} or (
+            producer_leaf.access_patterns or consumer_leaf.access_patterns
         ):
             return None
+        scalar = consumer_leaf.op_cls is NKITensorScalar
+        inputs = ("data", "operand0") if scalar else ("data1", "data2")
+        operators = _OPS.keys() - {"divide"} if scalar else {"add", "subtract", "multiply", "maximum"}
+        op_cls = NKITensorScalarSequence if scalar else NKIScalarTensorTensor
         producer = producer_leaf.op_cls.algebraic_contract(producer_leaf.kwargs)
         consumer = consumer_leaf.op_cls.algebraic_contract(consumer_leaf.kwargs)
         producer_block = ir.tree.block(producer_nid)
@@ -277,9 +296,13 @@ class FusePointwise(Transform[FusePointwiseOption]):
         if (
             not isinstance(producer, PointwiseContract)
             or not isinstance(consumer, PointwiseContract)
-            or consumer.operator not in {"add", "subtract", "multiply", "maximum"}
-            or consumer.input_operands != ("data1", "data2")
-            or not active_block_axes_align(producer_leaf, producer_block, consumer_block)
+            or consumer.operator not in operators
+            or consumer.input_operands != inputs
+            or not (
+                self._sequence_axes(producer_block) == self._sequence_axes(consumer_block)
+                if scalar
+                else active_block_axes_align(producer_leaf, producer_block, consumer_block)
+            )
             or any(
                 buffer.name != producer_leaf.operand_bindings[producer.output_operand].tensor
                 for buffer in producer_block.alloc_buffers
@@ -289,36 +312,52 @@ class FusePointwise(Transform[FusePointwiseOption]):
         data = producer_leaf.operand_bindings.get("data")
         operand0 = producer_leaf.operand_bindings.get("operand0")
         intermediate = producer_leaf.operand_bindings.get(producer.output_operand)
-        left = consumer_leaf.operand_bindings.get("data1")
-        right = consumer_leaf.operand_bindings.get("data2")
+        left = consumer_leaf.operand_bindings.get(inputs[0])
+        right = consumer_leaf.operand_bindings.get(inputs[1])
         destination = consumer_leaf.operand_bindings.get(consumer.output_operand)
-        if None in {data, intermediate, left, right, destination}:
+        if None in {data, intermediate, left, destination} or not scalar and right is None:
             return None
         data = cast(BufferRegion, data)
         intermediate = cast(BufferRegion, intermediate)
         left = cast(BufferRegion, left)
-        right = cast(BufferRegion, right)
         destination = cast(BufferRegion, destination)
         if (left == intermediate) == (right == intermediate):
             return None
         other, reverse1 = (right, False) if left == intermediate else (left, True)
         kwargs = self._sequence_kwargs(producer_leaf, producer, consumer.operator, operand0)
-        if kwargs is None:
+        if kwargs is None or kwargs["op0"] not in operators:
             return None
-        buffers = ir.all_buffers()
+        if scalar:
+            if left != intermediate or (other is None) != isinstance(consumer_leaf.kwargs.get("operand0"), float):
+                return None
+            if any(buffers[region.tensor].physical_dtype() != "float32" for region in (intermediate, destination)):
+                return None
+            kwargs["engine"], reverse1 = "vector", consumer.reverse
+            if other is None:
+                kwargs["operand1"] = consumer_leaf.kwargs["operand0"]
         legal = (
             data.ranges == intermediate.ranges == destination.ranges
-            and tuple(width for _lower, width in other.ranges) == tuple(width for _lower, width in destination.ranges)
+            and (
+                scalar
+                or other is not None
+                and tuple(w for _, w in other.ranges) == tuple(w for _, w in destination.ranges)
+            )
             and intermediate.tensor not in ir.param_buffers
             and intermediate.tensor not in ir.return_names
-            and buffers[data.tensor].location in NKIScalarTensorTensor.INPUT_LOCATIONS["data"]
-            and (
-                operand0 is None
-                or buffers[operand0.tensor].location in NKIScalarTensorTensor.INPUT_LOCATIONS["operand0"]
+            and (other is None or other.tensor != intermediate.tensor)
+            and buffers[data.tensor].location in op_cls.INPUT_LOCATIONS["data"]
+            and all(
+                region is None
+                or buffers[region.tensor].location in op_cls.INPUT_LOCATIONS[slot]
+                and (not scalar or buffers[region.tensor].physical_dtype() == "float32")
+                for slot, region in (("operand0", operand0), ("operand1", other))
             )
-            and buffers[other.tensor].location in NKIScalarTensorTensor.INPUT_LOCATIONS["operand1"]
-            and buffers[destination.tensor].location == NKIScalarTensorTensor.OUTPUT_LOCATION
-            and not (buffers[data.tensor].location == buffers[other.tensor].location == "psum")
+            and buffers[destination.tensor].location == op_cls.OUTPUT_LOCATION
+            and (
+                scalar
+                or other is not None
+                and not (buffers[data.tensor].location == buffers[other.tensor].location == "psum")
+            )
             and self._has_unique_consumer(ir, intermediate.tensor, producer_leaf_nid, consumer_leaf_nid)
         )
         if not legal:
@@ -328,6 +367,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
         return _PointwiseSequenceMatch(
             option=option,
             consumer_leaf_nid=consumer_leaf_nid,
+            op_cls=op_cls,
             data=data,
             operand0=operand0,
             other=other,
@@ -350,7 +390,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
                     kwargs["reverse0"] = True
         elif (
             producer_leaf.op_cls is NKITensorScalar
-            and producer.operator in {"add", "subtract", "multiply", "maximum"}
+            and producer.operator in _OPS.keys() - {"divide"}
             and producer.input_operands == ("data", "operand0")
             and producer.broadcast_operands == frozenset({"operand0"})
         ):
@@ -362,6 +402,17 @@ class FusePointwise(Transform[FusePointwiseOption]):
                 if producer.reverse:
                     kwargs["reverse0"] = True
         return kwargs
+
+    def _sequence_axes(self, block: BlockNode) -> dict[str, tuple[str | None, tuple[int, int], AxisRole, Expr]]:
+        """Compare scalar-operation axes without requiring identical broadcast dimension names."""
+        bindings = {
+            axis.axis: (axis.dom, axis.role, value)
+            for axis, value in zip(block.iter_vars, block.iter_values, strict=True)
+        }
+        return {
+            abstract: (None if abstract == "B" else concrete, *bindings[concrete])
+            for abstract, concrete in block.axis_map.items()
+        }
 
     def _affine_scalar(self, contract: PointwiseContract) -> tuple[str, float, bool] | None:
         """Represent one affine copy as a single scalar operation."""
@@ -376,22 +427,27 @@ class FusePointwise(Transform[FusePointwiseOption]):
 
     def _rewrite_sequence(self, ir: KernelIR, match: _PointwiseSequenceMatch) -> None:
         """Replace two exact pointwise instructions by their native sequence ISA."""
-        bindings = {"data": match.data, "operand1": match.other, "dst": match.destination}
-        if match.operand0 is not None:
-            bindings["operand0"] = match.operand0
+        bindings = {"data": match.data, "dst": match.destination}
+        bindings.update(
+            {
+                slot: region
+                for slot, region in (("operand0", match.operand0), ("operand1", match.other))
+                if region is not None
+            }
+        )
         ir.tree.graph.nodes[match.consumer_leaf_nid]["data"] = ISANode(
-            op_cls=NKIScalarTensorTensor, operand_bindings=bindings, kwargs=match.kwargs
+            op_cls=match.op_cls, operand_bindings=bindings, kwargs=match.kwargs
         )
         consumer = ir.tree.block(match.option.consumer_block_nid)
-        reads = tuple(
-            dict.fromkeys((match.data, *((match.operand0,) if match.operand0 is not None else ()), match.other))
-        )
+        reads = tuple(dict.fromkeys(region for slot, region in bindings.items() if slot != "dst"))
         ir.tree.graph.nodes[match.option.consumer_block_nid]["data"] = replace(consumer, reads=reads)
         remove_buffers(ir, {match.intermediate.tensor})
         self._remove_pointwise_block(ir, match.option.pointwise_block_nid)
         finalize_rewrite(ir)
 
-    def _resolve_copy(self, ir: KernelIR, option: FusePointwiseOption) -> _PointwiseCopyMatch | None:
+    def _resolve_copy(
+        self, ir: KernelIR, option: FusePointwiseOption, buffers: dict[str, Buffer]
+    ) -> _PointwiseCopyMatch | None:
         """Resolve a pointwise result followed by one value-preserving copy."""
         result: _PointwiseCopyMatch | None = None
         pointwise_nid = option.pointwise_block_nid
@@ -431,8 +487,8 @@ class FusePointwise(Transform[FusePointwiseOption]):
                     copied = copy_leaf.operand_bindings.get(copy_contract.input_operand)
                     destination = copy_leaf.operand_bindings.get(copy_contract.output_operand)
                     if intermediate is not None and intermediate == copied and destination is not None:
-                        source_buffer = ir.buffer(intermediate.tensor)
-                        destination_buffer = ir.buffer(destination.tensor)
+                        source_buffer = buffers[intermediate.tensor]
+                        destination_buffer = buffers[destination.tensor]
                         required_dtype = pointwise_leaf.op_cls.OUTPUT_STORAGE_DTYPE
                         legal = (
                             intermediate.tensor not in ir.param_buffers
@@ -492,7 +548,9 @@ class FusePointwise(Transform[FusePointwiseOption]):
         )
         finalize_rewrite(ir)
 
-    def _resolve_activation(self, ir: KernelIR, option: FusePointwiseOption) -> _PointwiseActivationMatch | None:
+    def _resolve_activation(
+        self, ir: KernelIR, option: FusePointwiseOption, buffers: dict[str, Buffer]
+    ) -> _PointwiseActivationMatch | None:
         """Resolve a pointwise expression accepted by the activation ISA."""
         result: _PointwiseActivationMatch | None = None
         pointwise_nid = option.pointwise_block_nid
@@ -504,7 +562,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
             and isinstance(ir.tree.data(activation_nid), BlockNode)
         ):
             pointwise_leaf_nid = single_leaf(ir.tree, pointwise_nid)
-            activation_leaf_nid = self._owned_leaf(ir, activation_nid)
+            activation_leaf_nid = ir.dependency._leaf_of_block.get(activation_nid)
             if pointwise_leaf_nid is not None and activation_leaf_nid is not None:
                 pointwise_leaf = ir.tree.isa(pointwise_leaf_nid)
                 activation_leaf = ir.tree.isa(activation_leaf_nid)
@@ -541,7 +599,6 @@ class FusePointwise(Transform[FusePointwiseOption]):
                         )
                         if native is not None and activation_input == intermediate:
                             data, bias, scale = native
-                            buffers = ir.all_buffers()
                             broadcast = next(iter(pointwise_contract.broadcast_operands), None)
                             broadcast_region = (
                                 None if broadcast is None else pointwise_leaf.operand_bindings.get(broadcast)
@@ -579,7 +636,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
         return result
 
     def _resolve_broadcast_activation(
-        self, ir: KernelIR, option: FusePointwiseOption
+        self, ir: KernelIR, option: FusePointwiseOption, buffers: dict[str, Buffer]
     ) -> _BroadcastActivationMatch | None:
         """Resolve a broadcast addition accepted as activation-reduction bias."""
         result: _BroadcastActivationMatch | None = None
@@ -592,7 +649,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
             and isinstance(ir.tree.data(activation_nid), BlockNode)
         ):
             pointwise_leaf_nid = single_leaf(ir.tree, pointwise_nid)
-            activation_leaf_nid = self._owned_leaf(ir, activation_nid)
+            activation_leaf_nid = ir.dependency._leaf_of_block.get(activation_nid)
             if pointwise_leaf_nid is not None and activation_leaf_nid is not None:
                 pointwise_leaf = ir.tree.isa(pointwise_leaf_nid)
                 activation_leaf = ir.tree.isa(activation_leaf_nid)
@@ -605,6 +662,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
                 activation_block = ir.tree.block(activation_nid)
                 supported = contracts and (
                     activation_leaf.op_cls is NKIActivationReduce
+                    and activation_contract.combinator.combiner in _ACTIVATION_REDUCERS
                     and activation_contract.bias_operand == "bias"
                     and pointwise_contract.operator == "add"
                     and not pointwise_contract.reverse
@@ -634,7 +692,6 @@ class FusePointwise(Transform[FusePointwiseOption]):
                         and activation_input.tensor == intermediate.tensor
                         and data.ranges == activation_input.ranges
                     ):
-                        buffers = ir.all_buffers()
                         removed_nodes = {pointwise_nid, *ir.tree.descendants(pointwise_nid)}
                         removed_allocations = {
                             buffer.name
@@ -678,7 +735,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
 
     def _nested_adjacent(self, ir: KernelIR, producer_nid: int, consumer_nid: int) -> bool:
         """Return whether a nested producer immediately precedes the consumer's owned leaf."""
-        consumer_leaf_nid = self._owned_leaf(ir, consumer_nid)
+        consumer_leaf_nid = ir.dependency._leaf_of_block.get(consumer_nid)
         parent = None if consumer_leaf_nid is None else ir.tree.parent(consumer_leaf_nid)
         siblings = [] if parent is None else ir.tree.children(parent)
         return (
@@ -706,25 +763,22 @@ class FusePointwise(Transform[FusePointwiseOption]):
         """Return whether a temporary has one writer and one reader."""
         readers: set[int] = set()
         writers: set[int] = set()
-        for nid in ir.tree.preorder():
-            node = ir.tree.data(nid)
-            if isinstance(node, ISANode):
-                rmw_operands = node.op_cls.rmw_operands(node.kwargs)
-                for slot, region in node.operand_bindings.items():
-                    if region.tensor == tensor:
-                        if slot in node.op_cls.INPUT_OPERANDS or slot in rmw_operands:
-                            readers.add(nid)
-                        if slot not in node.op_cls.INPUT_OPERANDS:
-                            writers.add(nid)
+        for nid in ir.dependency.touches_by_tensor.get(tensor, ()):
+            node = ir.tree.isa(nid)
+            rmw_operands = node.op_cls.rmw_operands(node.kwargs)
+            for slot, region in node.operand_bindings.items():
+                if region.tensor == tensor:
+                    if slot in node.op_cls.INPUT_OPERANDS or slot in rmw_operands:
+                        readers.add(nid)
+                    if slot not in node.op_cls.INPUT_OPERANDS:
+                        writers.add(nid)
         return readers == {consumer_leaf_nid} and writers == {producer_leaf_nid}
 
     def _has_unique_writer(self, ir: KernelIR, tensor: str, writer_leaf_nid: int) -> bool:
         """Return whether one leaf is the tensor's only writer."""
         writers: set[int] = set()
-        for nid in ir.tree.preorder():
-            node = ir.tree.data(nid)
-            if not isinstance(node, ISANode):
-                continue
+        for nid in ir.dependency.touches_by_tensor.get(tensor, ()):
+            node = ir.tree.isa(nid)
             for slot, region in node.operand_bindings.items():
                 if region.tensor == tensor and slot not in node.op_cls.INPUT_OPERANDS:
                     writers.add(nid)
@@ -746,10 +800,11 @@ class FusePointwise(Transform[FusePointwiseOption]):
             activation, operand_bindings=bindings, kwargs=kwargs
         )
         activation_block = ir.tree.block(match.option.consumer_block_nid)
+        buffers = ir.all_buffers()
         active_abstract_axes = {
             abstract
             for slot, region in bindings.items()
-            for abstract in activation.op_cls.OPERAND_AXES[slot][: len(ir.buffer(region.tensor).shape)]
+            for abstract in activation.op_cls.OPERAND_AXES[slot][: len(buffers[region.tensor].shape)]
         }
         axis_map = {
             abstract: concrete
@@ -800,7 +855,9 @@ class FusePointwise(Transform[FusePointwiseOption]):
         _replace_in_parent_children(ir.tree, parent, [block_nid], [])
         ir.tree.graph.remove_nodes_from({block_nid, *ir.tree.descendants(block_nid)})
 
-    def _resolve_reduction(self, ir: KernelIR, option: FusePointwiseOption) -> _ReductionFusion | None:
+    def _resolve_reduction(
+        self, ir: KernelIR, option: FusePointwiseOption, buffers: dict[str, Buffer]
+    ) -> _ReductionFusion | None:
         """Resolve one option to a fused native instruction, if legal."""
         result: _ReductionFusion | None = None
         pointwise_nid = option.pointwise_block_nid
@@ -812,16 +869,8 @@ class FusePointwise(Transform[FusePointwiseOption]):
         ):
             return result
         pointwise_leaf_nid = single_leaf(ir.tree, pointwise_nid)
-        reduction_leaf_nid = single_leaf(ir.tree, reduction_nid)
-        pointwise_chain = block_chain(ir.tree, pointwise_nid)
-        reduction_chain = block_chain(ir.tree, reduction_nid)
-        if (
-            pointwise_leaf_nid is None
-            or reduction_leaf_nid is None
-            or pointwise_chain is None
-            or reduction_chain is None
-            or pointwise_chain[1:-1] != reduction_chain[1:-1]
-        ):
+        reduction_leaf_nid = ir.dependency._leaf_of_block.get(reduction_nid)
+        if pointwise_leaf_nid is None or reduction_leaf_nid is None:
             return result
 
         pointwise_leaf = ir.tree.isa(pointwise_leaf_nid)
@@ -840,6 +889,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
             reduction_contract.map_operator != "copy"
             or reduction_contract.scale != 1.0
             or reduction_contract.bias != 0.0
+            or reduction_contract.bias_operand in reduction_leaf.operand_bindings
         ):
             return result
 
@@ -870,7 +920,6 @@ class FusePointwise(Transform[FusePointwiseOption]):
             )
         if native is not None:
             op_cls, bindings, kwargs = native
-            buffers = ir.all_buffers()
             inputs = {
                 operand: buffers[region.tensor]
                 for operand, region in bindings.items()
@@ -1006,7 +1055,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
         return result
 
     def _rewrite_reduction(self, ir: KernelIR, fusion: _ReductionFusion) -> None:
-        """Replace the pointwise block and delete the redundant reduction block."""
+        """Fuse co-located instructions while preserving their enclosing loops."""
         pointwise_nid = fusion.option.pointwise_block_nid
         reduction_nid = fusion.option.consumer_block_nid
         reduction_leaf = ir.tree.isa(fusion.reduction_leaf_nid)
@@ -1016,35 +1065,30 @@ class FusePointwise(Transform[FusePointwiseOption]):
             for operand, region in reduction_leaf.operand_bindings.items()
             if operand not in reduction_leaf.op_cls.INPUT_OPERANDS and region.tensor not in replacement_tensors
         }
-        remove_buffers(ir, obsolete)
         pointwise_block = ir.tree.block(pointwise_nid)
         reduction_block = ir.tree.block(reduction_nid)
-        iter_vars = tuple(
-            replace(iter_var, role=AxisRole.ACCUMULATION) if iter_var.axis == fusion.reduction_axis else iter_var
-            for iter_var in pointwise_block.iter_vars
-        )
-        writes = tuple(
-            dict.fromkeys(
-                region for region in (*pointwise_block.writes, *reduction_block.writes) if region.tensor not in obsolete
-            )
-        )
+        inputs = fusion.op_cls.INPUT_OPERANDS | fusion.op_cls.rmw_operands(fusion.kwargs)
+        reads = tuple(region for slot, region in fusion.bindings.items() if slot in inputs)
+        writes = tuple(region for slot, region in fusion.bindings.items() if slot not in fusion.op_cls.INPUT_OPERANDS)
         allocations = tuple(
             {
                 buffer.name: buffer for buffer in (*pointwise_block.alloc_buffers, *reduction_block.alloc_buffers)
             }.values()
         )
-        ir.tree.graph.nodes[pointwise_nid]["data"] = replace(
-            pointwise_block, iter_vars=iter_vars, writes=writes, alloc_buffers=allocations
+        ir.tree.graph.nodes[reduction_nid]["data"] = replace(
+            reduction_block, reads=reads, writes=writes, alloc_buffers=allocations
         )
-        ir.tree.graph.nodes[fusion.pointwise_leaf_nid]["data"] = ISANode(
+        ir.tree.graph.nodes[fusion.reduction_leaf_nid]["data"] = ISANode(
             op_cls=fusion.op_cls, operand_bindings=fusion.bindings, kwargs=fusion.kwargs
         )
-
-        parent = ir.tree.parent(reduction_nid)
-        if parent is None:
-            raise AssertionError(f"reduction block {reduction_nid} has no parent")
-        _replace_in_parent_children(ir.tree, parent, [reduction_nid], [])
-        ir.tree.graph.remove_nodes_from({reduction_nid, *ir.tree.descendants(reduction_nid)})
+        self._remove_pointwise_block(ir, pointwise_nid)
+        obsolete.difference_update(
+            region.tensor
+            for nid in ir.tree.leaves()
+            if isinstance(ir.tree.data(nid), ISANode)
+            for region in ir.tree.isa(nid).operand_bindings.values()
+        )
+        remove_buffers(ir, obsolete)
         finalize_rewrite(ir)
 
 

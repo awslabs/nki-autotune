@@ -36,6 +36,8 @@ class NKIGroupedTensorCopy(NKIOp):
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"C": 1, "G": 1, "T": None, "M": 128, "N": None}
     NON_TILABLE_AXES: ClassVar[frozenset[str]] = frozenset({"T", "M", "N"})
     CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"chunks", "groups", "tiles", "partition", "queries"})
+    OUTPUT_DTYPE: ClassVar[str | None] = "float32"
+    OUTPUT_STORAGE_DTYPE: ClassVar[str | None] = "float32"
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def __init__(self, chunks: int, groups: int, tiles: int, partition: int, queries: int) -> None:

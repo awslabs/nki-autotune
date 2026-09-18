@@ -6,6 +6,8 @@ import numpy as np
 
 from nkigym.codegen.torch_values import TorchSegments, TorchValue
 from nkigym.ops.base import NKIOp
+from nkigym.ops.register_load import ControlEmitter
+from nkigym.ops.transpose import emit_partition_sum
 
 
 class NKIIndexIota(NKIOp):
@@ -58,6 +60,53 @@ def emit_packed_topk_indices(
             )
         )
     return TorchSegments((positions,))
+
+
+def native_prefix(
+    emit: ControlEmitter, source: str, width: int, count: int, partitions: int = 1, per_partition: bool = False
+) -> tuple[str, str, str]:
+    """Emit a finite prefix and prove strict separation globally or per partition."""
+    low = emit.emit("NKITensorScalar", f'data={source}, operand0=float("-inf")', "op0='greater'")
+    high = emit.emit("NKITensorScalar", f'data={source}, operand0=float("inf")', "op0='less'")
+    finite = emit.binary("multiply", low, high)
+    total = emit.emit("NKITensorReduce", f"data={finite}", "op='add', axis=1")
+    zero = emit.emit("NKIIota", "", f"partitions={partitions}, width=1, pattern=[[1, 1]], channel_multiplier=0")
+    column = emit.emit("NKITensorScalar", f"data={zero}, operand0={total}", "op0='add'")
+    if partitions > 1:
+        column = emit_partition_sum(emit, column)
+    accepted = emit.binary("equal", column, float(width * partitions))
+    padded = (count // 8 + 1) * 8
+    seed = emit.emit(
+        "NKIIota", "", f"partitions={partitions}, width={padded}, pattern=[[0, {padded}]], channel_multiplier=0"
+    )
+    values = emit.emit("NKITensorCopy", f"src={seed}", "engine='vector'")
+    indices = emit.cast("NKIUInt32Cast", seed)
+    with emit.guard(accepted):
+        working = emit.emit("NKITensorCopy", f"src={source}", "engine='vector'")
+        emit.imports.update(("NKIInplaceMax8", "NKIInplaceMatchReplace8"))
+        for offset in range(0, padded, 8):
+            configuration = (
+                f"groups=1, partitions={partitions}, source_start=0, source_width={width}, "
+                f"output_start={offset}, output_width=8"
+            )
+            emit.line(f"{values} = NKIInplaceMax8({configuration})(src={working}, dst={values})")
+            emit.line(
+                f"{indices} = NKIInplaceMatchReplace8({configuration}, value_start={offset}, "
+                f"imm=float('-inf'))(data={working}, vals={values}, dst={working}, dst_idx={indices})"
+            )
+    left = emit.emit("NKITensorSlice", f"src={values}", f"start=0, width={count}")
+    right = emit.emit("NKITensorSlice", f"src={values}", f"start=1, width={count}")
+    strict = emit.binary("greater", left, right)
+    scanned = emit.emit("NKITensorScalarCumulative", f"src={strict}", "op0='add', op1='add', imm0=0.0")
+    total = emit.emit("NKITensorSlice", f"src={scanned}", f"start={count - 1}, width=1")
+    if partitions > 1 and not per_partition:
+        total = emit_partition_sum(emit, total)
+    guard = emit.binary("equal", total, float(count if per_partition else count * partitions))
+    if not per_partition:
+        guard = emit.binary("multiply", accepted, guard)
+    selected = emit.emit("NKITensorSlice", f"src={values}", f"start=0, width={count}")
+    positions = emit.emit("NKITensorSlice", f"src={indices}", f"start=0, width={count}")
+    return selected, positions, guard
 
 
 __all__ = ["NKIIndexIota", "emit_packed_topk_indices"]

@@ -1,21 +1,43 @@
-"""Float32 activation scaling and compensated scalar division emission."""
+"""Float32 activation scaling and correctly rounded constant division emission."""
 
+import math
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import numpy as np
 
+from nkigym.codegen.torch_arithmetic import TorchArithmetic
 from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
+from nkigym.ops.reinterpret_float32 import emit_binary32_round, emit_binary32_sign
+from nkigym.ops.reinterpret_uint32 import emit_binary32_parts
 
 
 def emit_tensor_scalar_or_divide(
-    source: TorchValue, operation: str, operand: str, reverse: bool, name: str, body: list[str], imports: set[str]
+    source: TorchValue,
+    operation: str,
+    operand: str,
+    reverse: bool,
+    name: str,
+    body: list[str],
+    imports: set[str],
+    native: bool,
 ) -> TorchValue:
-    """Emit a regular tensor-scalar op or compensated constant division."""
+    """Emit scalar math, using reciprocal scaling only under the native arithmetic contract.
+
+    Normalized significands are integers below 2**24. Each of 23 restoring
+    steps doubles the remainder, subtracts the divisor when needed, and
+    appends one quotient bit. All these operations are exact in float32.
+    The exact remainder then determines nearest-even rounding, including
+    subnormal outputs, without a rounded reciprocal or a fused operation.
+
+    Scalars are interpreted as binary32; zero and nonfinite divisors are
+    rejected. Infinite numerators retain the quotient sign. NaN numerators
+    are quieted while retaining their sign and payload.
+    """
     target = TorchValue(name, source.shape, source.transposed, storage_dtype="float32")
     if operation != "divide":
-        target = TorchValue(name, source.shape, source.transposed)
+        target = TorchValue(name, source.shape, source.transposed, storage_dtype=source.storage_dtype)
         reverse_argument = ", reverse0=True" if reverse and operation == "subtract" else ""
         imports.add("NKITensorScalar")
         body.append(
@@ -25,22 +47,35 @@ def emit_tensor_scalar_or_divide(
         return target
     if reverse:
         raise ValueError("Torch scalar-over-tensor division is unsupported")
-    divisor = float(operand)
+    divisor = float(np.float32(float(operand)))
     if divisor == 0.0:
         raise ValueError("Torch tensor division requires a nonzero scalar")
-    scale = 1.0 / divisor
-    approximate = TorchValue(f"{name}_approximate", source.shape, source.transposed, storage_dtype="float32")
-    residual = TorchValue(f"{name}_residual", source.shape, source.transposed, storage_dtype="float32")
-    imports.update(("NKIFloat32Scale", "NKIScalarTensorTensor"))
-    body.extend(
-        (
-            f"{approximate.name} = NKIFloat32Scale(scale={scale!r})(data={source.name})",
-            f'{residual.name} = NKIScalarTensorTensor(op0="multiply", op1="subtract", reverse1=True)'
-            f"(data={approximate.name}, operand0={divisor!r}, operand1={source.name})",
-            f'{target.name} = NKIScalarTensorTensor(op0="multiply", op1="add")'
-            f"(data={residual.name}, operand0={scale!r}, operand1={approximate.name})",
-        )
-    )
+    if not math.isfinite(divisor):
+        raise ValueError("Torch tensor division requires a finite binary32 scalar")
+    if native:
+        scale = float(np.float32(1.0) / np.float32(divisor))
+        imports.add("NKIFloat32Scale")
+        body.append(f"{target.name} = NKIFloat32Scale(scale={scale!r})(data={source.name})")
+        return target
+    emit = TorchArithmetic(name, body, imports)
+    data = source.name if source.storage_dtype == "float32" else emit.cast("NKIFloat32Cast", source.name)
+    bits, significand, exponent, field = emit_binary32_parts(emit, data)
+    mantissa, power = math.frexp(abs(divisor))
+    denominator = int(mantissa * 2**24)
+    op = emit.binary
+    below_one = op("less", significand, denominator)
+    remainder = op("subtract", op("multiply", significand, op("add", below_one, 1)), denominator)
+    exponent = op("subtract", op("subtract", exponent, power - 1), below_one)
+    quotient = op("greater_equal", significand, 0)
+    for _ in range(23):
+        twice = op("multiply", remainder, 2)
+        bit = op("greater_equal", twice, denominator)
+        remainder = op("subtract", twice, op("multiply", bit, denominator))
+        quotient = op("add", op("multiply", quotient, 2), bit)
+    magnitude = emit_binary32_round(emit, quotient, remainder, exponent, denominator)
+    result = emit_binary32_sign(emit, magnitude, bits, field, divisor < 0)
+    body.append(f"{target.name} = NKIReinterpretFloat32()(src={result})")
+    imports.add("NKIReinterpretFloat32")
     return target
 
 

@@ -118,7 +118,7 @@ class Buffer:
         name: tensor name.
         shape: per-axis extent.
         dtype: ``"float32"`` / ``"float16"`` / ``"bfloat16"``.
-        location: ``"shared_hbm"`` / ``"sbuf"`` / ``"psum"``.
+        location: ``"shared_hbm"`` / ``"sbuf"`` / ``"psum"`` / ``"register"``.
         storage_dtype: Optional physical allocation dtype. ``None`` uses
             ``dtype``.
         versions: pipeline buffer-version count (default 1).
@@ -235,10 +235,10 @@ class BufferRegion:
     ranges: tuple[tuple[Expr, Expr], ...]
 
     def with_partition_aligned_slice(
-        self, axis: int, start: int, width: int, output: BufferRegion | None = None
+        self, axis: int, start: int | Expr, width: int, output: BufferRegion | None = None
     ) -> BufferRegion:
-        """Return one static slice, optionally aligned to a partition tile."""
-        lower: Expr = Const(value=start)
+        """Return one slice, optionally aligned to a partition tile."""
+        lower: Expr = Const(value=start) if isinstance(start, int) else start
         slice_width: Expr = Const(value=width)
         if output is not None:
             offset, slice_width = output.ranges[axis]
@@ -399,7 +399,11 @@ class KernelTree:
                 continue
             visited.add(current)
             yield current
-            pending.extend(reversed(tuple(successors[current])))
+            children = successors[current]
+            if len(children) == 1:
+                pending.append(next(iter(children)))
+            elif children:
+                pending.extend(reversed(children))
 
     def leaves(self, nid: int | None = None) -> Iterator[int]:
         """Yield leaves (out-degree 0) reachable from ``nid``."""
@@ -414,8 +418,9 @@ class KernelTree:
         Convenience for transforms that walk blocks rather than ISA leaves.
         ``nid`` defaults to the root.
         """
+        nodes = getattr(self.graph, "_node")
         for m in self.preorder(nid):
-            if isinstance(self.data(m), BlockNode):
+            if isinstance(nodes[m]["data"], BlockNode):
                 yield m
 
 

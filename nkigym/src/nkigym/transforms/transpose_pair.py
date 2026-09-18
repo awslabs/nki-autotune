@@ -56,6 +56,7 @@ class _InsertMatch:
     operand: str
     source: str
     source_axes: tuple[str, str]
+    drain_output: bool
 
 
 @dataclass(frozen=True)
@@ -197,6 +198,13 @@ def _match_insert(
                         operand=option.operand,
                         source=source,
                         source_axes=source_axes,
+                        drain_output=not consumer.op_cls.accepts_input_locations(
+                            {
+                                slot: "psum" if slot == option.operand else buffers[region.tensor].location
+                                for slot, region in consumer.operand_bindings.items()
+                                if slot in consumer.op_cls.INPUT_OPERANDS
+                            }
+                        ),
                     )
     return result
 
@@ -239,28 +247,34 @@ def _match_transpose_execution(
             output=logical.output,
         )
     else:
-        result = _match_dma_transpose_execution(ir, block_nid, facts) if op_cls is NKIDMATranspose else None
+        result = (
+            _match_single_transpose_execution(ir, block_nid, facts)
+            if op_cls in {NKIDMATranspose, NKITranspose}
+            else None
+        )
     return result
 
 
-def _match_dma_transpose_execution(
+def _match_single_transpose_execution(
     ir: KernelIR, block_nid: int, facts: _TransposeAnalysisFacts | None = None
 ) -> _TransposeExecution | None:
-    """Return one canonical DMA transpose over complete SBUF/HBM buffers."""
+    """Return one canonical transpose without requiring a following drain."""
     result: _TransposeExecution | None = None
     leaf_nid = single_leaf(ir.tree, block_nid)
     if leaf_nid is not None:
         leaf = ir.tree.isa(leaf_nid)
-        if leaf.op_cls is NKIDMATranspose:
-            source = leaf.operand_bindings["src"].tensor
+        if leaf.op_cls in {NKIDMATranspose, NKITranspose}:
+            dma = leaf.op_cls is NKIDMATranspose
+            input_operand = "src" if dma else "data"
+            source = leaf.operand_bindings[input_operand].tensor
             output = leaf.operand_bindings["dst"].tensor
             buffers = facts.buffers if facts is not None else ir.all_buffers()
             if source in buffers and output in buffers:
                 source_buffer = buffers[source]
                 output_buffer = buffers[output]
                 valid = (
-                    source_buffer.location in {"shared_hbm", "sbuf"}
-                    and output_buffer.location == "sbuf"
+                    source_buffer.location in ({"shared_hbm", "sbuf"} if dma else {"sbuf"})
+                    and output_buffer.location == ("sbuf" if dma else "psum")
                     and len(source_buffer.shape) == 2
                     and output_buffer.shape == source_buffer.shape[::-1]
                     and source_buffer.dtype == output_buffer.dtype
@@ -274,7 +288,7 @@ def _match_dma_transpose_execution(
                         removable_buffers=(output,),
                         input_leaf=leaf_nid,
                         output_leaf=leaf_nid,
-                        input_operand="src",
+                        input_operand=input_operand,
                         source=source,
                         output=output,
                     )
@@ -359,7 +373,11 @@ def _match_cancel_from_facts(
     first = executions[index]
     if first is not None:
         second_index = index + len(first.blocks)
-        second = executions[second_index] if second_index < len(executions) else None
+        second = (
+            _match_single_transpose_execution(ir, facts.root_children[second_index], facts)
+            if second_index < len(executions)
+            else None
+        )
         if second is not None and second.source == first.output:
             consumers = tuple(use for use in facts.input_uses.get(second.output, ()) if use[0] != second.output_leaf)
             exact_middle = set(ir.dependency.touches_by_tensor.get(first.output, ())) == {
@@ -412,6 +430,11 @@ def _consumers_accept_source(
             leaf.op_cls.accepts_input_locations(locations)
             and leaf.op_cls.accepts_input_storage_dtypes(dtypes)
             and required
+            and all(
+                operand not in leaf.access_patterns
+                or buffers[inputs[operand].tensor].location == source_buffer.location
+                for operand in operands
+            )
         )
         if not accepted:
             break
@@ -455,7 +478,11 @@ def _apply_insert(ir: KernelIR, match: _InsertMatch) -> None:
                 location="psum",
                 storage_dtype=NKITranspose.OUTPUT_STORAGE_DTYPE,
             ),
-            Buffer(name=second_sbuf_name, shape=source.shape, dtype=source.dtype, location="sbuf"),
+            *(
+                (Buffer(name=second_sbuf_name, shape=source.shape, dtype=source.dtype, location="sbuf"),)
+                if match.drain_output
+                else ()
+            ),
         ),
     )
 
@@ -469,16 +496,23 @@ def _apply_insert(ir: KernelIR, match: _InsertMatch) -> None:
     second_transpose = required_spec(
         ir, NKITranspose, {"data": first_sbuf_name, "dst": second_psum_name}, {"P": second_axis, "F": first_axis}, {}
     )
-    second_drain = required_spec(
-        ir, NKITensorCopy, {"src": second_psum_name, "dst": second_sbuf_name}, {"P": first_axis, "F": second_axis}, {}
-    )
     inserted = [
         append_block(ir.tree, first_transpose),
         append_block(ir.tree, first_drain),
         append_block(ir.tree, second_transpose),
-        append_block(ir.tree, second_drain),
     ]
-    replace_input_binding(ir, match.consumer_leaf, match.operand, second_sbuf_name)
+    if match.drain_output:
+        second_drain = required_spec(
+            ir,
+            NKITensorCopy,
+            {"src": second_psum_name, "dst": second_sbuf_name},
+            {"P": first_axis, "F": second_axis},
+            {},
+        )
+        inserted.append(append_block(ir.tree, second_drain))
+    replace_input_binding(
+        ir, match.consumer_leaf, match.operand, second_sbuf_name if match.drain_output else second_psum_name
+    )
     _replace_in_parent_children(ir.tree, ir.tree.root, [match.consumer_block], [*inserted, match.consumer_block])
 
 

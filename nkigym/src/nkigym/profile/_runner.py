@@ -1,14 +1,11 @@
 """Single-kernel compile and profile pipeline for an installed Trn2 host."""
 
-from __future__ import annotations
-
 import json
 import os
 import re
 import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import time
 import traceback
@@ -19,12 +16,11 @@ from typing import Any
 import ml_dtypes
 import numpy as np
 
-from nkigym.profile._benchmark import benchmark_kernel
+from nkigym.profile._benchmark import _environment, benchmark_kernel
 from nkigym.profile._compile import compile_kernel
 from nkigym.profile.types import ProfileConfig, ProfileResult
 
 _COMPILE_TIMEOUT_S = 600
-_DTYPE_CACHE: dict[str, np.dtype] = {}
 _OUTPUT_PATTERN = re.compile(r'saved output "([^"]+)" as "([^"]+)"')
 
 
@@ -35,13 +31,7 @@ def _timeout_handler(signum: int, frame: FrameType | None) -> None:
 
 def _resolve_dtype(name: str) -> np.dtype:
     """Resolve a NumPy dtype name, including ``bfloat16``."""
-    if name not in _DTYPE_CACHE:
-        try:
-            dtype = np.dtype(name)
-        except TypeError:
-            dtype = np.dtype(getattr(ml_dtypes, name))
-        _DTYPE_CACHE[name] = dtype
-    return _DTYPE_CACHE[name]
+    return np.dtype(getattr(ml_dtypes, name, name))
 
 
 def _compile_with_timeout(
@@ -64,26 +54,26 @@ def _compile_with_timeout(
         signal.signal(signal.SIGALRM, previous_handler)
 
 
+def _input_arguments(inputs: dict[str, np.ndarray], work_dir: Path) -> list[str]:
+    """Write one input set shared by correctness, warmup, and timed captures."""
+    input_args: list[str] = []
+    (input_dir := work_dir / "inputs").mkdir()
+    for index, (name, value) in enumerate(inputs.items()):
+        value.tofile(path := input_dir / f"input_{index:03d}.bin")
+        input_args.extend((name, str(path)))
+    return input_args
+
+
 def _capture_outputs(
     neff_path: Path,
-    inputs: dict[str, np.ndarray],
+    input_args: list[str],
     output_specs: tuple[Any, ...],
     work_dir: Path,
     output_dir: Path,
     lnc: int,
     visible_core: int,
 ) -> None:
-    """Execute one exact-input inference and retain typed output files."""
-    input_args: list[str] = []
-    input_dir = work_dir / "inputs"
-    input_dir.mkdir()
-    for index, (name, value) in enumerate(inputs.items()):
-        path = input_dir / f"input_{index:03d}.bin"
-        value.tofile(path)
-        input_args.extend((name, str(path)))
-    environment = dict(os.environ)
-    environment["NEURON_LOGICAL_NC_CONFIG"] = str(lnc)
-    environment["NEURON_RT_VISIBLE_CORES"] = str(visible_core)
+    """Execute the shared input files and retain typed output files."""
     command = [
         "neuron-explorer",
         "capture",
@@ -95,7 +85,9 @@ def _capture_outputs(
         str(neff_path),
         *input_args,
     ]
-    completed = subprocess.run(command, cwd=work_dir, env=environment, text=True, capture_output=True, check=False)
+    completed = subprocess.run(
+        command, cwd=work_dir, env=_environment(lnc, visible_core), text=True, capture_output=True, check=False
+    )
     log = completed.stdout + completed.stderr
     (output_dir / "capture.log").write_text(log, encoding="utf-8")
     if completed.returncode != 0:
@@ -129,36 +121,32 @@ def run_profile(
     capture_outputs: bool = False,
 ) -> ProfileResult:
     """Compile one NKI kernel, optionally capture exact outputs, and profile the same NEFF."""
-    entries = (str(Path(sys.executable).parent), "/opt/aws/neuron/bin", *os.environ.get("PATH", "").split(os.pathsep))
-    os.environ["PATH"] = os.pathsep.join(dict.fromkeys(entries))
+    os.environ.update(_environment(config.lnc, None))
     os.environ["NEURON_PLATFORM_TARGET_OVERRIDE"] = "trn2"
-    os.environ["NEURON_LOGICAL_NC_CONFIG"] = str(config.lnc)
     output_dir.mkdir(parents=True, exist_ok=True)
-    started = time.monotonic()
-    profile_s = 0.0
-    summary: dict[str, object] | None = None
-    error_text: str | None = None
-    with tempfile.TemporaryDirectory(prefix="nkigym-profile-") as raw_work_dir:
-        work_dir = Path(raw_work_dir)
-        compile_dir = Path(raw_work_dir) / "compiler"
+    started, profile_s = time.monotonic(), 0.0
+    summary, error_text = None, None
+    input_args: list[str] = []
+    os.environ.setdefault("TMPDIR", "/dev/shm" if Path("/dev/shm").is_dir() else tempfile.gettempdir())
+    with tempfile.TemporaryDirectory(prefix="nkigym-profile-", dir=os.environ["TMPDIR"]) as raw_work_dir:
+        work_dir, compile_dir = Path(raw_work_dir), Path(raw_work_dir) / "compiler"
         profile_neff_path = output_dir / "file.neff"
         compile_started = time.monotonic()
         try:
-            resolved_inputs = (
-                {
+            resolved_inputs = inputs
+            if resolved_inputs is None:
+                resolved_inputs = {
                     name: np.zeros(shape, dtype=_resolve_dtype(dtype))
                     for name, (shape, dtype) in config.input_specs.items()
                 }
-                if inputs is None
-                else inputs
-            )
             neff_path, output_specs = _compile_with_timeout(
                 kernel_path, func_name, resolved_inputs, compile_dir, config, compiler_jobs
             )
             shutil.copy2(neff_path, profile_neff_path)
+            input_args = _input_arguments(resolved_inputs, work_dir)
             if capture_outputs:
                 _capture_outputs(
-                    profile_neff_path, resolved_inputs, output_specs, work_dir, output_dir, config.lnc, visible_core
+                    profile_neff_path, input_args, output_specs, work_dir, output_dir, config.lnc, visible_core
                 )
         except Exception:
             error_text = traceback.format_exc()
@@ -168,7 +156,9 @@ def run_profile(
         if error_text is None:
             profile_started = time.monotonic()
             try:
-                summary = benchmark_kernel(profile_neff_path, output_dir, config.lnc, visible_core, config.confirmation)
+                summary = benchmark_kernel(
+                    profile_neff_path, output_dir, config.lnc, visible_core, config.confirmation, input_args
+                )
             except Exception:
                 error_text = traceback.format_exc()
             profile_s = time.monotonic() - profile_started

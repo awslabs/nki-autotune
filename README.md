@@ -40,9 +40,9 @@ The complete ladder benchmark replays the current best public-transform ladder
 for each registered NAKB workload:
 
 ```bash
-NKIGYM_AGENTIC_TRACE_ROOT=/tmp/nkigym-ladder-replay \
-PYTHONPATH="$PWD:$PWD/nkigym/src" python -m pytest \
-  test/test_agentic_ladder_build.py \
+PYTHONPATH="$PWD:$PWD/nkigym/src" python -m pytest -s \
+  test/test_nkigym_ladder.py \
+  --cpu-hosts gym-cpu-1 gym-cpu-2 gym-cpu-3 gym-cpu-4 \
   --trn2-hosts gym-trn2-1
 ```
 
@@ -50,20 +50,22 @@ The development skill owns adaptive exploration and records confirmed ladders
 in `kernel_library/_best_nkigym.py`. Pytest starts from the current canonical
 IR, requires every recorded option to remain legal, renders the replayed
 endpoint, and checks the workload's copied NAKB accuracy contract on Trn2. The
-aggregate metric is:
+aggregate metric is the arithmetic mean of the per-configuration latency ratios:
 
 ```text
-relative_latency = sum(confirmed NKIGym latency) / sum(NAKB latency)
+mean_relative_latency = mean(confirmed NKIGym latency / NAKB latency)
 ```
 
-Lower is better. Individual workloads may regress, but every workload must be
-correct and `relative_latency` must not exceed the fixed target of `0.9`. The
-trace root contains one `result.json` per workload and an aggregate
-`relative_latency.json`. A value of `0.9` means total confirmed NKIGym latency
-is at most 90% of total NAKB latency.
+Each registered configuration has equal weight regardless of absolute latency.
+Lower is better. Every workload must be correct, and `mean_relative_latency`
+must not exceed the fixed target of `0.9`, equivalent to at least 10% average
+latency reduction over NAKB. Individual regressions count as negative
+improvements and remain in the mean. For example, 10% and 20% latency reductions
+average to 15%. The benchmark prints each workload's latencies, the mean relative
+latency, and the mean percentage latency reduction.
 
 Hardware correctness uses a fresh random 63-bit input seed on every benchmark
-run. The seed is printed and stored in all result files. Set
+run. The seed is printed. Set
 `NKIGYM_NAKB_VALIDATION_SEED` to a recorded value only when reproducing a run.
 
 CPU checks use the official
@@ -124,46 +126,50 @@ The supported subset includes 2D transpose and matmul, scalar or per-row
 broadcast arithmetic, common activations, and free-axis sum, maximum, and mean
 reductions. Unsupported operations raise `ValueError`.
 
-## Kernel Library
+## Benchmark
 
-Every runtime workload contains a copied NAKB PyTorch golden reference, tensor
-input specifications, seeded input generator, correctness tolerances, a fixed
-NAKB baseline in `nakb_latency_ms`, recorded best latency metadata in
-`best_nkigym_latency_ms`, and an optional `best_nkigym_ladder`. Committed
-replayable ladders live in `kernel_library/_best_nkigym.py`; a missing artifact
-means the canonical empty ladder.
+`benchmark/` is created once and frozen. Every target contains a NAKB PyTorch
+reference, tensor input specifications, a seeded input generator, a frozen
+`AccuracySpec`, and a fixed NAKB baseline in `nakb_latency_ms`. `AccuracySpec`
+contains `atol`, `rtol`, the comparison mode, and any output selection, views,
+grouping, or per-output tolerances.
 
-The relative-latency benchmark synthesizes the current canonical lowering and
-programmatically replays each recorded ladder by matching every serialized step
-to exactly one currently legal public-transform option. Final acceptance calls
-the unified
-`nkigym.profile.profile_metrics` backend with exact inputs, which compiles
-once, captures outputs, and profiles that same NEFF. It compares each output
-with the copied Torch golden using
-`abs(actual - expected) <= atol + rtol * max(abs(expected))`, and requires
-matching shapes, dtypes, and finiteness. The accepted source must also contain
-one derived `@nki.jit` entry point and must not use `nki.compiler` internals or
-manipulate `NEURON_CC_FLAGS`.
-
-`kernel_library.NAKB_WORKLOADS` contains 127 complete measured NAKB targets
+`benchmark.NAKB_WORKLOADS` contains 127 complete measured NAKB targets
 grouped into 26 flat, self-contained Python modules by workload type. Static
 numerical choices are bound into the callable, and configurations with
 different callables, input specifications, generators, tolerances, or latency
 records remain separate dictionaries. NAKB configurations without every
-required field are not included. `kernel_library.WORKLOADS` exposes only exact
+required field are not included. `benchmark.WORKLOADS` exposes only exact
 aliases to entries in `NAKB_WORKLOADS`.
+
+The repository structure test pins the benchmark contents with a SHA-256
+checksum and forbids dependencies on `nkigym` or `kernel_library`. Backend
+development must leave both the benchmark and its checksum unchanged.
 
 The seeded generators retain NAKB's NumPy input-generation convention.
 `TorchReference` applies NAKB's NumPy-to-Torch argument conversion before
 calling the copied golden:
 
 ```python
-from kernel_library import NAKB_WORKLOADS
+from benchmark import NAKB_WORKLOADS
 
 workload = NAKB_WORKLOADS["cumsum"][0]
 inputs = workload["input_generator"](workload["input_specs"], seed=0)
 outputs = workload["torch_ref"](**inputs)
 ```
+
+## Kernel Library
+
+`kernel_library/_best_nkigym.py` records the best NKIGym kernels as replayable
+public-transform ladders. A missing record means the canonical empty ladder.
+Kernel development updates these records while the benchmark stays frozen.
+
+The ladder benchmark synthesizes the current canonical lowering and replays
+each recorded ladder, requiring every step to be a currently legal transform
+option. Each intermediate state is checked using the target's `AccuracySpec`.
+Final acceptance calls `nkigym.profile.profile_metrics` with exact inputs to
+compile, capture outputs, and profile the same NEFF, then checks those outputs
+against the target's reference and accuracy criteria.
 
 ## Security
 

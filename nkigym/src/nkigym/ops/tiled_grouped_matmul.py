@@ -27,7 +27,6 @@ class NKITiledGroupedMatmul(NKIOp):
     }
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"stationary", "moving"})
     RMW_OPERANDS: ClassVar[frozenset[str]] = frozenset({"dst"})
-    SYNTHESIZE_RMW_INITIALIZER: ClassVar[bool] = False
     FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {
         "C": "chunks",
         "G": "groups",
@@ -35,7 +34,6 @@ class NKITiledGroupedMatmul(NKIOp):
         "M": "width",
         "N": "queries",
     }
-    FIRST_WRITE_AXES: ClassVar[tuple[str, ...]] = ("C", "T")
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {
         "K": AxisRole.ACCUMULATION,
         "C": AxisRole.ACCUMULATION,

@@ -49,14 +49,18 @@ def grouped_context_attention_graph(
 ) -> GraphModule | None:
     """Build grouped batched context attention without cross-batch contractions."""
     target, bound = getattr(f_torch, "function", f_torch), getattr(f_torch, "bound_kwargs", {})
-    if getattr(target, "__name__", "") != "attention_cte_torch_ref" or bound.get("tp_out"):
+    if getattr(target, "__name__", "") != "attention_cte_torch_ref":
         return None
     q_shape, k_shape, v_shape = (input_specs[name][0] for name in ("q", "k", "v"))
-    groups, reduction, sequence = q_shape
+    if bound.get("tp_q"):
+        groups, sequence, reduction = q_shape
+        q_kind = "q_t"
+    else:
+        groups, reduction, sequence = q_shape
+        q_kind = "q"
     output_width = v_shape[-1]
     if not (
-        groups > 1
-        and k_shape == q_shape
+        k_shape == (groups, reduction, sequence)
         and v_shape[:2] == (groups, sequence)
         and max(reduction, output_width) <= 128
         and sequence % 512 == 0
@@ -73,12 +77,12 @@ def grouped_context_attention_graph(
         node.meta["example_value"] = SimpleNamespace(shape=shape)
         return node
 
-    dimensions = (groups, sequence // 128, sequence // 512, reduction, 128, 512, output_width)
+    dimensions = (groups, sequence // 128, sequence // 128, reduction, 128, 128, output_width)
     g, q, t, r, p, w, h = dimensions
     layouts = {
-        "q": (("grouped_context", "q", *dimensions), (r, g * q * p)),
+        "q": (("grouped_context", q_kind, *dimensions), (r, g * q * p)),
         "k": (("grouped_context", "k", *dimensions), (r, g * t * w)),
-        "v": (("grouped_context", "v", *dimensions), (128, t * 4 * g * h)),
+        "v": (("grouped_context", "v", *dimensions), (128, t * (w // 128) * g * h)),
         "bound_min": (("grouped_context", "lower", *dimensions), (p, g * q)),
         "bound_max": (("grouped_context", "upper", *dimensions), (p, g * q)),
     }

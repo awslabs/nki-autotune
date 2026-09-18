@@ -15,20 +15,27 @@ from nkigym.codegen.recurrence import (
     _Lowering,
     _Plan,
     _plan_buffers,
-    _recurrence_buffers,
+    _regular_correction,
     _stage_region,
     _stage_regions,
 )
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Const, Expr, Mul, Var, to_affine
+from nkigym.ir.arith.expr import Const, Expr, Var, expr_variables, substitute, to_affine
+from nkigym.ir.dependency import Dependency
 from nkigym.ir.recurrence import _build_match, _compatible_block, _evaluate, _Match, _Stage
 from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole, BilinearReductionContract, ReductionContract
-from nkigym.ops.store import NKIStore
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
+from nkigym.transforms.base import (
+    Transform,
+    TransformLegalityError,
+    TransformOption,
+    copy_for_rewrite,
+    intersects_software_pipeline,
+)
 from nkigym.transforms.helper.canonical_rewrite import block_chain, finalize_rewrite, owning_block
+from nkigym.transforms.helper.normalize import _substitute_block_regions
 from nkigym.transforms.helper.operation_builder import NameSupply, OperationBuilder, OperationScope
-from nkigym.transforms.helper.value_graph import ValueGraph, build_value_graph, contract_input_operands
+from nkigym.transforms.helper.value_graph import ValueGraph, ValueGraphAliasError, build_value_graph
 
 _INCREMENTAL_ANNOTATION = "online_fusion_incremental"
 
@@ -46,6 +53,7 @@ class _Prefix:
     plans: tuple[_Plan, ...]
     scopes: tuple[OperationScope | None, ...]
     regions: tuple[BufferRegion, ...]
+    outer_loop_vars: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -59,6 +67,7 @@ class _Incremental:
     remaining: tuple[_Match, ...]
     nodes: tuple[tuple[int, BlockNode | ForNode | ISANode, tuple[int, ...]], ...]
     buffers: tuple[Buffer, ...]
+    root_children: tuple[int, ...] = ()
 
 
 def _detect_matches(ir: KernelIR, complete: bool) -> list[_Match]:
@@ -73,20 +82,25 @@ def _detect_matches(ir: KernelIR, complete: bool) -> list[_Match]:
     )
     if not axes:
         return matches
-    graph = build_value_graph(ir)
+    try:
+        graph = build_value_graph(ir)
+    except ValueGraphAliasError:
+        return matches
     for axis in axes:
         evaluation = _evaluate(ir, graph, axis)
         if len(evaluation.stages) < 2:
             continue
         maximal = _build_match(ir, graph, axis, evaluation)
-        if maximal is None:
+        if maximal is None or any(
+            stage.factor is not None and not _regular_correction(stage.factor) for stage in maximal.stages
+        ):
             continue
         selected = maximal
-        if not complete and len(maximal.stages) > 2:
+        if not complete:
             prefixes = tuple(
                 (
                     _build_match(ir, graph, axis, evaluation, stage_count=count)
-                    for count in range(2, len(maximal.stages))
+                    for count in range(1, len(maximal.stages))
                 )
             )
             if any((prefix is None for prefix in prefixes)):
@@ -150,24 +164,6 @@ def _mapped(match: _Match, ir: KernelIR) -> bool:
     return any((ir.buffer(name).shape[0] > PARTITION_DIM for name in names))
 
 
-def _region_shape(region: BufferRegion) -> tuple[int, ...]:
-    """Return the constant shape represented by a region."""
-    shape: list[int] = []
-    for _lower, width in region.ranges:
-        if not isinstance(width, Const):
-            raise ValueError("online recurrence widths must be constant")
-        shape.append(width.value)
-    return tuple(shape)
-
-
-def _hbm_region(region: BufferRegion, tensor: str) -> BufferRegion:
-    """Map an on-chip partition tile to element-addressed HBM."""
-    ranges = list(region.ranges)
-    lower, width = ranges[0]
-    ranges[0] = (Mul(left=lower, right=Const(value=PARTITION_DIM)), width)
-    return BufferRegion(tensor=tensor, ranges=tuple(ranges))
-
-
 def _root_insertion(
     ir: KernelIR,
     match: _Match,
@@ -200,7 +196,8 @@ def _root_insertion(
     if lower > upper:
         return None
     if retain_old:
-        return lower
+        preferred = positions[match.stages[0].reducer_block]
+        return preferred if lower <= preferred <= upper else None
     first = min((roots.index(block) for block in absorbed_blocks))
     preferred = sum((roots.index(block) < first for block in remaining))
     return min(max(preferred, lower), upper)
@@ -298,7 +295,8 @@ def _group_scopes(
     loops = [loop for loop in scopes[-1].loops if loop.loop_var in variables]
     if len(loops) < 2:
         return None
-    outer = loops[0]
+    reference = to_affine(values[0])
+    signature = tuple((loop.extent, reference[loop.loop_var]) for loop in loops)
     for nid in match.derivation_leaves:
         block_nid = owning_block(ir.tree, nid)
         block = ir.tree.block(block_nid)
@@ -310,24 +308,84 @@ def _group_scopes(
         matching = (
             []
             if chain is None
-            else [
-                item
-                for item in chain[1:-1]
-                if isinstance(item, ForNode) and item.loop_var == outer.loop_var and item.extent == outer.extent
-            ]
+            else [item for item in chain[1:-1] if isinstance(item, ForNode) and item.loop_var in variables]
         )
-        count = (
-            0
-            if chain is None
-            else sum((isinstance(item, ForNode) and item.loop_var in variables for item in chain[1:-1]))
-        )
-        if len(mapped_values) != 1 or len(matching) != 1 or count < 2:
+        if len(mapped_values) != 1:
+            return None
+        coefficients = to_affine(mapped_values[0])
+        if tuple((loop.extent, coefficients[loop.loop_var]) for loop in matching) != signature or coefficients.get(
+            None, 0
+        ) != reference.get(None, 0):
             return None
     return scopes
 
 
+def _normalize_loop_names(ir: KernelIR, blocks: tuple[int, ...]) -> None:
+    """Normalize bound names within each selected block without changing its schedule."""
+    for block_nid in blocks:
+        block = ir.tree.block(block_nid)
+        dimensions = {
+            name: variable.axis
+            for variable, value in zip(block.iter_vars, block.iter_values)
+            for name in to_affine(value)
+            if name is not None
+        }
+        indices: dict[str, int] = {}
+        substitutions: dict[str, Expr] = {}
+        for nid in ir.tree.preorder(block_nid):
+            loop = ir.tree.data(nid)
+            if isinstance(loop, ForNode):
+                axis = dimensions[loop.loop_var]
+                index = indices.get(axis, 0)
+                name = f"i_{axis}_{index}"
+                indices[axis] = index + 1
+                substitutions[loop.loop_var] = Var(name=name)
+                ir.tree.graph.nodes[nid]["data"] = replace(loop, loop_var=name)
+        _substitute_block_regions(ir.tree, block_nid, substitutions)
+    finalize_rewrite(ir)
+
+
+def _outer_loop_prefix(ir: KernelIR, match: _Match) -> tuple[ForNode, ...] | None:
+    """Find a common loop prefix that originally precedes the progress axis."""
+    reference: tuple[ForNode, ...] | None = None
+    signature: tuple[tuple[str, int, int], ...] | None = None
+    for nid in (match.stages[0].reducer_leaf, *match.derivation_leaves):
+        block_nid = owning_block(ir.tree, nid)
+        block = ir.tree.block(block_nid)
+        chain = block_chain(ir.tree, block_nid)
+        if chain is None:
+            return None
+        bindings = {
+            name: (variable.axis, coefficient)
+            for variable, value in zip(block.iter_vars, block.iter_values)
+            for name, coefficient in to_affine(value).items()
+            if name is not None
+        }
+        loops = tuple(node for node in chain[1:-1] if isinstance(node, ForNode))
+        progress = next(
+            (index for index, loop in enumerate(loops) if bindings[loop.loop_var][0] == match.progress_axis), None
+        )
+        prefix = loops if progress is None else loops[:progress]
+        current = tuple((bindings[loop.loop_var][0], loop.extent, bindings[loop.loop_var][1]) for loop in prefix)
+        if reference is None:
+            reference, signature = prefix, current
+        else:
+            assert signature is not None
+            compared = current[: len(signature)] if progress is None else current
+            if compared != signature:
+                return None
+    return reference
+
+
+def _mapped_container(ir: KernelIR) -> tuple[int, int]:
+    """Group recurrence initialization and progress without merging mapped loops."""
+    root = ir.tree.add_node(BlockNode(iter_vars=(), iter_values=(), reads=(), writes=()))
+    body = ir.tree.add_node(BlockNode(iter_vars=(), iter_values=(), reads=(), writes=()), parent=root)
+    return root, body
+
+
 def _can_lower(ir: KernelIR, match: _Match, chunk_size: int, prefix: bool = False) -> bool:
-    """Return whether ordinary-IR lowering supports one option."""
+    """Require explicit progress-outermost order before recurrence fusion."""
     states = {stage.state_tensor for stage in match.stages}
     valid = (
         chunk_size in match.chunk_sizes
@@ -335,10 +393,12 @@ def _can_lower(ir: KernelIR, match: _Match, chunk_size: int, prefix: bool = Fals
         and match.external_outputs[0] == match.stages[-1].state_tensor
         and set(match.external_outputs).issubset(states)
         and match.deferred_factor is None
+        and all(stage.factor is None or _regular_correction(stage.factor) for stage in match.stages)
     )
     valid = valid and bool(match.absorbed_blocks)
     valid = valid and all((ir.tree.parent(block) == ir.tree.root for block in match.absorbed_blocks))
     graph = build_value_graph(ir)
+    valid = valid and all(ir.buffer(graph.outputs[stage.reducer_leaf]).location == "sbuf" for stage in match.stages)
     valid = valid and all(
         not isinstance((contract := graph.contracts[stage.reducer_leaf]), ReductionContract)
         or contract.mapped_output_operand is None
@@ -350,19 +410,23 @@ def _can_lower(ir: KernelIR, match: _Match, chunk_size: int, prefix: bool = Fals
         state_buffers = [ir.buffer(stage.state_tensor) for stage in match.stages]
         valid = valid and all(
             (
-                buffer.location in {"sbuf", "psum"}
+                buffer.location == "sbuf"
                 and len(buffer.shape) == 1
                 and buffer.shape[0] >= PARTITION_DIM
                 and buffer.shape[0] % PARTITION_DIM == 0
                 for buffer in state_buffers
             )
         )
-        return valid and _root_insertion(ir, match, retain_old=True) is not None
+        return (
+            valid
+            and _outer_loop_prefix(ir, _matching_complete(ir, match)) == ()
+            and _root_insertion(ir, match, retain_old=True) is not None
+        )
     names = [stage.state_tensor for stage in match.stages[:-1]] + [match.external_outputs[0]]
     state_buffers = [ir.buffer(name) for name in names]
     valid = valid and all(
         (
-            buffer.location in {"sbuf", "psum"}
+            buffer.location == "sbuf"
             and len(buffer.shape) in {1, 2}
             and buffer.shape[0] >= PARTITION_DIM
             and buffer.shape[0] % PARTITION_DIM == 0
@@ -373,11 +437,12 @@ def _can_lower(ir: KernelIR, match: _Match, chunk_size: int, prefix: bool = Fals
     if valid and _mapped(match, ir):
         scopes = tuple((_stage_scope(ir, graph, stage, match.progress_axis) for stage in match.stages))
         valid = _group_scopes(ir, match, graph, scopes) is not None
-    return valid and _root_insertion(ir, match) is not None
+    return valid and _outer_loop_prefix(ir, match) == () and _root_insertion(ir, match) is not None
 
 
 def _preserved_chunk_size(ir: KernelIR, match: _Match) -> int | None:
-    """Return the chain's existing common tile width on the progress axis."""
+    """Require a common existing progress width across every stage before fusion."""
+    match = _matching_complete(ir, match) if match.incremental_prefix else match
     sizes: set[int] = set()
     for nid in match.derivation_leaves:
         leaf = ir.tree.isa(nid)
@@ -431,23 +496,19 @@ def _lower_tile(ir: KernelIR, match: _Match, graph: ValueGraph, chunk_size: int)
     """Lower a recurrence whose states fit one partition tile."""
     original = ir.all_buffers()
     names = NameSupply(set(original))
-    plans, added = _plan_buffers(ir, match, graph, names, False, False)
-    buffers = _recurrence_buffers(ir, match, original)
+    plans, added = _plan_buffers(ir, match, graph, names, False)
+    buffers = dict(original)
     buffers.update(added)
     init = OperationBuilder(ir.tree, None, buffers, names)
     roots = [_emit_initializer(init, plan.state, stage.combinator.identity) for stage, plan in zip(match.stages, plans)]
-    carrier, loop = _carrier(ir.tree, match, chunk_size, None)
+    if chunk_size < match.progress_extent:
+        carrier, loop = _carrier(ir.tree, match, chunk_size, None)
+        progress: Expr = Var(name=f"i_{match.progress_axis}_online")
+    else:
+        carrier = loop = ir.tree.add_node(BlockNode(iter_vars=(), iter_values=(), reads=(), writes=()))
+        progress = Const(value=0)
     context = _new_context(
-        ir,
-        match,
-        graph,
-        chunk_size,
-        loop,
-        buffers,
-        names,
-        {},
-        tuple((None for _stage in match.stages)),
-        Var(name=f"i_{match.progress_axis}_online"),
+        ir, match, graph, chunk_size, loop, buffers, names, {}, tuple((None for _stage in match.stages)), progress
     )
     _derive(context, plans)
     roots.append(carrier)
@@ -467,15 +528,12 @@ def _lower_grouped(
     """Keep one explicit mapped group on chip across the progress loop."""
     original = ir.all_buffers()
     names = NameSupply(set(original))
-    plans, added = _plan_buffers(ir, match, graph, names, True, False)
-    buffers = _recurrence_buffers(ir, match, original)
+    plans, added = _plan_buffers(ir, match, graph, names, False)
+    buffers = dict(original)
     buffers.update(added)
     stage_regions = tuple((_stage_region(ir, graph, stage) for stage in match.stages))
     regions = _stage_regions(plans, stage_regions)
-    group = ir.tree.add_node(BlockNode(iter_vars=(), iter_values=(), reads=(), writes=(), alloc_buffers=()))
-    body = ir.tree.add_node(
-        BlockNode(iter_vars=(), iter_values=(), reads=(), writes=(), alloc_buffers=()), parent=group
-    )
+    group, body = _mapped_container(ir)
     init = OperationBuilder(ir.tree, body, buffers, names, regions)
     if chunk_size < match.progress_extent:
         for index, (stage, plan) in enumerate(zip(match.stages, plans)):
@@ -521,13 +579,13 @@ def _rewrite_reducer_as_map(ir: KernelIR, stage: _Stage, contract: ReductionCont
 
 
 def _lower_prefix(ir: KernelIR, match: _Match, complete: _Match, chunk_size: int) -> _Prefix:
-    """Emit a live two-stage recurrence while retaining the suffix."""
+    """Emit a live one-stage recurrence in the original mapped-loop order."""
     if not _can_lower(ir, match, chunk_size, prefix=True):
         raise ValueError(f"online-fusion prefix {match.match_id} cannot lower")
     graph = build_value_graph(ir)
     original = ir.all_buffers()
     names = NameSupply(set(original))
-    plans, added = _plan_buffers(ir, match, graph, names, False, True)
+    plans, added = _plan_buffers(ir, match, graph, names, True)
     buffers = dict(original)
     buffers.update(added)
     mapped = _mapped(match, ir)
@@ -541,16 +599,18 @@ def _lower_prefix(ir: KernelIR, match: _Match, complete: _Match, chunk_size: int
         if mapped
         else tuple((None for _stage in complete.stages))
     )
+    assert _outer_loop_prefix(ir, complete) == ()
     complete_regions = tuple((_stage_region(ir, graph, stage) for stage in complete.stages))
     regions = (
         _stage_regions(plans, tuple((_stage_region(ir, graph, stage) for stage in match.stages))) if mapped else {}
     )
-    init = OperationBuilder(ir.tree, None, buffers, names, regions)
+    group, body = _mapped_container(ir) if mapped else (None, None)
+    init = OperationBuilder(ir.tree, body, buffers, names, regions)
     roots: list[int] = []
     for index, (stage, plan) in enumerate(zip(match.stages, plans)):
         init.scope = prefix_scopes[index]
         roots.append(_emit_initializer(init, plan.state, stage.combinator.identity))
-    carrier, loop = _carrier(ir.tree, match, chunk_size, None)
+    carrier, loop = _carrier(ir.tree, match, chunk_size, body)
     context = _new_context(
         ir,
         match,
@@ -569,11 +629,14 @@ def _lower_prefix(ir: KernelIR, match: _Match, complete: _Match, chunk_size: int
         context.builder.scope = prefix_scopes[index]
         rolls.append(_emit_copy(context.builder, plan.current, plan.state))
     roots.append(carrier)
+    if group is not None:
+        roots = [group]
     insertion = _root_insertion(ir, match, retain_old=True)
     assert insertion is not None
     _set_root_children(ir.tree, (), tuple(roots), insertion)
     removed: list[int] = []
     for stage in match.stages:
+        removed.extend(owning_block(ir.tree, nid) for nid in graph.initializers.get(stage.state_tensor, ()))
         contract = graph.contracts[stage.reducer_leaf]
         if isinstance(contract, ReductionContract) and contract.mapped_output_operand is not None:
             _rewrite_reducer_as_map(ir, stage, contract)
@@ -595,6 +658,7 @@ def _lower_prefix(ir: KernelIR, match: _Match, complete: _Match, chunk_size: int
         plans,
         complete_scopes,
         complete_regions,
+        (),
     )
 
 
@@ -610,23 +674,17 @@ def _extend_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pref
     state_buffer = replace(ir.buffer(state), location="sbuf", storage_dtype="float32")
     contribution_leaf = match.stages[index].reducer_leaf
     contribution_source = ir.buffer(graph.outputs[contribution_leaf])
-    raw_contribution: str | None = None
-    if contribution_source.location == "psum":
-        raw_contribution = names.fresh(f"{state}_online_partial")
-        contribution = names.fresh(f"{state}_online_chunk")
-        contribution_buffer = replace(contribution_source, name=contribution, location="sbuf", storage_dtype="float32")
-    else:
-        contribution = names.fresh(f"{state}_online_chunk")
-        contribution_buffer = replace(contribution_source, name=contribution, storage_dtype="float32")
+    if contribution_source.location != "sbuf":
+        raise ValueError("online fusion requires an explicitly materialized SBUF contribution")
+    contribution = names.fresh(f"{state}_online_chunk")
+    contribution_buffer = replace(contribution_source, name=contribution, storage_dtype="float32")
     current = names.fresh(f"{state}_online_current")
-    plan = _Plan(state, contribution, current, raw_contribution)
+    plan = _Plan(state, contribution, current, None)
     plans = (*prefix.plans, plan)
-    buffers = _recurrence_buffers(ir, match, original)
+    buffers = dict(original)
     buffers[state] = state_buffer
     buffers[current] = replace(state_buffer, name=current)
     buffers[contribution] = contribution_buffer
-    if raw_contribution is not None:
-        buffers[raw_contribution] = replace(contribution_source, name=raw_contribution, storage_dtype="float32")
     mapped = _mapped(match, ir)
     regions = _stage_regions(plans, prefix.regions) if mapped else {}
     init = OperationBuilder(ir.tree, None, buffers, names, regions, prefix.scopes[index])
@@ -652,8 +710,10 @@ def _extend_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pref
     if isinstance(contract, ReductionContract) and contract.mapped_output_operand is not None:
         _rewrite_reducer_as_map(ir, stage, contract)
     else:
-        _set_root_children(ir.tree, (stage.reducer_block,), (), 0)
         ir.tree.graph.remove_nodes_from({stage.reducer_block, *ir.tree.descendants(stage.reducer_block)})
+    for nid in graph.initializers.get(stage.state_tensor, ()):
+        block = owning_block(ir.tree, nid)
+        ir.tree.graph.remove_nodes_from({block, *ir.tree.descendants(block)})
     _seed_buffers(ir, buffers, frozenset())
     finalize_rewrite(ir)
     added = (*prefix.added_buffers, *(name for name in buffers if name not in original and name in ir.all_buffers()))
@@ -667,6 +727,7 @@ def _extend_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pref
         plans,
         prefix.scopes,
         prefix.regions,
+        prefix.outer_loop_vars,
     )
 
 
@@ -682,47 +743,23 @@ def _complete_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pr
     state_buffer = replace(source, name=state, location="sbuf", storage_dtype="float32")
     contribution_leaf = match.stages[-1].reducer_leaf
     contribution_source = ir.buffer(graph.outputs[contribution_leaf])
-    raw_contribution: str | None = None
-    if contribution_source.location == "psum":
-        raw_contribution = names.fresh(f"{final_stage.state_tensor}_online_partial")
-        contribution = names.fresh(f"{final_stage.state_tensor}_online_chunk")
-        contribution_buffer = replace(contribution_source, name=contribution, location="sbuf", storage_dtype="float32")
-    else:
-        contribution = names.fresh(f"{final_stage.state_tensor}_online_chunk")
-        contribution_buffer = replace(contribution_source, name=contribution, storage_dtype="float32")
-    final_plan = _Plan(state, contribution, state, raw_contribution)
+    if contribution_source.location != "sbuf":
+        raise ValueError("online fusion requires an explicitly materialized SBUF contribution")
+    contribution = names.fresh(f"{final_stage.state_tensor}_online_chunk")
+    contribution_buffer = replace(contribution_source, name=contribution, storage_dtype="float32")
+    final_plan = _Plan(state, contribution, state, None)
     plans = (*prefix.plans, final_plan)
-    buffers = _recurrence_buffers(ir, match, all_buffers)
+    buffers = dict(all_buffers)
     buffers[state] = state_buffer
     buffers[contribution] = contribution_buffer
-    if raw_contribution is not None:
-        buffers[raw_contribution] = replace(contribution_source, name=raw_contribution, storage_dtype="float32")
     mapped = _mapped(match, ir)
     buffers[match.external_outputs[0]] = replace(source, location="sbuf", storage_dtype="float32")
     regions = _stage_regions(plans, prefix.regions) if mapped else {}
-    carry: str | None = None
-    init_roots: list[int] = []
-    if mapped:
-        output = ir.return_name
-        carry = names.fresh(f"{output}_online_carry")
-        buffers[carry] = replace(buffers[output], name=carry, dtype="float32", storage_dtype="float32")
-        final_region = prefix.regions[-1]
-        regions[carry] = _hbm_region(final_region, carry)
-        zero = names.fresh(f"{match.external_outputs[0]}_online_zero")
-        shape = _region_shape(final_region)
-        buffers[zero] = Buffer(name=zero, shape=shape, dtype="float32", location="sbuf", storage_dtype="float32")
-        regions[zero] = BufferRegion(
-            tensor=zero, ranges=tuple(((Const(value=0), Const(value=extent)) for extent in shape))
-        )
-        init = OperationBuilder(ir.tree, None, buffers, names, regions, prefix.scopes[-1])
-        init_roots.append(_emit_initializer(init, zero, 0.0))
-        init_roots.append(init.append(NKIStore, {"src": regions[zero], "dst": regions[carry]}, {}))
-    else:
-        init = OperationBuilder(ir.tree, None, buffers, names)
-        init_roots.append(_emit_initializer(init, state, final_stage.combinator.identity))
+    init = OperationBuilder(ir.tree, None, buffers, names, regions, prefix.scopes[-1] if mapped else None)
+    init_roots = [_emit_initializer(init, state, final_stage.combinator.identity)]
     builder = OperationBuilder(ir.tree, None, buffers, names, regions)
     context = _Lowering(
-        ir, match, graph, chunk_size, Var(name=ir.tree.loop(prefix.loop).loop_var), builder, prefix.scopes, carry
+        ir, match, graph, chunk_size, Var(name=ir.tree.loop(prefix.loop).loop_var), builder, prefix.scopes
     )
     remap = {stage.state_tensor: plan.current for stage, plan in zip(match.stages[:-1], prefix.plans)}
     selected = frozenset(match.derivation_leaves) - frozenset(prefix.derivation_leaves)
@@ -735,9 +772,12 @@ def _complete_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pr
     ]
     _insert_detached_roots(ir.tree, prefix.carrier, init_roots, before=True)
     _insert_children_before(ir.tree, prefix.loop, prefix.roll_forward, suffix)
-    old = [block for block in match.absorbed_blocks if block in ir.tree.graph]
+    removed_leaves = selected | frozenset(graph.initializers.get(final_stage.state_tensor, ()))
+    old = {owning_block(ir.tree, leaf) for leaf in removed_leaves if leaf in ir.tree.graph}
     roots = ir.tree.children(ir.tree.root)
     for block in old:
+        if block not in ir.tree.graph:
+            continue
         if block in roots:
             ir.tree.graph.remove_edge(ir.tree.root, block)
         ir.tree.graph.remove_nodes_from({block, *ir.tree.descendants(block)})
@@ -746,16 +786,19 @@ def _complete_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pr
 
 
 def _insert_detached_roots(tree: KernelTree, anchor: int, blocks: list[int], before: bool) -> None:
-    """Attach detached roots immediately before or after one anchor."""
+    """Attach detached blocks beside an anchor in its existing loop scope."""
     if not blocks:
         return
-    roots = tree.children(tree.root)
+    parent = tree.parent(anchor)
+    if parent is None:
+        raise ValueError("recurrence anchor has no enclosing scope")
+    roots = tree.children(parent)
     index = roots.index(anchor) + (0 if before else 1)
     order = roots[:index] + blocks + roots[index:]
     for root in roots:
-        tree.graph.remove_edge(tree.root, root)
+        tree.graph.remove_edge(parent, root)
     for root in order:
-        tree.graph.add_edge(tree.root, root)
+        tree.graph.add_edge(parent, root)
 
 
 def _insert_children_before(tree: KernelTree, parent: int, anchors: tuple[int, ...], blocks: list[int]) -> None:
@@ -815,7 +858,9 @@ def _capture_incremental(
         )
     )
     buffers = tuple((copy.deepcopy(buffer) for buffer in ir.all_buffers().values()))
-    return _Incremental(complete, graph, chunk_size, prefix, remaining, nodes, buffers)
+    return _Incremental(
+        complete, graph, chunk_size, prefix, remaining, nodes, buffers, tuple(ir.tree.children(ir.tree.root))
+    )
 
 
 def _incremental_state(ir: KernelIR) -> _Incremental | None:
@@ -827,7 +872,9 @@ def _incremental_state(ir: KernelIR) -> _Incremental | None:
 
 
 def _incremental_intact(ir: KernelIR, state: _Incremental) -> bool:
-    """Return whether completion can consume the retained prefix."""
+    """Accept unchanged prefixes and equivalent explicit scheduling of the suffix."""
+    if intersects_software_pipeline(ir, state.complete.derivation_leaves):
+        return False
     expected = {nid: (payload, children) for nid, payload, children in state.nodes}
     actual = set(ir.tree.graph) - {ir.tree.root}
     intact = actual == set(expected)
@@ -841,7 +888,138 @@ def _incremental_intact(ir: KernelIR, state: _Incremental) -> bool:
     if intact:
         buffers = ir.all_buffers()
         intact = all((buffers.get(buffer.name) == buffer for buffer in state.buffers))
-    return intact
+    return intact or _prepared_suffix_intact(ir, state)
+
+
+def _prepared_leaf_signature(tree: KernelTree, nid: int) -> tuple[BlockNode, ISANode, tuple[tuple[str, int], ...]]:
+    """Compare operation semantics independently of equivalent loop names and placement."""
+    block, leaf = tree.block(owning_block(tree, nid)), tree.isa(nid)
+    substitutions: dict[str, Expr] = {
+        value.name: Var(name=variable.axis)
+        for variable, value in zip(block.iter_vars, block.iter_values, strict=True)
+        if isinstance(value, Var)
+    }
+
+    def region(value: BufferRegion) -> BufferRegion:
+        """Express one operand region in the block's concrete iteration axes."""
+        return replace(
+            value,
+            ranges=tuple(
+                (substitute(lo, substitutions), substitute(width, substitutions)) for lo, width in value.ranges
+            ),
+        )
+
+    loops = tuple(
+        (str(substitutions.get(loop.loop_var, Var(name=loop.loop_var))), loop.extent)
+        for ancestor in tree.ancestors(nid)
+        if isinstance(loop := tree.data(ancestor), ForNode)
+    )
+    return (
+        replace(
+            block,
+            iter_values=tuple(substitute(value, substitutions) for value in block.iter_values),
+            reads=tuple(map(region, block.reads)),
+            writes=tuple(map(region, block.writes)),
+            alloc_buffers=(),
+        ),
+        replace(leaf, operand_bindings={slot: region(value) for slot, value in leaf.operand_bindings.items()}),
+        loops,
+    )
+
+
+def _captured_tree(ir: KernelIR, state: _Incremental) -> KernelTree:
+    """Reconstruct the immutable pre-preparation tree for semantic comparison."""
+    tree = KernelTree()
+    tree.graph.clear()
+    tree.root = ir.tree.root
+    tree.graph.add_node(tree.root, data=ir.tree.block(ir.tree.root))
+    for nid, payload, _children in state.nodes:
+        tree.graph.add_node(nid, data=payload)
+    for nid, _payload, children in state.nodes:
+        tree.graph.add_edges_from((nid, child) for child in children)
+    roots = state.root_children or tuple(
+        nid for nid in tree.graph if nid != tree.root and tree.graph.in_degree(nid) == 0
+    )
+    tree.graph.add_edges_from((tree.root, nid) for nid in roots)
+    return tree
+
+
+def _prepared_suffix_intact(ir: KernelIR, state: _Incremental) -> bool:
+    """Permit only axis-equivalent suffix loop fusion while protecting the live prefix."""
+    if not state.remaining or ir.all_buffers() != {buffer.name: buffer for buffer in state.buffers}:
+        return False
+    original = _captured_tree(ir, state)
+    suffix = set(state.complete.derivation_leaves) - set(state.prefix.derivation_leaves)
+    leaves = {nid for nid, payload, _ in state.nodes if isinstance(payload, ISANode)}
+    if leaves != set(ir.tree.leaves()):
+        return False
+    for nid, payload, children in state.nodes:
+        if nid not in original.graph:
+            return False
+        movable = bool(set(original.leaves(nid)) & suffix)
+        if not movable and (
+            nid not in ir.tree.graph or ir.tree.data(nid) != payload or tuple(ir.tree.children(nid)) != children
+        ):
+            return False
+    signatures = all(
+        _prepared_leaf_signature(original, nid) == _prepared_leaf_signature(ir.tree, nid) for nid in leaves
+    )
+    order = {nid: index for index, nid in enumerate(ir.tree.preorder())}
+    return signatures and all(order[first] < order[second] for first, second in Dependency(original).graph.edges)
+
+
+def _prepared_stage_loop(ir: KernelIR, state: _Incremental) -> int | None:
+    """Require the next stage's producers and reducer to share an explicit progress loop."""
+    match = state.remaining[0]
+    leaves = set(match.derivation_leaves) - set(state.prefix.derivation_leaves)
+    progress = []
+    for nid in leaves:
+        block = ir.tree.block(owning_block(ir.tree, nid))
+        values = [
+            value for variable, value in zip(block.iter_vars, block.iter_values) if variable.axis == match.progress_axis
+        ]
+        if not values:
+            continue
+        variables = to_affine(values[0])
+        loops = [
+            ancestor
+            for ancestor in ir.tree.ancestors(nid)
+            if isinstance(loop := ir.tree.data(ancestor), ForNode) and loop.loop_var in variables
+        ]
+        if len(loops) != 1:
+            return None
+        if any(
+            isinstance(ir.tree.data(ancestor), ForNode)
+            and ancestor != loops[0]
+            and len(set(ir.tree.leaves(ancestor)) & leaves) > 1
+            for ancestor in ir.tree.ancestors(nid)
+        ):
+            return None
+        progress.append(loops[0])
+    loop = progress[0] if progress and len(set(progress)) == 1 else None
+    if loop is not None and not set(ir.tree.leaves(loop)).issubset(leaves):
+        return None
+    return loop
+
+
+def _can_extend_prefix(ir: KernelIR, state: _Incremental) -> bool:
+    """Require a nonsingular correction and unchanged instruction tiles."""
+    if state.prefix.outer_loop_vars or _prepared_stage_loop(ir, state) is None:
+        return False
+    match = state.remaining[0]
+    if ir.buffer(state.graph.outputs[match.stages[-1].reducer_leaf]).location != "sbuf":
+        return False
+    if any(stage.factor is not None and not _regular_correction(stage.factor) for stage in match.stages):
+        return False
+    selected = set(match.derivation_leaves) - set(state.prefix.derivation_leaves)
+    for nid in selected:
+        for region in ir.tree.isa(nid).operand_bindings.values():
+            axes = state.graph.tensor_axes[region.tensor]
+            if match.progress_axis in axes:
+                width = region.ranges[axes.index(match.progress_axis)][1]
+                if not isinstance(width, Const) or width.value != state.chunk_size:
+                    return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -862,7 +1040,7 @@ class OnlineFusion(Transform[OnlineFusionOption]):
         elif state is not None:
             options = (
                 [OnlineFusionOption(state.remaining[0].match_id)]
-                if state.remaining and _incremental_intact(ir, state)
+                if state.remaining and _incremental_intact(ir, state) and _can_extend_prefix(ir, state)
                 else []
             )
         elif any(
@@ -888,6 +1066,7 @@ class OnlineFusion(Transform[OnlineFusionOption]):
                 not state.remaining
                 or option.match_id != state.remaining[0].match_id
                 or (not _incremental_intact(ir, state))
+                or not _can_extend_prefix(ir, state)
             ):
                 raise TransformLegalityError(f"illegal OnlineFusion completion option: {option}")
             result = copy_for_rewrite(ir)
@@ -920,6 +1099,8 @@ class OnlineFusion(Transform[OnlineFusionOption]):
         ):
             raise TransformLegalityError(f"illegal OnlineFusion option: {option}")
         result = copy_for_rewrite(ir)
+        complete = _matching_complete(ir, match) if match.incremental_prefix else match
+        _normalize_loop_names(result, complete.absorbed_blocks)
         copied_matches = {candidate.match_id: candidate for candidate in _detect_matches(result, complete=False)}
         copied_match = copied_matches[option.match_id]
         copied_chunk_size = _preserved_chunk_size(result, copied_match)

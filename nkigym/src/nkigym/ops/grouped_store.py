@@ -62,7 +62,7 @@ def rotational_topk_config(rows: int, width: int, k: int) -> tuple[int, int, int
     """Return the lowest-cost legal packed selection layout."""
     groups = 2 if rows > 1 and rows % 2 == 0 else 1
     rows_per_group = rows // groups
-    if k != 256 or width < k or rows_per_group >= 128:
+    if k not in {256, 2048} or width < k or rows_per_group >= 128:
         return None
     costs = [
         (cost, stages)

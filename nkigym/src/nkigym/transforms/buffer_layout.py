@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import lcm
+from weakref import WeakKeyDictionary
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Add, Const, Mul, to_affine
-from nkigym.ir.buffer_placement import layout_satisfies_output_alignment
+from nkigym.ir.buffer_placement import layout_satisfies_alignment
 from nkigym.ir.dependency_rebind import rebind_unchanged_dependency
-from nkigym.ir.tree import BlockNode, Buffer, ISANode
+from nkigym.ir.tree import BlockNode, Buffer, ISANode, KernelTree
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
+from nkigym.transforms.buffer_region_normalization import access_patterns_fit_buffer
 from nkigym.transforms.helper.access_pattern import tensor_has_access_pattern
 
+_OUTPUT_ALIGNMENTS: WeakKeyDictionary[KernelTree, dict[str, int]] = WeakKeyDictionary()
 _DTYPE_BYTES = {
     "bfloat16": 2,
     "float16": 2,
@@ -24,6 +28,7 @@ _DTYPE_BYTES = {
     "tfloat32": 4,
     "uint8": 1,
     "uint32": 4,
+    "uint16": 2,
 }
 
 
@@ -49,11 +54,12 @@ class BufferLayout(Transform[BufferLayoutOption]):
         for name, buf in ir.all_buffers().items():
             if buf.location not in ("sbuf", "psum") or name not in ir.dependency.touches_by_tensor:
                 continue
-            if tensor_has_access_pattern(ir.tree, name):
-                continue
+            explicit_views = tensor_has_access_pattern(ir.tree, name)
             logical_tiles = buf.logical_tile_count()
             for b in range(1, logical_tiles + 1):
                 candidate = replace(buf, list_len=b)
+                if explicit_views and (b != 1 or not access_patterns_fit_buffer(ir.tree, name, candidate, prior=buf)):
+                    continue
                 if logical_tiles % b == 0 and b != buf.list_len and _layout_satisfies_output_alignment(ir, candidate):
                     options.append(BufferLayoutOption(tensor=name, list_len=b))
         return options
@@ -76,8 +82,11 @@ class BufferLayout(Transform[BufferLayoutOption]):
             raise TransformLegalityError(f"BufferLayout: {option.tensor} is shared_hbm (no tile axis)")
         if option.tensor not in ir.dependency.touches_by_tensor:
             raise TransformLegalityError(f"BufferLayout: {option.tensor} has no ISA touches")
-        if tensor_has_access_pattern(ir.tree, option.tensor):
-            raise TransformLegalityError(f"BufferLayout: {option.tensor} participates in an explicit access pattern")
+        if tensor_has_access_pattern(ir.tree, option.tensor) and (
+            option.list_len != 1
+            or not access_patterns_fit_buffer(ir.tree, option.tensor, replace(buf, list_len=1), prior=buf)
+        ):
+            raise TransformLegalityError(f"BufferLayout: {option.tensor} views do not fit the requested allocation")
         logical_tiles = buf.logical_tile_count()
         if option.list_len < 1 or logical_tiles % option.list_len != 0:
             raise TransformLegalityError(
@@ -99,27 +108,38 @@ class BufferLayout(Transform[BufferLayoutOption]):
 
 
 def _layout_satisfies_output_alignment(ir: KernelIR, buffer: Buffer) -> bool:
-    """Accept coarse tile alignment or prove every actual list-of-one output start."""
-    if layout_satisfies_output_alignment(ir.tree, buffer):
+    """Check PSUM bank bases or ordinary output element addresses."""
+    alignments = _OUTPUT_ALIGNMENTS.get(ir.tree)
+    if alignments is None:
+        alignments = {}
+        for nid in ir.tree.preorder():
+            node = ir.tree.data(nid)
+            if isinstance(node, ISANode):
+                for slot, required in node.op_cls.OUTPUT_TILE_ALIGNMENT_BYTES.items():
+                    region = node.operand_bindings.get(slot)
+                    if region is not None:
+                        alignments[region.tensor] = lcm(alignments.get(region.tensor, 1), required)
+        _OUTPUT_ALIGNMENTS[ir.tree] = alignments
+    if layout_satisfies_alignment(buffer, alignments.get(buffer.name, 1)):
         return True
     if buffer.list_len != 1:
         return False
     element_bytes = _DTYPE_BYTES[buffer.physical_dtype()]
     free = Const(value=buffer.physical_shape()[2])
-    for nid in ir.tree.preorder():
-        node = ir.tree.data(nid)
-        if not isinstance(node, ISANode):
-            continue
+    for nid in ir.dependency.touches_by_tensor.get(buffer.name, ()):
+        node = ir.tree.isa(nid)
         for slot, alignment in node.op_cls.OUTPUT_TILE_ALIGNMENT_BYTES.items():
             region = node.operand_bindings.get(slot)
             if region is None or region.tensor != buffer.name:
                 continue
             tile = region.ranges[0][0]
             offset = region.ranges[1][0] if len(region.ranges) > 1 else Const(value=0)
-            if any(
-                coefficient * element_bytes % alignment
-                for coefficient in to_affine(Add(left=Mul(left=tile, right=free), right=offset)).values()
-            ):
+            address = (
+                Mul(left=Mul(left=tile, right=free), right=Const(value=buffer.partition_extent()))
+                if buffer.location == "psum"
+                else Add(left=Mul(left=tile, right=free), right=offset)
+            )
+            if any(coefficient * element_bytes % alignment for coefficient in to_affine(address).values()):
                 return False
     return True
 

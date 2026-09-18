@@ -20,6 +20,10 @@ from nkigym.ops.base import (
 from nkigym.transforms.helper.canonical_rewrite import owning_block
 
 
+class ValueGraphAliasError(ValueError):
+    """A reused allocation has multiple logical axis interpretations."""
+
+
 @dataclass(frozen=True)
 class ValueGraph:
     """Semantic SSA use-def graph derived from operation contracts."""
@@ -76,10 +80,11 @@ def build_value_graph(ir: KernelIR) -> ValueGraph:
         contracts[nid] = contract
         axis_map = ir.tree.block(owning_block(ir.tree, nid)).axis_map
         for slot, region in leaf.operand_bindings.items():
-            axes = tuple(axis_map[axis] for axis in leaf.op_cls.OPERAND_AXES[slot] if axis in axis_map)
+            operand_axes = leaf.op_cls.OPERAND_AXES[slot][: len(region.ranges)]
+            axes = tuple(axis_map[axis] for axis in operand_axes if axis in axis_map)
             prior = tensor_axes.get(region.tensor)
             if prior is not None and prior != axes:
-                raise ValueError(f"tensor {region.tensor!r} has inconsistent axes {prior} and {axes}")
+                raise ValueGraphAliasError(f"tensor {region.tensor!r} has inconsistent axes {prior} and {axes}")
             tensor_axes[region.tensor] = axes
         bound = {
             slot: leaf.operand_bindings[slot].tensor
@@ -118,4 +123,4 @@ def build_value_graph(ir: KernelIR) -> ValueGraph:
     )
 
 
-__all__ = ["ValueGraph", "build_value_graph", "contract_input_operands"]
+__all__ = ["ValueGraph", "ValueGraphAliasError", "build_value_graph", "contract_input_operands"]

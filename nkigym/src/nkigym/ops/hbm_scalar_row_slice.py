@@ -14,20 +14,30 @@ class NKIHBMScalarRowSlice(NKIOp):
     INDIRECT_DMA_MODE: ClassVar[str | None] = "scalar_gather"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"src": ("E", "L"), "indices": ("I", "J"), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src", "indices"})
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {
+        "src": frozenset({"shared_hbm"}),
+        "indices": frozenset({"sbuf", "register"}),
+    }
     FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {"P": "rows", "F": "width"}
-    NON_TILABLE_AXES: ClassVar[frozenset[str]] = frozenset({"E", "L", "I", "J", "F"})
+    TILABLE_FIXED_AXES: ClassVar[frozenset[str]] = frozenset({"F"})
+    """The configured matrix width is an iteration extent, not a DMA tile width."""
+    NON_TILABLE_AXES: ClassVar[frozenset[str]] = frozenset({"E", "L", "I", "J"})
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"E": 1, "L": 1, "I": 1, "J": 1, "P": 1, "F": 1}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"E": None, "L": None, "I": 1, "J": None, "P": 128, "F": None}
     REQUIRED_INPUT_STORAGE_DTYPES: ClassVar[dict[str, str]] = {"indices": "uint32"}
-    CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"index", "rows", "width"})
+    SPLIT_OFFSET_KWARGS: ClassVar[dict[str, tuple[str, str]]] = {
+        "P": ("row_offset", "dst"),
+        "F": ("column_offset", "dst"),
+    }
+    CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"index", "rows", "width", "row_offset", "column_offset"})
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def _check_roles(self, **kwargs: Any) -> None:
-        """Require one flattened HBM expert matrix and one scalar SBUF index."""
-        if (role := _operand_role(kwargs["src"])) is not None and role != "param":
-            raise TypeError(f"NKIHBMScalarRowSlice(src=<role={role}>) expects an HBM parameter")
-        if (role := _operand_role(kwargs["indices"])) is not None and role != "sbuf":
-            raise TypeError(f"NKIHBMScalarRowSlice(indices=<role={role}>) expects SBUF indices")
+        """Require one flattened HBM matrix and one scalar SBUF index."""
+        if (role := _operand_role(kwargs["src"])) not in {None, "param", "shared_hbm", "stored"}:
+            raise TypeError(f"NKIHBMScalarRowSlice(src=<role={role}>) expects an HBM source")
+        if (role := _operand_role(kwargs["indices"])) is not None and role not in {"sbuf", "register"}:
+            raise TypeError(f"NKIHBMScalarRowSlice(indices=<role={role}>) expects SBUF or a scalar register")
         source, indices = np.asarray(kwargs["src"]), np.asarray(kwargs["indices"])
         index = int(kwargs.get("index", 0))
         rows, width = int(kwargs["rows"]), int(kwargs["width"])

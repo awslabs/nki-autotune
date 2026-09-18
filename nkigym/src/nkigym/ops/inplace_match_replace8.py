@@ -47,16 +47,16 @@ class NKIInplaceMatchReplace8(NKIOp):
             raise ValueError("NKIInplaceMatchReplace8 requires data and dst to alias")
 
     def _run(self, **kwargs: Any) -> np.ndarray:
-        """Replace selected values and write their original positions."""
+        """Replace selected values and write reverse-column match positions."""
         data, positions = kwargs["dst"], kwargs["dst_idx"]
         value_start, output_start, width = (
             int(kwargs[name]) for name in ("value_start", "output_start", "output_width")
         )
         active = int(kwargs["source_width"])
         for row, values in enumerate(np.asarray(kwargs["vals"])[:, value_start : value_start + width]):
-            for column, value in enumerate(values, output_start):
-                matches = np.flatnonzero(data[row, :active] == value)
-                positions[row, column] = matches[0]
+            for column in range(values.size - 1, -1, -1):
+                matches = np.flatnonzero(data[row, :active] == values[column])
+                positions[row, output_start + column] = matches[0]
                 data[row, matches[0]] = kwargs["imm"]
         return positions
 

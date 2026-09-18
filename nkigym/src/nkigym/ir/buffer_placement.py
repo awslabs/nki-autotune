@@ -35,6 +35,7 @@ _STORAGE_DTYPE_BYTES = {
     "tfloat32": 4,
     "uint8": 1,
     "uint32": 4,
+    "uint16": 2,
 }
 
 
@@ -63,18 +64,25 @@ def layout_satisfies_alignment(buffer: Buffer, alignment: int) -> bool:
 
 def collect_buffers(tensors: dict[str, TensorDims], param_names: list[str], tree: KernelTree) -> dict[str, Buffer]:
     """Return one allocation per intermediate tensor with a consistent partition width."""
+    widths_by_tensor: dict[str, set[int]] = {}
+    alignments: dict[str, int] = {}
+    for nid in tree.preorder():
+        node = tree.data(nid)
+        if isinstance(node, BlockNode):
+            for region in (*node.reads, *node.writes):
+                for _lower, width in region.ranges[:1]:
+                    if isinstance(width, Const):
+                        widths_by_tensor.setdefault(region.tensor, set()).add(width.value)
+        elif isinstance(node, ISANode):
+            for slot, required in node.op_cls.OUTPUT_TILE_ALIGNMENT_BYTES.items():
+                if (region := node.operand_bindings.get(slot)) is not None:
+                    alignments[region.tensor] = lcm(alignments.get(region.tensor, 1), required)
     out: dict[str, Buffer] = {}
     for name, tensor in tensors.items():
         if name in param_names:
             continue
-        widths = {
-            width.value
-            for block_nid in tree.blocks()
-            for region in (*tree.block(block_nid).reads, *tree.block(block_nid).writes)
-            if region.tensor == name
-            for _lower, width in region.ranges[:1]
-            if isinstance(width, Const)
-        }
+        widths = widths_by_tensor.get(name, ())
+        alignment = alignments.get(name, 1)
         partition_size = None
         if tensor.location != "shared_hbm":
             partition_size = partition_extent(tensor.shape[0])
@@ -88,9 +96,9 @@ def collect_buffers(tensors: dict[str, TensorDims], param_names: list[str], tree
             storage_dtype=tensor.storage_dtype,
             partition_size=partition_size,
         )
-        if buffer.location != "shared_hbm" and not layout_satisfies_output_alignment(tree, buffer):
+        if buffer.location != "shared_hbm" and not layout_satisfies_alignment(buffer, alignment):
             buffer = replace(buffer, list_len=buffer.logical_tile_count())
-        if buffer.location != "shared_hbm" and not layout_satisfies_output_alignment(tree, buffer):
+        if buffer.location != "shared_hbm" and not layout_satisfies_alignment(buffer, alignment):
             raise ValueError(f"{name}: no canonical allocation satisfies producer output alignment")
         out[name] = buffer
     return out

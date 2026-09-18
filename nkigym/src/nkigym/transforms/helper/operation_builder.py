@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -63,34 +64,29 @@ class OperationBuilder:
     def append(
         self,
         op_cls: type[NKIOp],
-        bindings: dict[str, BufferRegion],
+        bindings: Mapping[str, BufferRegion | str],
         kwargs: dict[str, Any],
         scope: OperationScope | None = None,
     ) -> int:
-        """Append one ISA block using explicit operand regions."""
-        reads: list[BufferRegion] = []
-        writes: list[BufferRegion] = []
+        """Append one ISA block from explicit regions or named active tensors."""
+        regions = {slot: self.region(value) if isinstance(value, str) else value for slot, value in bindings.items()}
         rmw_operands = op_cls.rmw_operands(kwargs)
-        for slot, region in bindings.items():
-            if slot in op_cls.INPUT_OPERANDS:
-                reads.append(region)
-            elif slot in rmw_operands:
-                reads.append(region)
-                writes.append(region)
-            else:
-                writes.append(region)
+        reads = tuple(
+            region for slot, region in regions.items() if slot in op_cls.INPUT_OPERANDS or slot in rmw_operands
+        )
+        writes = tuple(region for slot, region in regions.items() if slot not in op_cls.INPUT_OPERANDS)
         active_scope = self.scope if scope is None else scope
         if active_scope is None:
-            block = BlockNode(iter_vars=(), iter_values=(), reads=tuple(reads), writes=tuple(writes), alloc_buffers=())
+            block = BlockNode(iter_vars=(), iter_values=(), reads=reads, writes=writes, alloc_buffers=())
             loops: tuple[ForNode, ...] = ()
         else:
-            block = replace(active_scope.block, reads=tuple(reads), writes=tuple(writes), alloc_buffers=())
+            block = replace(active_scope.block, reads=reads, writes=writes, alloc_buffers=())
             loops = active_scope.loops
         block_nid = self.tree.add_node(block, parent=self.parent)
         parent = block_nid
         for loop in loops:
             parent = self.tree.add_node(loop, parent=parent)
-        self.tree.add_node(ISANode(op_cls=op_cls, operand_bindings=bindings, kwargs=kwargs), parent=parent)
+        self.tree.add_node(ISANode(op_cls=op_cls, operand_bindings=regions, kwargs=kwargs), parent=parent)
         return block_nid
 
     def temp(self, stem: str, source: str) -> str:

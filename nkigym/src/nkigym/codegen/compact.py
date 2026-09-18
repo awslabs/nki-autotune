@@ -1,7 +1,5 @@
 """Selected-buffer geometry compaction over a transformed schedule tree."""
 
-from __future__ import annotations
-
 from dataclasses import replace
 
 from nkigym.ir.arith.analyzer import Analyzer
@@ -83,8 +81,7 @@ def _axis_span(
     _lo, hi = analyzer.const_int_bound(zeroed)
     if hi is None:
         raise ValueError(f"cannot bound compacted buffer index {zeroed!r}")
-    is_partition = axis == 0 and location in ("sbuf", "psum") and width.value == partition
-    if is_partition:
+    if axis == 0 and location in ("sbuf", "psum") and width.value == partition:
         return (hi + 1) * partition
     return hi + width.value
 
@@ -101,6 +98,3 @@ def _leaf_loop_extents(tree: KernelTree, leaf_nid: int) -> dict[str, int]:
         for ancestor in tree.ancestors(leaf_nid)
         if isinstance((data := tree.data(ancestor)), ForNode)
     }
-
-
-__all__ = ["compact_buffer_shapes"]

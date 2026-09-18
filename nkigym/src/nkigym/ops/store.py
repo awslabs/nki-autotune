@@ -5,7 +5,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import CopyContract, NKIOp, _operand_role
+from nkigym.ops.base import CopyContract, NKIOp, PartitionTileBatchingContract, _operand_role
 
 
 class NKIStore(NKIOp):
@@ -28,6 +28,12 @@ class NKIStore(NKIOp):
         """Return the value-preserving store contract."""
         _ = kwargs
         return CopyContract(input_operand="src", output_operand="dst")
+
+    @classmethod
+    def partition_tile_batching_contract(cls, kwargs: Mapping[str, Any]) -> PartitionTileBatchingContract:
+        """Allow one DMA instruction to transfer an independent tile family."""
+        _ = kwargs
+        return PartitionTileBatchingContract(operands=("src", "dst"))
 
     def _check_roles(self, **kwargs: Any) -> None:
         """``src`` must be SBUF-resident."""

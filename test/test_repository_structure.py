@@ -19,10 +19,13 @@ nkigym/src/nkigym/
         |-- __init__.py
         `-- <helper>.py              no public transforms
 
+benchmark/                         frozen targets and accuracy criteria
+|-- __init__.py
+`-- nakb_<workload>.py               one direct Python module per workload
+
 kernel_library/
 |-- __init__.py
-|-- _best_nkigym.py                  recorded kernels and transform ladders
-`-- nakb_<workload>.py               one direct Python module per workload
+`-- _best_nkigym.py                  recorded best NKIGym transform ladders
 
 Only the files shown above are allowed under ops and transforms. Every transform
 Python file must have fewer than 1,000 code lines, and all helper Python files
@@ -30,19 +33,20 @@ together must have fewer than 1,000 code lines. Blank lines, comments, and
 documentation strings do not count. Public transforms must directly define
 typed, synchronous analyze and apply methods. Formatter-control comments are
 forbidden because they permit multiple statements to be hidden on one line.
-Only the package initializer, the best-NKIGym artifact module, and direct
-workload Python modules are allowed under kernel_library; helper subdirectories
-are forbidden. No Python source files are allowed outside the documented
-nkigym implementation directories.
+The frozen benchmark contains only its initializer and direct workload modules.
+Its contents are pinned by a checksum below. Kernel_library contains only its
+initializer and best-NKIGym artifact module. No Python source files are allowed
+outside the documented nkigym implementation directories.
 
-Required package initializers: nkigym, codegen, ir, ir/arith, ops, profile,
-synthesis, transforms, and transforms/helper.
+Required package initializers: benchmark, kernel_library, nkigym, codegen, ir,
+ir/arith, ops, profile, synthesis, transforms, and transforms/helper.
 
 Allowed repository imports:
 
-nkigym        -> nkigym
+benchmark      -> benchmark
+nkigym         -> nkigym
 kernel_library -> kernel_library, nkigym
-test           -> kernel_library, nkigym
+test           -> benchmark, kernel_library, nkigym
 
 The top-level developer package must not exist.
 
@@ -58,6 +62,7 @@ import re
 import subprocess
 import sys
 import tokenize
+from hashlib import sha256
 from pathlib import Path
 
 from _transform_inventory import inspect_transform_api, inspect_transforms
@@ -72,11 +77,14 @@ MAX_SYNTHESIS_IMPLEMENTATION_LINES = 1000
 OP_FILE_LINE_LIMIT = 100
 OP_BASE_FILE_LINE_LIMIT = 500
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-REPOSITORY_IMPORT_ROOTS = {"developer", "kernel_library", "nkigym"}
-FORMATTER_TARGETS = ("nkigym/src", "kernel_library", "test")
+REPOSITORY_IMPORT_ROOTS = {"benchmark", "developer", "kernel_library", "nkigym"}
+FORMATTER_TARGETS = ("benchmark", "nkigym/src", "kernel_library", "test")
+FROZEN_BENCHMARK_SHA256 = "0502c1b62cb6e148ba4ec58a38dbaee1607904107fc62911b4a1270f93fb62e3"
 NKIGYM_IMPLEMENTATION_DIRECTORIES = frozenset({"codegen", "ir", "ops", "profile", "synthesis", "transforms"})
 REQUIRED_PACKAGE_INITIALIZERS = frozenset(
     {
+        "benchmark/__init__.py",
+        "kernel_library/__init__.py",
         "nkigym/src/nkigym/__init__.py",
         "nkigym/src/nkigym/codegen/__init__.py",
         "nkigym/src/nkigym/ir/__init__.py",
@@ -351,19 +359,37 @@ def _operation_structure_violations() -> tuple[list[str], int, int, int]:
     return violations, operation_count, largest_operation_file, base_lines
 
 
-def _kernel_library_structure_violations() -> list[str]:
-    """Allow the initializer, artifact records, and direct NAKB workload modules."""
-    kernel_library_directory = REPOSITORY_ROOT / "kernel_library"
+def _benchmark_structure_violations() -> list[str]:
+    """Keep the benchmark self-contained and unchanged after its creation."""
+    benchmark_directory = REPOSITORY_ROOT / "benchmark"
     violations: list[str] = []
-    for relative_path in _repository_files(kernel_library_directory):
-        is_infrastructure = relative_path in {Path("__init__.py"), Path("_best_nkigym.py")}
+    digest = sha256()
+    for relative_path in _repository_files(benchmark_directory):
+        is_initializer = relative_path == Path("__init__.py")
         is_workload_module = (
             len(relative_path.parts) == 1 and relative_path.suffix == ".py" and relative_path.name.startswith("nakb_")
         )
-        if not is_infrastructure and not is_workload_module:
+        if not is_initializer and not is_workload_module:
             violations.append(
-                f"kernel_library/{relative_path.as_posix()} is not allowed; keep only __init__.py, "
-                "_best_nkigym.py, and direct nakb_*.py workload modules"
+                f"benchmark/{relative_path.as_posix()} is not allowed; keep only __init__.py "
+                "and direct nakb_*.py workload modules"
+            )
+        digest.update(relative_path.as_posix().encode() + b"\0")
+        digest.update((benchmark_directory / relative_path).read_bytes() + b"\0")
+    if digest.hexdigest() != FROZEN_BENCHMARK_SHA256:
+        violations.append("benchmark contents differ from the frozen benchmark")
+    return violations
+
+
+def _kernel_library_structure_violations() -> list[str]:
+    """Reserve the kernel library for best NKIGym artifact records."""
+    kernel_library_directory = REPOSITORY_ROOT / "kernel_library"
+    violations: list[str] = []
+    for relative_path in _repository_files(kernel_library_directory):
+        if relative_path not in {Path("__init__.py"), Path("_best_nkigym.py")}:
+            violations.append(
+                f"kernel_library/{relative_path.as_posix()} is not allowed; keep only __init__.py "
+                "and _best_nkigym.py"
             )
     return violations
 
@@ -411,9 +437,10 @@ def _boundary_violations(directory: Path, allowed_repository_roots: set[str]) ->
 def _dependency_violations() -> list[str]:
     """Enforce the one-way repository dependency graph."""
     violations = [
+        *_boundary_violations(REPOSITORY_ROOT / "benchmark", {"benchmark"}),
         *_boundary_violations(REPOSITORY_ROOT / "nkigym/src/nkigym", {"nkigym"}),
         *_boundary_violations(REPOSITORY_ROOT / "kernel_library", {"kernel_library", "nkigym"}),
-        *_boundary_violations(REPOSITORY_ROOT / "test", {"kernel_library", "nkigym"}),
+        *_boundary_violations(REPOSITORY_ROOT / "test", {"benchmark", "kernel_library", "nkigym"}),
     ]
     if (REPOSITORY_ROOT / "developer").exists():
         violations.append("legacy top-level developer package must remain removed")
@@ -448,6 +475,7 @@ def test_repository_structure() -> None:
         *structure_violations,
         *operation_violations,
         *api_violations,
+        *_benchmark_structure_violations(),
         *_kernel_library_structure_violations(),
         *_formatter_control_violations(source_root),
         *_dependency_violations(),

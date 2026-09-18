@@ -1,17 +1,19 @@
 """NKI operator definitions."""
 
-from nkigym.ops.base import NKIOp, nkigym_kernel
+from nkigym.ops.base import NKIOp, nkigym_kernel, nkigym_repeat
 
 _OP_MODULES: dict[str, str] = {
     item.split("=")[0]: item.split("=")[1]
     for item in (
         "NKIActivation=activation NKIActivationReduce=activation_reduce NKIBF16Cast=bfloat16_cast "
-        "NKIBatchedMatmul=batched_matmul NKIDMATranspose=dma_transpose NKIFindIndex8=find_index8 "
+        "NKIBitwiseScalar=bitwise_scalar NKIBitwiseTensor=bitwise_tensor "
+        "NKIBatchedMatmul=batched_matmul NKIDMATranspose=dma_transpose "
+        "NKIDynamicSliceCopy=dynamic_slice_copy NKIDynamicSliceLoad=dynamic_slice_load NKIFindIndex8=find_index8 "
         "NKIFloat32Cast=float32_cast NKIFloat32Load=float32_load NKIFloat32Scale=float32_scale "
         "NKIFloat8Cast=float8_cast NKIFlattenStore=flatten_store NKIGather=gather "
         "NKIFoldedLoad=folded_load NKIFoldedStore=folded_store "
         "NKIGroupedActivationReduce=grouped_activation_reduce "
-        "NKIGroupedChunkLoad=grouped_chunk_load "
+        "NKIGroupedChunkBroadcast=grouped_chunk_broadcast NKIGroupedChunkLoad=grouped_chunk_load "
         "NKIGroupedCountsCopy=grouped_counts_copy NKIGroupedCountsTranspose=grouped_counts_transpose "
         "NKIGroupedCrossMatmul=grouped_cross_matmul NKIGroupedDMATranspose=grouped_dma_transpose "
         "NKIGroupedGather=grouped_gather NKIGroupedInt32Cast=grouped_int32_cast "
@@ -29,27 +31,33 @@ _OP_MODULES: dict[str, str] = {
         "NKIGroupedVectorActivation=grouped_vector_activation NKIGroupedVectorBinary=grouped_vector_binary "
         "NKIGroupedVectorBroadcast=grouped_vector_broadcast NKIGroupedVectorStore=grouped_vector_store "
         "NKIIndexIota=index_iota "
-        "NKIHBMFreeSlice=hbm_free_slice NKIHBMRowSlice=hbm_row_slice "
-        "NKIHBMScalarRowSlice=hbm_scalar_row_slice NKIIota=iota "
+        "NKIHBMColumnGather=hbm_column_gather NKIHBMFreeSlice=hbm_free_slice NKIHBMRowSlice=hbm_row_slice "
+        "NKIHBMScalarRowSlice=hbm_scalar_row_slice NKIHBMScalarRowStore=hbm_scalar_row_store NKIIota=iota "
         "NKIInplaceMatchReplace8=inplace_match_replace8 NKIInplaceMax8=inplace_max8 "
         "NKIInplaceTensorCopy=inplace_tensor_copy NKIInt32Cast=int32_cast NKILoad=load "
         "NKIMatmul=matmul NKIMatmulBroadcast=matmul_broadcast "
         "NKIMatchReplace8=match_replace8 NKIMax8=max8 NKINCGather=nc_gather "
         "NKINonzeroWithCount=nonzero_with_count NKISemanticBF16Cast=semantic_bfloat16_cast NKIStore=store "
         "NKIRangeSelect=range_select NKIRangeSelectReduce=range_select_reduce NKIReciprocal=reciprocal "
+        "NKIReinterpretFloat32=reinterpret_float32 NKIReinterpretUInt32=reinterpret_uint32 "
+        "NKIRegisterLoad=register_load NKIReshapeStore=reshape_store "
         "NKIRowLoad=row_load NKIRowMemset=row_memset "
         "NKIScalarTensorTensor=scalar_tensor_tensor "
         "NKISendRecv=sendrecv "
-        "NKIStreamShuffleBroadcast=stream_shuffle_broadcast "
+        "NKIStreamShuffleBroadcast=stream_shuffle_broadcast NKIStridedCopy=strided_copy "
+        "NKIStridedTensorCopy=strided_tensor_copy "
         "NKITensorCopy=tensor_copy NKITileBroadcast=tile_broadcast "
+        "NKITensorCopyPredicated=tensor_copy_predicated NKIUInt16Cast=uint16_cast NKIUInt16Iota=uint16_iota "
+        "NKIUInt32Cast=uint32_cast NKIUInt32Tensor=uint32_tensor "
         "NKITiledGroupedMatmul=tiled_grouped_matmul NKITiledSumMatmul=tiled_sum_matmul "
         "NKITiledTensorReduce=tiled_tensor_reduce NKITransposeBroadcast=transpose_broadcast "
         "NKITranspose=transpose "
         "NKITensorReduce=tensor_reduce "
         "NKITensorScalar=tensor_scalar NKITensorScalarReduce=tensor_scalar_reduce "
+        "NKITensorScalarSequence=tensor_scalar_sequence "
         "NKITensorScalarCumulative=tensor_scalar_cumulative NKITensorSlice=tensor_slice "
         "NKITensorTensor=tensor_tensor NKITensorTensorScan=tensor_tensor_scan"
     ).split()
 }
 
-__all__ = ["NKIOp", "nkigym_kernel"]
+__all__ = ["NKIOp", "nkigym_kernel", "nkigym_repeat"]

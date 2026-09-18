@@ -1,5 +1,17 @@
 Read `.agents/rules/learnings.md` before project work.
 
+## Benchmark and Kernel Records
+
+`benchmark/` is a frozen snapshot of the NAKB targets, reference computations,
+input contracts, accuracy specifications, and baseline latencies. It must not
+depend on `nkigym` or `kernel_library`. Do not modify the benchmark or its checksum
+in `test/test_repository_structure.py` during backend development. A benchmark
+revision requires an explicit user request.
+
+Record best NKIGym kernels as replayable transform ladders in
+`kernel_library/_best_nkigym.py`. Keep benchmark data and acceptance criteria out
+of `kernel_library`.
+
 ## Target Paper Abstract
 
 The following abstract states the target contribution and does not represent the current measured results.

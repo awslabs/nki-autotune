@@ -59,17 +59,15 @@ def single_leaf(tree: KernelTree, block_nid: int) -> int | None:
     else:
         result = None
         if block_nid in tree.graph and isinstance(tree.data(block_nid), BlockNode):
-            descendants = tree.descendants(block_nid)
-            leaves = [
-                nid
-                for nid in descendants
-                if isinstance(tree.data(nid), ISANode)
-                and not any(
-                    isinstance(tree.data(ancestor), BlockNode) and ancestor != block_nid
-                    for ancestor in tree.ancestors(nid)
-                    if ancestor in descendants
-                )
-            ]
+            pending = list(tree.children(block_nid))
+            leaves = []
+            while pending:
+                nid = pending.pop()
+                node = tree.data(nid)
+                if isinstance(node, ISANode):
+                    leaves.append(nid)
+                elif not isinstance(node, BlockNode):
+                    pending.extend(tree.children(nid))
             if len(leaves) == 1:
                 result = leaves[0]
         cache[block_nid] = result
@@ -78,18 +76,14 @@ def single_leaf(tree: KernelTree, block_nid: int) -> int | None:
 
 def owning_block(tree: KernelTree, leaf_nid: int) -> int:
     """Return the nearest block that owns ``leaf_nid``."""
-    result: int | None = None
-    for ancestor in reversed(tree.ancestors(leaf_nid)):
-        if isinstance(tree.data(ancestor), BlockNode):
-            result = ancestor
-            break
+    result = next((nid for nid in reversed(tree.ancestors(leaf_nid)) if isinstance(tree.data(nid), BlockNode)), None)
     if result is None:
         raise ValueError(f"ISA leaf {leaf_nid} has no owning block")
     return result
 
 
 def is_canonical_block(ir: KernelIR, block_nid: int) -> bool:
-    """Return whether ``block_nid`` exactly matches canonical construction."""
+    """Match canonical geometry using the selected block's bound loop names."""
     context = _canonical_context(ir)
     result = context.canonical_blocks.get(block_nid)
     if result is None:
@@ -97,13 +91,14 @@ def is_canonical_block(ir: KernelIR, block_nid: int) -> bool:
         leaf_nid = single_leaf(ir.tree, block_nid)
         if leaf_nid is not None:
             leaf = ir.tree.isa(leaf_nid)
+            block = ir.tree.block(block_nid)
+            bindings = zip(block.iter_vars, block.iter_values, strict=True)
+            loop_names = {variable.axis: value.name for variable, value in bindings if isinstance(value, Var)}
             operand_names = {slot: region.tensor for slot, region in leaf.operand_bindings.items()}
-            spec = canonical_spec(
-                ir, leaf.op_cls, operand_names, ir.tree.block(block_nid).axis_map, leaf.kwargs, context
-            )
+            spec = canonical_spec(ir, leaf.op_cls, operand_names, block.axis_map, leaf.kwargs, context, loop_names)
             chain = block_chain(ir.tree, block_nid)
             if spec is not None and chain is not None:
-                block = replace(ir.tree.block(block_nid), alloc_buffers=())
+                block = replace(block, alloc_buffers=())
                 result = (block, *chain[1:]) == (spec.block, *spec.loops, spec.leaf)
         context.canonical_blocks[block_nid] = result
     return result
@@ -138,10 +133,9 @@ def axis_extents(ir: KernelIR) -> dict[str, int]:
     for block_nid in ir.tree.blocks():
         for iter_var in ir.tree.block(block_nid).iter_vars:
             extent = iter_var.dom[1] - iter_var.dom[0]
-            prior = extents.get(iter_var.axis)
-            if prior is not None and prior != extent:
+            prior = extents.setdefault(iter_var.axis, extent)
+            if prior != extent:
                 raise ValueError(f"axis {iter_var.axis} has conflicting extents {prior} and {extent}")
-            extents[iter_var.axis] = extent
     return extents
 
 
@@ -152,8 +146,10 @@ def canonical_spec(
     axis_map: dict[str, str],
     kwargs: dict[str, Any],
     context: _CanonicalContext | None = None,
+    loop_names: dict[str, str] | None = None,
+    tile_template: ISANode | None = None,
 ) -> CanonicalSpec | None:
-    """Build canonical payloads for one operation."""
+    """Build operation payloads, optionally bounded by an existing tile geometry."""
     resolved = context if context is not None else _canonical_context(ir)
     extents = resolved.extents
     buffers = resolved.buffers
@@ -165,11 +161,18 @@ def canonical_spec(
         for abstract in axes[: len(buffers[operand_names[slot]].shape)]
     )
     tiles: dict[str, int] = {}
+    widths = {
+        axis: width.value
+        for slot, region in (() if tile_template is None else tile_template.operand_bindings.items())
+        for axis, (_, width) in zip(op_cls.OPERAND_AXES[slot], region.ranges)
+        if isinstance(width, Const)
+    }
     if valid:
         for abstract, concrete in axis_map.items():
             extent = extents[concrete]
             minimum = min(op_cls.MIN_TILE_SIZE.get(abstract, 1), extent)
             upper = extent if (maximum := op_cls.MAX_TILE_SIZE.get(abstract)) is None else min(extent, maximum)
+            upper = min(upper, widths.get(abstract, upper))
             tile = next((candidate for candidate in range(upper, minimum - 1, -1) if extent % candidate == 0), None)
             if tile is None:
                 valid = False
@@ -185,7 +188,7 @@ def canonical_spec(
         for abstract, concrete in axis_map.items():
             extent = extents[concrete]
             trip = extent // tiles[abstract]
-            loop_var = f"i_{concrete}_0"
+            loop_var = (loop_names or {}).get(concrete, f"i_{concrete}_0")
             loop_vars[abstract] = loop_var
             iter_vars.append(
                 IterVar(axis=concrete, dom=(0, extent), role=op_cls.AXIS_ROLES.get(abstract, AxisRole.PARALLEL))
@@ -195,15 +198,7 @@ def canonical_spec(
                 loops.append(ForNode(loop_var=loop_var, extent=trip))
 
         bindings = {
-            slot: _canonical_region(
-                tensor=operand_names[slot],
-                axes=axes,
-                axis_map=axis_map,
-                loop_vars=loop_vars,
-                tiles=tiles,
-                extents=extents,
-                buffers=buffers,
-            )
+            slot: _canonical_region(operand_names[slot], axes, axis_map, loop_vars, tiles, extents, buffers)
             for slot, axes in op_cls.OPERAND_AXES.items()
             if slot in operand_names
         }
@@ -277,10 +272,10 @@ def replace_buffer(ir: KernelIR, replacement: Buffer) -> None:
     found = 0
     for block_nid in ir.tree.blocks():
         block = ir.tree.block(block_nid)
+        found += sum(buffer.name == replacement.name for buffer in block.alloc_buffers)
         updated = tuple(replacement if buffer.name == replacement.name else buffer for buffer in block.alloc_buffers)
         if updated != block.alloc_buffers:
             ir.tree.graph.nodes[block_nid]["data"] = replace(block, alloc_buffers=updated)
-            found += 1
     if found != 1:
         raise AssertionError(f"expected one declaration of {replacement.name!r}, found {found}")
 
@@ -311,31 +306,33 @@ def fresh_name(ir: KernelIR, stem: str) -> str:
 
 
 def replace_input_binding(ir: KernelIR, leaf_nid: int, operand: str, tensor: str) -> None:
-    """Rebind one input operand and its owning block read region."""
+    """Rebind one input, converting partition tile indices when the source is HBM."""
     leaf = ir.tree.isa(leaf_nid)
     if operand not in leaf.op_cls.INPUT_OPERANDS or operand not in leaf.operand_bindings:
         raise ValueError(f"{leaf.op_cls.__name__}.{operand} is not a bound input operand")
     old_region = leaf.operand_bindings[operand]
     new_region = replace(old_region, tensor=tensor)
+    old_buffer = ir.buffer(old_region.tensor)
+    if old_buffer.location != "shared_hbm" and ir.buffer(tensor).location == "shared_hbm":
+        lower, width = old_region.ranges[0]
+        scale = old_buffer.partition_extent()
+        offset = (
+            Const(value=lower.value * scale) if isinstance(lower, Const) else Mul(left=lower, right=Const(value=scale))
+        )
+        new_region = replace(new_region, ranges=((offset, width), *new_region.ranges[1:]))
     bindings = dict(leaf.operand_bindings)
     bindings[operand] = new_region
     ir.tree.graph.nodes[leaf_nid]["data"] = replace(leaf, operand_bindings=bindings)
 
     block_nid = owning_block(ir.tree, leaf_nid)
     block = ir.tree.block(block_nid)
-    replaced = False
-    reads: list[BufferRegion] = []
-    for region in block.reads:
-        if region == old_region and not replaced:
-            reads.append(new_region)
-            replaced = True
-        else:
-            reads.append(region)
-    if not replaced:
+    if old_region not in block.reads:
         raise AssertionError(
             f"expected a {old_region.tensor} read in block {block_nid} for {leaf.op_cls.__name__}.{operand}"
         )
-    ir.tree.graph.nodes[block_nid]["data"] = replace(block, reads=tuple(reads))
+    index = block.reads.index(old_region)
+    reads = (*block.reads[:index], new_region, *block.reads[index + 1 :])
+    ir.tree.graph.nodes[block_nid]["data"] = replace(block, reads=reads)
 
 
 def finalize_rewrite(ir: KernelIR) -> None:
@@ -346,7 +343,6 @@ def finalize_rewrite(ir: KernelIR) -> None:
 
 
 def _canonical_region(
-    *,
     tensor: str,
     axes: tuple[str, ...],
     axis_map: dict[str, str],
@@ -358,7 +354,7 @@ def _canonical_region(
     """Build one canonical operand region."""
     ranges: list[tuple[Const | Var | Mul, Const]] = []
     buffer = buffers[tensor]
-    present_axes = tuple(axis for axis in axes if axis in axis_map)
+    present_axes = tuple(axis for axis in axes[: len(buffer.shape)] if axis in axis_map)
     for axis_index, abstract in enumerate(present_axes):
         concrete = axis_map[abstract]
         tile = tiles[abstract]

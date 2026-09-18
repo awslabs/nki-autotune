@@ -5,9 +5,15 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import ml_dtypes
 import numpy as np
 
 InputSpecs = dict[str, tuple[tuple[int, ...], str]]
+
+
+def _physical_numpy_dtype(name: str) -> np.dtype:
+    """Resolve one NKI physical dtype to its NumPy representation."""
+    return np.dtype(np.float32 if name == "tfloat32" else getattr(ml_dtypes, name, name))
 
 
 @dataclass(frozen=True)

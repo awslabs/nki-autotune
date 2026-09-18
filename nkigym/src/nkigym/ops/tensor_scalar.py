@@ -11,6 +11,7 @@ from typing import Any, ClassVar, Protocol, TypeVar, cast
 
 import numpy as np
 
+from nkigym.codegen.torch_arithmetic import TorchArithmetic
 from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
 
 VE_PARTITION_MAX = 128
@@ -24,7 +25,10 @@ _OPS: dict[str, Any] = {
     "maximum": np.maximum,
     "divide": np.divide,
     "greater_equal": lambda left, right: np.greater_equal(left, right).astype(np.float32),
+    "greater": lambda left, right: np.greater(left, right).astype(np.float32),
+    "equal": lambda left, right: np.equal(left, right).astype(np.float32),
     "less": lambda left, right: np.less(left, right).astype(np.float32),
+    "less_equal": lambda left, right: np.less_equal(left, right).astype(np.float32),
 }
 
 
@@ -81,6 +85,7 @@ class NKITensorScalar(NKIOp):
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+    INPLACE_OPERANDS: ClassVar[dict[str, frozenset[str]]] = {"dst": frozenset({"data"})}
 
     @classmethod
     def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> PointwiseContract:
@@ -113,3 +118,21 @@ class NKITensorScalar(NKIOp):
         )
         operands = (broadcast, data) if kwargs.get("reverse0", False) else (data, broadcast)
         return _OPS[kwargs["op0"]](*operands)
+
+
+def emit_scan_stop(
+    emit: TorchArithmetic, values: str, positions: str, bounds: tuple[str, str], pivot: str, reverse: bool
+) -> str:
+    """Mark interval elements where a NaN-first comparator scan must stop."""
+    low, high = bounds
+    inside = emit.binary("multiply", emit.scalar("greater_equal", positions, low), emit.scalar("less", positions, high))
+    finite, pivot_finite = emit.binary("equal", values, values), emit.binary("equal", pivot, pivot)
+    ordinary = emit.scalar("less" if reverse else "greater", values, pivot)
+    missing = emit.scalar(
+        "multiply",
+        finite if reverse else emit.scalar("subtract", finite, 1.0, True),
+        emit.scalar("subtract", pivot_finite, 1.0, True) if reverse else pivot_finite,
+    )
+    return emit.binary(
+        "multiply", inside, emit.scalar("subtract", emit.binary("maximum", ordinary, missing), 1.0, True)
+    )

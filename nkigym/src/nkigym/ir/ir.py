@@ -2,10 +2,10 @@
 
 :class:`KernelIR` is the single envelope. It carries the kernel
 signature, return-tensor identity, schedule tree, and producer-consumer
-dependency graph. Per-buffer and per-axis information is derived from
-the tree on demand via :meth:`KernelIR.all_buffers` and
-:meth:`KernelIR.axis_extent` — caching them on the envelope leads to
-invalidation churn when transforms move buffers between blocks.
+dependency graph. :meth:`KernelIR.all_buffers` uses the dependency
+sidecar's validated declarations for its owning tree, and scans a
+rewrite's tree until its sidecar is rebuilt. :meth:`KernelIR.axis_extent`
+derives axis information from the current tree.
 
 :func:`build_initial_ir` runs dim unification, tree construction, and
 dependency graph construction, then flattens the analysis output onto
@@ -47,17 +47,10 @@ class KernelIR:
     dependency: Dependency
     param_buffers: dict[str, Buffer] = field(default_factory=dict)
 
-    def __getstate__(self) -> bytes:
-        """Return one cached serialization payload for parallel read-only analysis."""
-        payload = self.__dict__.get("_pickle_cache")
-        if not isinstance(payload, bytes):
-            state = {key: value for key, value in self.__dict__.items() if key != "_pickle_cache"}
-            self.__dict__["_pickle_cache"] = payload = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
-        return payload
-
-    def __setstate__(self, payload: bytes) -> None:
-        """Restore one cached serialization payload."""
-        self.__dict__.update(pickle.loads(payload), _pickle_cache=payload)
+    def __setstate__(self, payload: bytes | dict[str, object]) -> None:
+        """Restore ordinary state dictionaries and legacy serialized snapshots."""
+        self.__dict__.update(pickle.loads(payload) if isinstance(payload, bytes) else payload)
+        self.__dict__.pop("_pickle_cache", None)
 
     @property
     def return_name(self) -> str:
@@ -67,20 +60,16 @@ class KernelIR:
         return self.return_names[0]
 
     def all_buffers(self) -> dict[str, Buffer]:
-        """Walk every :class:`BlockNode` in pre-order; return ``name -> Buffer`` including parameters."""
-        out: dict[str, Buffer] = dict(self.param_buffers)
-        for nid in self.tree.blocks():
-            for buf in self.tree.block(nid).alloc_buffers:
-                if buf.name in out:
-                    raise ValueError(f"buffer {buf.name!r} declared by two blocks")
-                out[buf.name] = buf
-        return out
+        """Return parameters and the current tree's validated declaration snapshot."""
+        buffers = getattr(self.dependency, "_buffers", None) if self.dependency._tree is self.tree else None
+        buffers = self.dependency._buffer_map(self.tree) if buffers is None else buffers
+        if self.param_buffers.keys() & buffers.keys():
+            raise ValueError("a parameter buffer is also declared in block.alloc_buffers")
+        return self.param_buffers | buffers
 
     def buffer(self, name: str) -> Buffer:
         """Resolve a buffer by name; raises :class:`KeyError` if absent."""
-        if name not in (buffers := self.all_buffers()):
-            raise KeyError(f"buffer {name!r} not found in any block.alloc_buffers")
-        return buffers[name]
+        return self.all_buffers()[name]
 
     def axis_extent(self, axis: str) -> int:
         """Return the extent of the iter_var named ``axis``.

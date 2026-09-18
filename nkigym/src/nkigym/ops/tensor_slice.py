@@ -1,10 +1,11 @@
 """Copy a fixed free-axis slice with ``nisa.tensor_copy``."""
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import NKIOp, SliceContract, _operand_role
 
 
 class NKITensorSlice(NKIOp):
@@ -19,6 +20,11 @@ class NKITensorSlice(NKIOp):
     INPUT_SLICES: ClassVar[dict[str, tuple[tuple[int, str, str], ...]]] = {"src": ((1, "start", "width"),)}
     CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"start", "width"})
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> SliceContract:
+        """Describe the exact interval copied from the source."""
+        return SliceContract("src", "dst", 1, int(kwargs["start"]), int(kwargs["width"]))
 
     def _check_roles(self, **kwargs: Any) -> None:
         """Require an on-chip source and a valid contiguous slice."""

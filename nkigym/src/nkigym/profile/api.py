@@ -1,40 +1,29 @@
 """One-call SSH profiling for a standalone NKI kernel."""
 
-from __future__ import annotations
-
 import json
 import math
 import shutil
 from pathlib import Path
 from typing import cast
 
-import ml_dtypes
 import numpy as np
 
 from nkigym.profile.protocol import parse_result, request_payload
 from nkigym.profile.ssh import SSHTransportError, profile_over_ssh
-from nkigym.profile.types import InputSpecs, ProfileConfig, ProfileMetrics, ProfileResult
+from nkigym.profile.types import InputSpecs, ProfileConfig, ProfileMetrics, ProfileResult, _physical_numpy_dtype
 
 
-def _resolve_dtype(name: str) -> np.dtype:
-    """Resolve one NumPy or ml_dtypes dtype name."""
-    try:
-        dtype = np.dtype(name)
-    except TypeError:
-        dtype = np.dtype(getattr(ml_dtypes, name))
-    return dtype
-
-
-def _validate_exact_inputs(input_specs: InputSpecs, inputs: dict[str, np.ndarray]) -> None:
-    """Require exact names, shapes, and dtypes for one hardware execution."""
+def _adapt_exact_inputs(input_specs: InputSpecs, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Validate logical exact inputs and cast them to the generated physical ABI."""
     if set(inputs) != set(input_specs):
         raise ValueError("exact inputs must match input_specs")
+    adapted: dict[str, np.ndarray] = {}
     for name, (shape, dtype_name) in input_specs.items():
         value = inputs[name]
         if not isinstance(value, np.ndarray) or value.shape != shape:
             raise ValueError(f"input {name!r} must be an ndarray with shape {shape}")
-        if value.dtype != _resolve_dtype(dtype_name):
-            raise ValueError(f"input {name!r} has dtype {value.dtype}, expected {dtype_name}")
+        adapted[name] = value.astype(_physical_numpy_dtype(dtype_name), copy=False)
+    return adapted
 
 
 def _read_execution_outputs(directory: Path) -> tuple[np.ndarray, ...]:
@@ -50,14 +39,15 @@ def _read_execution_outputs(directory: Path) -> tuple[np.ndarray, ...]:
         if not isinstance(metadata, dict):
             raise ValueError("SSH execution output metadata must be objects")
         shape = tuple(cast(list[int], metadata["shape"]))
-        dtype = _resolve_dtype(cast(str, metadata["dtype"]))
+        dtype = _physical_numpy_dtype(dtype_name := cast(str, metadata["dtype"]))
         path = directory / cast(str, metadata["file"])
         if not path.is_file():
             raise RuntimeError(f"SSH execution returned no {path}")
         expected_bytes = int(np.prod(shape)) * dtype.itemsize
         if path.stat().st_size != expected_bytes:
             raise RuntimeError(f"output {path.name!r} has {path.stat().st_size} bytes, expected {expected_bytes}")
-        outputs.append(np.fromfile(path, dtype=dtype).reshape(shape))
+        output = np.fromfile(path, dtype=dtype).reshape(shape)
+        outputs.append(output.astype(np.float32, copy=False) if "float" in dtype_name else output)
     if not outputs:
         raise RuntimeError("SSH execution returned no output tensors")
     return tuple(outputs)
@@ -79,7 +69,7 @@ def profile_metrics(
     if not kernel.strip() or not func_name.isidentifier():
         raise ValueError("kernel source and function name must be valid")
     if inputs is not None:
-        _validate_exact_inputs(input_specs, inputs)
+        inputs = _adapt_exact_inputs(input_specs, inputs)
     config = ProfileConfig(input_specs=input_specs, neuronx_cc_args=neuronx_cc_args, lnc=lnc, confirmation=confirmation)
     output_dir = Path(cache_dir).expanduser().resolve()
     shutil.rmtree(output_dir, ignore_errors=True)
@@ -88,8 +78,7 @@ def profile_metrics(
     kernel_path = input_path / "kernel.py" if inputs is not None else input_path
     kernel_path.write_text(kernel, encoding="utf-8")
     if inputs is not None:
-        inputs_dir = input_path / "inputs"
-        inputs_dir.mkdir()
+        (inputs_dir := input_path / "inputs").mkdir()
         for index, name in enumerate(input_specs):
             inputs[name].tofile(inputs_dir / f"input_{index:03d}.bin")
     request_path = input_path / "request.json" if inputs is not None else output_dir / "request.json"
@@ -98,18 +87,11 @@ def profile_metrics(
         profile_over_ssh(host, input_path, request_path, output_dir, timeout_s)
     except SSHTransportError as error:
         raise RuntimeError(f"SSH profile failed for {host}: {error}\n{error.log[-3000:]}") from error
-    result, compiler_log = _read_profile_result(output_dir)
-    return _metrics(result, compiler_log, () if inputs is None else _read_execution_outputs(output_dir))
-
-
-def _read_profile_result(directory: Path) -> tuple[ProfileResult, str]:
-    """Read one worker result and its compiler log."""
-    result_path = directory / "result.json"
-    if not result_path.is_file():
-        raise RuntimeError(f"SSH profile returned no {result_path}")
-    compiler_log_path = directory / "log-neuron-cc.txt"
+    result = parse_result(json.loads((output_dir / "result.json").read_text(encoding="utf-8")))
+    compiler_log_path = output_dir / "log-neuron-cc.txt"
     compiler_log = compiler_log_path.read_text(encoding="utf-8") if compiler_log_path.is_file() else ""
-    return parse_result(json.loads(result_path.read_text(encoding="utf-8"))), compiler_log
+    outputs = () if inputs is None or result.error is not None else _read_execution_outputs(output_dir)
+    return _metrics(result, compiler_log, outputs)
 
 
 def _metrics(result: ProfileResult, compiler_log: str, outputs: tuple[np.ndarray, ...] = ()) -> ProfileMetrics:

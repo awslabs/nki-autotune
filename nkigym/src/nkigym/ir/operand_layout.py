@@ -28,10 +28,10 @@ class CanonicalTileError(ValueError):
 def canonical_tile_size(rec: _OpRecord, abstract: str, analysis: _AnalysisResult) -> int:
     """Return the widest legal divisor for one canonical operation axis."""
     extent = analysis.dim_sizes[rec.axis_map[abstract]]
-    minimum = min(rec.op_cls.MIN_TILE_SIZE.get(abstract, 1), extent)
-    maximum = rec.op_cls.MAX_TILE_SIZE.get(abstract)
-    upper = extent if maximum is None else min(extent, maximum)
-    tile = next((candidate for candidate in range(upper, minimum - 1, -1) if extent % candidate == 0), None)
+    upper = extent if (maximum := rec.op_cls.MAX_TILE_SIZE.get(abstract)) is None else min(extent, maximum)
+    minimum = min(rec.op_cls.MIN_TILE_SIZE.get(abstract, 1), extent, upper)
+    step = 128 if rec.op_cls.NAME == "nc_matmul" and abstract == "N" and upper >= 128 else 1
+    tile = next(filter(lambda value: extent % value == 0, range(upper - upper % step, minimum - 1, -step)), None)
     if tile is None:
         raise CanonicalTileError(
             f"{rec.op_cls.__name__}.{abstract} extent {extent} has no canonical tile between {minimum} and {upper}",

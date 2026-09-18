@@ -1,7 +1,5 @@
 """Fixed command-line worker installed once on an SSH Trn2 host."""
 
-from __future__ import annotations
-
 import argparse
 import json
 import shutil

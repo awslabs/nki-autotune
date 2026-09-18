@@ -25,8 +25,8 @@ _ACT_FNS: dict[str, Any] = {
     "tanh": np.tanh,
     "rsqrt": lambda x: 1.0 / np.sqrt(x),
     "sqrt": np.sqrt,
-    "erf": lambda x: np.frompyfunc(erf, 1, 1)(x).astype(np.float32),
-    "gelu": lambda x: 0.5 * x * (1.0 + np.frompyfunc(erf, 1, 1)(x / sqrt(2.0)).astype(np.float32)),
+    "erf": lambda x: np.asarray(np.frompyfunc(erf, 1, 1)(x), dtype=np.float32),
+    "gelu": lambda x: 0.5 * x * (1.0 + np.asarray(np.frompyfunc(erf, 1, 1)(x / sqrt(2.0)), dtype=np.float32)),
     "log": np.log,
     "gelu_apprx_tanh": lambda x: 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * np.power(x, 3)))),
     "gelu_apprx_sigmoid": lambda x: x / (1.0 + np.exp(-1.702 * x)),
@@ -61,6 +61,7 @@ class NKIActivation(NKIOp):
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+    INPLACE_OPERANDS: ClassVar[dict[str, frozenset[str]]] = {"dst": frozenset({"data"})}
 
     @classmethod
     def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> PointwiseContract:

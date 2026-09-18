@@ -14,6 +14,7 @@ def rebind_unchanged_dependency(dependency: Dependency, tree: KernelTree) -> Dep
     """Attach an unchanged dependency sidecar to an equivalent cloned tree."""
     result = copy.copy(dependency)
     result._tree = tree
+    result._buffers = result._buffer_map(tree)
     return result
 
 
@@ -35,6 +36,7 @@ def rebind_exact_retile(dependency: Dependency, tree: KernelTree, block_nid: int
     result = copy.copy(dependency)
     result._tree = tree
     result.graph = _clone_dependency_graph(dependency.graph)
+    result._topology_valid = False
     first_leaf = next(iter(dependency.graph.nodes), None)
     buffers = {} if first_leaf is None else dependency.info(first_leaf).buffers
     leaf_nid = dependency._leaf_of_block[block_nid]
@@ -46,5 +48,4 @@ def rebind_exact_retile(dependency: Dependency, tree: KernelTree, block_nid: int
     leaves = tuple(nid for nid in tree.preorder() if nid in dependency.graph)
     if leaves != tuple(dependency.blocks):
         raise AssertionError("exact retile changed ISA leaf execution order")
-    result._topology_valid = False
     return result

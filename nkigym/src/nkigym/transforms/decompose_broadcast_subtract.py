@@ -5,8 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import to_affine
-from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
+from nkigym.ir.tree import BlockNode, BufferRegion, ISANode
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.base import PointwiseContract
 from nkigym.ops.tensor_scalar import NKITensorScalar
@@ -138,16 +137,15 @@ def _has_internal_producer(ir: KernelIR, block_nid: int, tensor: str) -> bool:
 
 
 def _rewrite(ir: KernelIR, match: _Match) -> None:
-    """Insert the negation and retarget the subtraction as addition."""
+    """Replace one instruction by local negation and addition in the same loops."""
     source_buffer = ir.buffer(match.broadcast.tensor)
     negative_name = fresh_name(ir, f"{match.broadcast.tensor}_negative")
     append_root_buffers(ir, (replace(source_buffer, name=negative_name),))
     negative_region = replace(match.broadcast, tensor=negative_name)
     negation_block = _append_negation_block(ir, match, negative_region)
-    parent = ir.tree.parent(match.block_nid)
+    parent = ir.tree.parent(match.leaf_nid)
     if parent is None:
-        raise AssertionError(f"pointwise block {match.block_nid} has no parent")
-    _replace_in_parent_children(ir.tree, parent, [match.block_nid], [negation_block, match.block_nid])
+        raise AssertionError(f"pointwise instruction {match.leaf_nid} has no parent")
 
     leaf = ir.tree.isa(match.leaf_nid)
     bindings = dict(leaf.operand_bindings)
@@ -158,12 +156,14 @@ def _rewrite(ir: KernelIR, match: _Match) -> None:
 
     block = ir.tree.block(match.block_nid)
     reads = tuple(negative_region if region == match.broadcast else region for region in block.reads)
-    ir.tree.graph.nodes[match.block_nid]["data"] = replace(block, reads=reads)
+    addition_block = ir.tree.add_node(replace(block, reads=reads, alloc_buffers=()))
+    _replace_in_parent_children(ir.tree, parent, [match.leaf_nid], [negation_block, addition_block])
+    ir.tree.graph.add_edge(addition_block, match.leaf_nid)
     finalize_rewrite(ir)
 
 
 def _append_negation_block(ir: KernelIR, match: _Match, negative_region: BufferRegion) -> int:
-    """Append a negation with the pointwise block's exact partition scope."""
+    """Build a negation referring to the pointwise instruction's enclosing loops."""
     pointwise = ir.tree.block(match.block_nid)
     partition_bindings = [
         (iter_var, iter_value)
@@ -175,14 +175,6 @@ def _append_negation_block(ir: KernelIR, match: _Match, negative_region: BufferR
             f"pointwise block {match.block_nid} must bind partition axis {match.partition_axis!r} exactly once"
         )
     partition_iter_var, partition_iter_value = partition_bindings[0]
-    bound_names = {name for name in to_affine(partition_iter_value) if name is not None}
-    ancestors = ir.tree.ancestors(match.leaf_nid)
-    block_index = ancestors.index(match.block_nid)
-    local_loops = tuple(
-        node
-        for nid in ancestors[block_index + 1 :]
-        if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var in bound_names
-    )
     block = BlockNode(
         iter_vars=(partition_iter_var,),
         iter_values=(partition_iter_value,),
@@ -192,16 +184,13 @@ def _append_negation_block(ir: KernelIR, match: _Match, negative_region: BufferR
         axis_map={"P": match.partition_axis},
     )
     block_nid = ir.tree.add_node(block)
-    parent_nid = block_nid
-    for loop in local_loops:
-        parent_nid = ir.tree.add_node(loop, parent=parent_nid)
     ir.tree.add_node(
         ISANode(
             op_cls=NKIActivation,
             operand_bindings={"data": match.broadcast, "dst": negative_region},
             kwargs={"op": "copy", "scale": -1.0},
         ),
-        parent=parent_nid,
+        parent=block_nid,
     )
     return block_nid
 

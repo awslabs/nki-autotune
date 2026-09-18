@@ -7,7 +7,7 @@ from fractions import Fraction
 from functools import cache
 from math import gcd, isqrt, prod
 
-from nkigym.ir import KernelIR
+from nkigym.ir import Dependency, KernelIR
 from nkigym.ir.arith.analyzer import Analyzer
 from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var, to_affine
 from nkigym.ir.dependency_rebind import rebind_exact_retile
@@ -63,10 +63,6 @@ class Split(Transform[SplitOption]):
             if isinstance(data, (ForNode, ISANode)) and subtree_has_access_patterns(ir.tree, nid):
                 continue
             if isinstance(data, ForNode):
-                if _encloses_multiple_blocks(ir.tree, nid):
-                    """Outer-trip Split of a shared (post-CodeMotion) loop is illegal — see
-                    _reject_if_shared_loop; do not offer it as a candidate action."""
-                    continue
                 for factors in _factorizations(data.extent):
                     options.append(SplitOption(target_nid=nid, factors=factors, target_axis=None))
             elif isinstance(data, ISANode):
@@ -77,7 +73,7 @@ class Split(Transform[SplitOption]):
                     if (
                         sum(axis == concrete for axis in block.axis_map.values()) != 1
                         or _is_static_axis(data, block, concrete)
-                        or _is_slot_reduction_axis(ir, nid, concrete)
+                        or _is_reduction_axis(ir, nid, concrete)
                     ):
                         continue
                     """Tile width currently bound on the leaf (max_tile or full extent)."""
@@ -101,7 +97,11 @@ class Split(Transform[SplitOption]):
             self._do_outer_trip(new_ir, option)
         else:
             self._do_tensorize(new_ir, option)
-        new_ir.dependency = rebind_exact_retile(ir.dependency, new_ir.tree, block_nid)
+        new_ir.dependency = (
+            Dependency(new_ir.tree)
+            if option.target_axis is None and _encloses_multiple_blocks(ir.tree, option.target_nid)
+            else rebind_exact_retile(ir.dependency, new_ir.tree, block_nid)
+        )
         return new_ir
 
     def _check_legality(self, ir: KernelIR, option: SplitOption) -> None:
@@ -125,7 +125,6 @@ class Split(Transform[SplitOption]):
                 raise TransformLegalityError(
                     f"Split.factors {option.factors} do not exactly tile ForNode.extent {target.extent}"
                 )
-            _reject_if_shared_loop(ir.tree, option.target_nid)
         else:
             if not isinstance(target, ISANode):
                 raise TransformLegalityError(
@@ -134,8 +133,8 @@ class Split(Transform[SplitOption]):
             _block_nid, block = _find_enclosing_block(ir.tree, option.target_nid)
             if _is_static_axis(target, block, option.target_axis):
                 raise TransformLegalityError("Split cannot partition a fixed or statically sliced instruction axis")
-            if _is_slot_reduction_axis(ir, option.target_nid, option.target_axis):
-                raise TransformLegalityError("Split cannot partition a slot reduction; use RFactor")
+            if _is_reduction_axis(ir, option.target_nid, option.target_axis):
+                raise TransformLegalityError("Split cannot partition a reduction axis; use RFactor when supported")
             if not any(iv.axis == option.target_axis for iv in block.iter_vars):
                 raise TransformLegalityError(
                     f"Split.target_axis={option.target_axis!r} not declared by enclosing block"
@@ -382,38 +381,8 @@ def _blocks_under_loop(tree: KernelTree, loop_nid: int) -> set[int]:
 
 
 def _encloses_multiple_blocks(tree: KernelTree, loop_nid: int) -> bool:
-    """True when ``loop_nid`` encloses ISA leaves owned by more than one block.
-
-    Such a loop was made shared by a prior ``CodeMotion`` co-location; an
-    outer-trip Split of it is unsafe (see :func:`_reject_if_shared_loop`).
-    """
+    """Return whether one loop encloses ISA leaves owned by multiple blocks."""
     return len(_blocks_under_loop(tree, loop_nid) - {_enclosing_block_of(tree, loop_nid)}) > 0
-
-
-def _reject_if_shared_loop(tree: KernelTree, loop_nid: int) -> None:
-    """Reject an outer-trip Split of a loop shared across more than one block.
-
-    ``_do_outer_trip`` rewrites only the target loop's *enclosing* BlockNode
-    (``normalize_block`` recomputes that block's bindings from the new loop
-    chain). A loop that a prior ``CodeMotion`` made shared — i.e. one enclosing
-    ISA leaves of a nested sub-block as well as the enclosing block's own leaf —
-    would have only the enclosing block rewritten, leaving the nested block's
-    ``iter_value`` referencing the old single loop var while its sibling now
-    indexes the composed split affine. The two then address one buffer
-    inconsistently (sim out-of-bounds / wrong accumulation).
-
-    Splitting a dim is orthogonal to co-locating producers: do the Split on the
-    private per-op loop *before* the ``CodeMotion`` that shares it. This guard
-    keeps the broken ordering a loud rejection rather than a wrong kernel.
-    """
-    if _encloses_multiple_blocks(tree, loop_nid):
-        enclosing_block = _enclosing_block_of(tree, loop_nid)
-        extra = sorted(_blocks_under_loop(tree, loop_nid) - {enclosing_block})
-        raise TransformLegalityError(
-            f"Split target loop {loop_nid} is shared across multiple blocks "
-            f"(encloses leaves of nested block(s) {extra} besides its enclosing "
-            f"block {enclosing_block}); split the per-op loop before CodeMotion co-locates them"
-        )
 
 
 def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
@@ -425,11 +394,11 @@ def _find_enclosing_block(tree: KernelTree, nid: int) -> tuple[int, BlockNode]:
     raise TransformLegalityError(f"no enclosing BlockNode for nid {nid}")
 
 
-def _is_slot_reduction_axis(ir: KernelIR, leaf_nid: int, target_axis: str) -> bool:
-    """Return whether ``target_axis`` is a slot recipe's reduction axis."""
+def _is_reduction_axis(ir: KernelIR, leaf_nid: int, target_axis: str) -> bool:
+    """Return whether ``target_axis`` is the leaf's declared reduction axis."""
     result = False
     leaf = ir.tree.data(leaf_nid)
-    if isinstance(leaf, ISANode) and leaf.op_cls.RFACTOR_RECIPE == "slot":
+    if isinstance(leaf, ISANode):
         _block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
         contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
         if isinstance(contract, ReductionContract):
@@ -531,17 +500,16 @@ def _is_static_axis(leaf: ISANode, block: BlockNode, concrete_axis: str) -> bool
         for slot, specs in getattr(leaf.op_cls, "INPUT_SLICES", {}).items()
         for index, _start, _width, *_alignment in specs
     )
-    return (
-        abstract in leaf.op_cls.FIXED_AXIS_SIZES or abstract in getattr(leaf.op_cls, "NON_TILABLE_AXES", ()) or sliced
-    )
+    fixed = abstract in leaf.op_cls.FIXED_AXIS_SIZES and abstract not in getattr(leaf.op_cls, "TILABLE_FIXED_AXES", ())
+    return fixed or abstract in getattr(leaf.op_cls, "NON_TILABLE_AXES", ()) or sliced
 
 
 def _min_tile_floor(leaf: ISANode, block: BlockNode, concrete_axis: str) -> int | None:
     """Minimum legal innermost tile for ``concrete_axis``, or ``None`` if unconstrained.
 
     Translates the block iter_var dim (e.g. ``d1``) to the abstract op-axis
-    (e.g. ``M``) via ``block.axis_map`` and reads the op's
-    ``MIN_TILE_SIZE``. Dimensions whose complete domain is already smaller
+    (e.g. ``M``) via ``block.axis_map`` and reads its tensorization minimum,
+    falling back to ``MIN_TILE_SIZE``. Dimensions whose complete domain is smaller
     than that canonical minimum may still split when their operand layouts
     permit it.
     """
@@ -549,7 +517,7 @@ def _min_tile_floor(leaf: ISANode, block: BlockNode, concrete_axis: str) -> int 
     abstract = inverse.get(concrete_axis)
     floor: int | None = None
     if abstract is not None:
-        floor = leaf.op_cls.MIN_TILE_SIZE.get(abstract)
+        floor = leaf.op_cls.TENSORIZE_MIN_TILE_SIZE.get(abstract, leaf.op_cls.MIN_TILE_SIZE.get(abstract))
         extent = next(iv.dom[1] - iv.dom[0] for iv in block.iter_vars if iv.axis == concrete_axis)
         if floor is not None and extent < floor:
             floor = 1

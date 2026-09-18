@@ -74,7 +74,15 @@ class SetFirstWriteOverwrite(Transform[SetFirstWriteOverwriteOption]):
             tensor=option.tensor,
             initializer_leaf_nid=option.initializer_leaf_nid,
         )
-        return EliminateIdentityInitializer()._resolve(ir, candidate, explicit=False, overlap_nodes=overlap_nodes)
+        match = EliminateIdentityInitializer()._resolve(ir, candidate, explicit=False, overlap_nodes=overlap_nodes)
+        if match is not None:
+            reduction = ir.tree.isa(match.reduction_leaf_nid)
+            updated = reduction.op_cls.with_first_write_overwrite(
+                match.output_operand, reduction.kwargs, match.reduction_axis
+            )
+            if updated == reduction.kwargs:
+                match = None
+        return match
 
     def _rewrite(self, ir: KernelIR, match: _InitializerMatch) -> None:
         """Mark one reduction axis for dynamic first-write lowering."""

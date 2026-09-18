@@ -5,7 +5,7 @@ from __future__ import annotations
 import operator
 from collections.abc import Callable
 from types import FunctionType, SimpleNamespace
-from typing import cast
+from typing import NoReturn, cast
 
 import numpy as np
 import torch
@@ -13,7 +13,6 @@ from torch.fx import GraphModule, Node
 
 from nkigym.ops.folded_load import grouped_context_input
 from nkigym.ops.folded_store import grouped_context_attention_graph
-from nkigym.ops.grouped_store import rotational_topk_config
 from nkigym.ops.grouped_tensor_copy import grouped_attention
 
 InputSpecs = dict[str, tuple[tuple[int, ...], str]]
@@ -86,14 +85,26 @@ def trace_function(function: FunctionType) -> FunctionType:
     return result
 
 
-def cross_entropy_backward(logits: torch.Tensor, targets: torch.Tensor, **_kwargs: object) -> torch.Tensor:
-    """Mark an analytical cross-entropy gradient in a synthetic FX graph."""
-    raise RuntimeError("cross_entropy_backward is a trace-only marker")
+def _trace_marker(name: str) -> Callable[..., NoReturn]:
+    """Create a named graph target that rejects direct execution."""
+
+    def marker(*_args: object, **_kwargs: object) -> NoReturn:
+        """Reject execution of a graph-only operation."""
+        raise RuntimeError(f"{name} is a trace-only marker")
+
+    marker.__name__ = marker.__qualname__ = name
+    return marker
 
 
-def nonzero_compact(data: torch.Tensor, columns: int, tokens: int) -> torch.Tensor:
-    """Mark stable nonzero compaction in a synthetic FX graph."""
-    raise RuntimeError("nonzero_compact is a trace-only marker")
+cross_entropy_backward = _trace_marker("cross_entropy_backward")
+nonzero_compact = _trace_marker("nonzero_compact")
+routed_gather = _trace_marker("routed_gather")
+packed_attention = _trace_marker("packed_attention")
+stable_softmax = _trace_marker("stable_softmax")
+astype = _trace_marker("astype")
+sparse_topk_affinity = _trace_marker("sparse_topk_affinity")
+sorted_prefix = _trace_marker("sorted_prefix")
+moe_experts = _trace_marker("moe_experts")
 
 
 def block_diagonal(array: np.ndarray, shape: tuple[int, ...], transpose: bool) -> np.ndarray:
@@ -181,32 +192,11 @@ def convolution_columns(array: np.ndarray, transform: tuple[object, ...], shape:
     return pad_array(columns, shape, frozenset({0}))
 
 
-def normalize_topk_output(
-    values: np.ndarray, indices: np.ndarray, sort_output: bool, source: np.ndarray | None
-) -> tuple[np.ndarray, np.ndarray]:
-    """Match native top-eight ordering and duplicate-index behavior."""
+def normalize_topk_output(values: np.ndarray, indices: np.ndarray, sort_output: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Order unsorted result pairs while retaining the reference's selected indices."""
     if sort_output:
-        order = np.argsort(-values, axis=-1)
+        order = np.argsort(-values, axis=-1, kind="stable")
         values, indices = (np.take_along_axis(array, order, axis=-1) for array in (values, indices))
-    indices = indices.copy()
-    flat_values = values.reshape(-1, 1 if values.ndim == 1 else values.shape[-1])
-    flat_indices = indices.reshape(flat_values.shape)
-    working = None if source is None else source.reshape(flat_values.shape[0], -1).astype(np.float32).copy()
-    for start in range(0, values.shape[-1], 8):
-        chunk = flat_values[:, start : start + 8]
-        if working is None:
-            first = np.argmax(chunk[:, :, None] == chunk[:, None, :], axis=-2)
-            flat_indices[:, start : start + 8] = np.take_along_axis(flat_indices[:, start : start + 8], first, axis=-1)
-            continue
-        for row, row_values in enumerate(chunk):
-            before = working[row].copy()
-            for offset, value in enumerate(row_values):
-                matches = np.flatnonzero(before == value)
-                flat_indices[row, start + offset] = matches[0] if matches.size else 0
-            for value in row_values:
-                matches = np.flatnonzero(working[row] == value)
-                if matches.size:
-                    working[row, matches[0]] = -np.inf
     return values, indices
 
 
@@ -267,62 +257,10 @@ def token_attention_input(
     return result.reshape(shape)
 
 
-def routed_gather(data: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    """Mark one routed-token row gather in a synthetic FX graph."""
-    raise RuntimeError("routed_gather is a trace-only marker")
-
-
-def packed_attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor
-) -> torch.Tensor:
-    """Mark sequence-packed attention in a synthetic FX graph."""
-    raise RuntimeError("packed_attention is a trace-only marker")
-
-
-def stable_softmax(data: torch.Tensor) -> torch.Tensor:
-    """Mark stable last-axis softmax in a synthetic FX graph."""
-    raise RuntimeError("stable_softmax is a trace-only marker")
-
-
-def astype(data: torch.Tensor, dtype: str) -> torch.Tensor:
-    """Mark one physical dtype conversion in a synthetic FX graph."""
-    raise RuntimeError("astype is a trace-only marker")
-
-
-def sparse_topk_affinity(
-    logits: torch.Tensor, values: torch.Tensor, indices: torch.Tensor, activation: str, normalize: bool
-) -> torch.Tensor:
-    """Mark sparse router affinities in a synthetic FX graph."""
-    raise RuntimeError("sparse_topk_affinity is a trace-only marker")
-
-
-def topk(data: torch.Tensor, k: int, **_kwargs: object) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mark structured top-k over a packed input."""
-    raise RuntimeError("topk is a trace-only marker")
-
-
-def moe_experts(
-    hidden: torch.Tensor,
-    gate_up_weights: torch.Tensor,
-    down_weights: torch.Tensor,
-    affinities: torch.Tensor,
-    indices: torch.Tensor,
-    experts: int,
-    intermediate: int,
-) -> torch.Tensor:
-    """Mark tiled selected-expert MLP evaluation in a synthetic FX graph."""
-    raise RuntimeError("moe_experts is a trace-only marker")
-
-
-def moe_gate_up_input(array: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
-    """Flatten each expert weight matrix into one contiguous HBM row."""
-    return array.reshape(shape)
-
-
 def direct_hbm_placeholder(node: Node) -> bool:
     """Return whether one routed placeholder is consumed directly from HBM."""
     if str(node.target) == "expert_down_weights" or (
-        node.users and all(user.target is torch.cumsum for user in node.users)
+        node.users and all(user.target in {torch.cumsum, torch.topk} for user in node.users)
     ):
         return True
     for user in node.users:
@@ -440,25 +378,6 @@ def special_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | Non
     """Build a static graph for wide top-k or token-generation MoE."""
     target, bound = getattr(f_torch, "function", f_torch), getattr(f_torch, "bound_kwargs", {})
     name = getattr(target, "__name__", "")
-    if name == "topk_torch_ref":
-        rows, width = input_specs["inp"][0]
-        k, sorted_output = int(bound["topk_k"]), bool(bound["topk_sorted"])
-        config = rotational_topk_config(rows, width, k) if sorted_output else None
-        if config is not None:
-            stages, stage_width, local_k = config[2:]
-            transform, shape = ("rotational_topk", *config), (rows, stages * (stage_width + stages * local_k))
-            kwargs = {"k": k, "rotational_config": config}
-        elif width > 16384:
-            if rows != 1 or width % 16 or not sorted_output:
-                raise ValueError("wide top-k requires one divisible sorted input row")
-            transform, shape, kwargs = ("wide_topk",), (16, width // 16), {"k": k, "wide_width": width}
-        else:
-            return None
-        graph, inputs, call = synthetic_graph(input_specs)
-        data = call(operator.getitem, (inputs["inp"], transform), shape)
-        selected = graph.call_function(topk, (data,), kwargs)
-        graph.output([call(operator.getitem, (selected, index), (rows, k)) for index in range(2)])
-        return GraphModule(torch.nn.Module(), graph)
     if name != "moe_block_tkg_torch_ref":
         return None
     expected = (
@@ -484,14 +403,15 @@ def special_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | Non
     ):
         raise ValueError("Torch MoE synthesis requires aligned gate/up and down-projection weights")
     matrix, row = (1, hidden_width), (1, 1)
-    hidden = call(torch.reshape, (inputs["inp"], matrix), matrix)
+    hidden = call(torch.reshape, (call(astype, (inputs["inp"], "float32"), input_specs["inp"][0]), matrix), matrix)
+    gamma = call(astype, (inputs["gamma"], "float32"), input_specs["gamma"][0])
     squared = call(torch.square, (hidden,), matrix)
     mean = call(torch.mean, (squared,), row, dim=-1, keepdim=True)
     rms = call(torch.sqrt, (call(operator.add, (mean, float(bound["eps"])), row),), row)
     normalized = call(operator.mul, (hidden, call(torch.reciprocal, (rms,), row)), matrix)
-    normalized = call(operator.mul, (normalized, inputs["gamma"]), matrix)
+    normalized = call(operator.mul, (normalized, gamma), matrix)
     logits = call(operator.matmul, (normalized, inputs["router_weights"]), (1, experts))
-    selected = graph.call_function(torch.topk, (logits,), {"k": 8, "dim": -1, "largest": True, "sorted": True})
+    selected = graph.call_function(sorted_prefix, (logits,), {"k": 8, "dim": -1, "largest": True, "sorted": True})
     values = call(operator.getitem, (selected, 0), (1, 8))
     indices = call(operator.getitem, (selected, 1), (1, 8))
     affinities = call(stable_softmax, (values,), (1, 8))
@@ -501,26 +421,3 @@ def special_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | Non
     output = call(moe_experts, (normalized, gate_up, down, affinities, indices, experts, intermediate), matrix)
     graph.output([output, logits])
     return GraphModule(torch.nn.Module(), graph)
-
-
-__all__ = [
-    "OUTPUT_LAYOUTS",
-    "attention_graph",
-    "block_diagonal",
-    "direct_hbm_placeholder",
-    "grouped_context_attention_graph",
-    "grouped_context_input",
-    "moe_gate_up_input",
-    "moe_experts",
-    "normalize_topk_output",
-    "packed_attention",
-    "routed_graph",
-    "routed_gather",
-    "routed_input",
-    "sparse_topk_affinity",
-    "special_graph",
-    "stable_softmax",
-    "synthetic_graph",
-    "token_attention_graph",
-    "token_attention_input",
-]

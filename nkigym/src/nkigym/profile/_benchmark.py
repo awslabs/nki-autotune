@@ -1,7 +1,5 @@
 """Neuron Explorer execution used only by the installed Trn2 worker."""
 
-from __future__ import annotations
-
 import json
 import os
 import statistics
@@ -100,24 +98,24 @@ def _confirmation_capture(summaries: tuple[dict[str, object], ...]) -> dict[str,
     return result
 
 
-def _capture(neff_path: Path, ntff_path: Path, executions: int, environment: dict[str, str], stage: str) -> None:
-    """Capture a fixed number of executions into one trace session."""
-    values = neff_path, executions, ntff_path
-    flags = "--neff", "--num-exec", "--session-file"
-    _run(stage, ["neuron-explorer", "capture", *(f"{flag}={value}" for flag, value in zip(flags, values))], environment)
+def _capture(
+    neff_path: Path, ntff_path: Path, executions: int, environment: dict[str, str], input_args: list[str]
+) -> None:
+    """Capture repeated executions using the same serialized input set."""
+    args = [f"--neff={neff_path}", f"--num-exec={executions}", f"--session-file={ntff_path}", *input_args]
+    _run(f"Neuron Explorer {ntff_path.stem}", ["neuron-explorer", "capture", *args], environment)
 
 
 def benchmark_kernel(
-    neff_path: Path, artifacts_dir: Path, lnc: int, visible_core: int, confirmation: bool
+    neff_path: Path, artifacts_dir: Path, lnc: int, visible_core: int, confirmation: bool, input_args: list[str]
 ) -> dict[str, object]:
     """Capture repeated NEFF executions and return their robust summary."""
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
     environment = _environment(lnc, visible_core)
-    _capture(neff_path, artifacts_dir / "warmup.ntff", 20, environment, "Neuron Explorer warmup")
+    _capture(neff_path, artifacts_dir / "warmup.ntff", 20, environment, input_args)
     captures, execution_count = (3, 20) if confirmation else (5, 1)
     capture_paths = tuple(artifacts_dir / f"profile_capture_{index}.ntff" for index in range(captures))
     for path in capture_paths:
-        _capture(neff_path, path, execution_count, environment, "Neuron Explorer capture")
+        _capture(neff_path, path, execution_count, environment, input_args)
     ntff_paths = tuple(path for capture in capture_paths for path in _execution_paths(capture, execution_count))
     with ThreadPoolExecutor(max_workers=8) as executor:
         summaries = tuple(executor.map(lambda path: _summary(neff_path, path, environment), ntff_paths))
