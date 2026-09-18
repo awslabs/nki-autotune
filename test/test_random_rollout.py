@@ -14,20 +14,18 @@ import os
 import random
 import time
 from collections.abc import Iterator
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from math import ceil
-from threading import Event
-from types import TracebackType
-from typing import Any, cast
+from multiprocessing.synchronize import Event
 
 import pytest
 
-from kernel_library import NAKB_WORKLOADS, Workload
+from benchmark import NAKB_WORKLOADS, Workload, accuracy_validation
 from nkigym.codegen import render
 from nkigym.ir import KernelIR, build_initial_ir
 from nkigym.profile import FP32SimulationCase, batch_simulate_fp32
 from nkigym.synthesis import SynthesizedKernel, synthesize_torch_to_nkigym
-from nkigym.transforms import Transform, TransformOption, public_transforms
+from nkigym.transforms import public_transforms
 
 ROLLOUT_STEPS = 500
 TRANSFORMS_PER_SIMULATION = 50
@@ -42,77 +40,19 @@ ROLLOUT_WORKLOADS: dict[str, Workload] = {
 }
 pytestmark = pytest.mark.timeout(TEST_TIMEOUT_SECONDS)
 
-_AnalysisResult = tuple[int, tuple[TransformOption, ...]]
-_SimulationKey = tuple[float, float, bool]
 _SimulationWorkload = tuple[str, list[FP32SimulationCase]]
-_CANCEL_ROLLOUTS = Event()
+_ROLLOUT_CONTEXT = multiprocessing.get_context("spawn")
+_CANCEL_ROLLOUTS = _ROLLOUT_CONTEXT.Event()
 
 
-def _analyzer_ready() -> None:
-    """Provide a picklable task used to start analyzer workers eagerly."""
+def _initialize_rollout_worker(cancel: Event) -> None:
+    """Share the controller's cancellation event with each fresh worker."""
+    global _CANCEL_ROLLOUTS
+    _CANCEL_ROLLOUTS = cancel
 
 
-def _analyze_transform(state: KernelIR, index: int, transform: Transform[Any]) -> _AnalysisResult:
-    """Return one transform's legal options with its registry index."""
-    options = cast(tuple[TransformOption, ...], tuple(transform.analyze(state)))
-    return index, options
-
-
-class _ParallelLegalityAnalyzer:
-    """Keep one affinity-sized process pool across concurrent rollout states."""
-
-    def __init__(self, transforms: list[Transform[Any]]) -> None:
-        """Detect usable local CPUs and derive rollout concurrency."""
-        if not transforms:
-            raise ValueError("parallel legality analysis requires at least one transform")
-        self.transforms = transforms
-        cpu_count = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
-        self.max_workers = cpu_count
-        self.concurrent_rollouts = ceil(cpu_count / len(transforms))
-        self._executor: ProcessPoolExecutor | None = None
-
-    def __enter__(self) -> _ParallelLegalityAnalyzer:
-        """Start the persistent analyzer process pool."""
-        self._executor = ProcessPoolExecutor(
-            max_workers=self.max_workers, mp_context=multiprocessing.get_context("fork")
-        )
-        ready = [self._executor.submit(_analyzer_ready) for _worker in range(self.max_workers)]
-        for future in ready:
-            future.result()
-        return self
-
-    def __exit__(
-        self,
-        exception_type: type[BaseException] | None,
-        exception: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        """Stop every analyzer process."""
-        if self._executor is None:
-            raise RuntimeError("parallel legality analyzer was not started")
-        cancelled = _CANCEL_ROLLOUTS.is_set()
-        self._executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
-        self._executor = None
-
-    def legal_actions(self, state: KernelIR) -> list[tuple[Transform[Any], TransformOption]]:
-        """Return ordered legal actions after parallel transform analysis."""
-        if self._executor is None:
-            raise RuntimeError("parallel legality analyzer must be used as a context manager")
-        futures = [
-            self._executor.submit(_analyze_transform, state, index, transform)
-            for index, transform in enumerate(self.transforms)
-        ]
-        options_by_index = dict(future.result() for future in futures)
-        actions = [
-            (transform, option) for index, transform in enumerate(self.transforms) for option in options_by_index[index]
-        ]
-        return actions
-
-
-def _rollout(
-    name: str, kernel: SynthesizedKernel, seed: int, analyzer: _ParallelLegalityAnalyzer
-) -> Iterator[tuple[str, KernelIR]]:
-    """Yield one seeded rollout with parallel transform legality analysis."""
+def _rollout(name: str, kernel: SynthesizedKernel, seed: int, deadline: float) -> Iterator[tuple[str, KernelIR]]:
+    """Keep one seeded rollout and all of its transform analysis in one process."""
     rng = random.Random(seed)
     prefix = f"{name} seed {seed}"
     state = build_initial_ir(kernel.function, kernel.input_specs)
@@ -120,7 +60,9 @@ def _rollout(
     for step in range(1, ROLLOUT_STEPS + 1):
         if _CANCEL_ROLLOUTS.is_set():
             raise RuntimeError(f"{prefix} was cancelled")
-        actions = analyzer.legal_actions(state)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{prefix} exceeded the shared rollout deadline")
+        actions = [(transform, option) for transform in TRANSFORMS for option in transform.analyze(state)]
         if not actions:
             raise AssertionError(f"{prefix} terminated after {step - 1} steps")
         action = rng.choice(actions)
@@ -129,7 +71,7 @@ def _rollout(
         yield (label, state)
 
 
-def _generate_rollout_cases(name: str, seed: int, analyzer: _ParallelLegalityAnalyzer) -> list[FP32SimulationCase]:
+def _generate_rollout_cases(name: str, seed: int, deadline: float) -> list[FP32SimulationCase]:
     """Render every fiftieth state from one complete rollout."""
     workload = ROLLOUT_WORKLOADS[name]
     kernel = synthesize_torch_to_nkigym(workload["torch_ref"], workload["input_specs"])
@@ -142,9 +84,14 @@ def _generate_rollout_cases(name: str, seed: int, analyzer: _ParallelLegalityAna
     print(f"{name} simulation_interval={TRANSFORMS_PER_SIMULATION}", flush=True)
     cases = [
         FP32SimulationCase(
-            label=label, kernel=render(state), func_name=generated_name, inputs=inputs, expected=expected
+            label=label,
+            kernel=render(state),
+            func_name=generated_name,
+            inputs=inputs,
+            expected=expected,
+            validation=accuracy_validation(workload),
         )
-        for step, (label, state) in enumerate(_rollout(name, kernel, seed, analyzer))
+        for step, (label, state) in enumerate(_rollout(name, kernel, seed, deadline))
         if step > 0 and step % TRANSFORMS_PER_SIMULATION == 0
     ]
     return cases
@@ -154,24 +101,24 @@ def _simulate_groups(
     cpu_hosts: tuple[str, ...], generated: dict[str, list[FP32SimulationCase]], deadline: float
 ) -> dict[str, int | Exception]:
     """Simulate compatible workload groups across the available CPU hosts."""
-    groups: dict[_SimulationKey, list[_SimulationWorkload]] = {}
+    groups: dict[bool, list[_SimulationWorkload]] = {}
     for name, cases in generated.items():
-        workload = ROLLOUT_WORKLOADS[name]
+        if any(case.validation is None for case in cases):
+            raise ValueError(f"{name}: rollout cases must carry their copied NAKB validation criteria")
         input_bytes = sum(value.nbytes for value in cases[0].inputs.values())
-        key = (workload["atol"], workload["rtol"], input_bytes > LARGE_INPUT_BYTES)
-        groups.setdefault(key, []).append((name, cases))
+        groups.setdefault(input_bytes > LARGE_INPUT_BYTES, []).append((name, cases))
     results: dict[str, int | Exception] = {}
-    for (atol, rtol, large_inputs), workloads in groups.items():
+    for large_inputs, workloads in groups.items():
         cases = [case for _name, workload_cases in workloads for case in workload_cases]
         hosts = [cpu_hosts[0]] if large_inputs else list(cpu_hosts)
         timeout_s = max(1, ceil(deadline - time.monotonic()))
         print(
             f"validating {len(cases)} cases from {len(workloads)} workloads across {len(hosts)} hosts "
-            f"with atol={atol:g}, rtol={rtol:g}, input_bytes_over_1_gib={str(large_inputs).lower()}",
+            f"using per-case NAKB criteria, input_bytes_over_1_gib={str(large_inputs).lower()}",
             flush=True,
         )
         try:
-            completed = batch_simulate_fp32(hosts=hosts, cases=cases, atol=atol, rtol=rtol, timeout_s=timeout_s)
+            completed = batch_simulate_fp32(hosts=hosts, cases=cases, atol=0.0, rtol=0.0, timeout_s=timeout_s)
             if completed != len(cases):
                 raise RuntimeError(f"simulation completed {completed} of {len(cases)} cases")
             for name, workload_cases in workloads:
@@ -184,40 +131,42 @@ def _simulate_groups(
 
 @pytest.fixture(scope="module")
 def rollout_results(cpu_hosts: tuple[str, ...]) -> dict[str, int | Exception]:
-    """Generate workloads concurrently, then simulate compatible global batches."""
+    """Run complete rollouts in parallel processes, then simulate global batches."""
     _CANCEL_ROLLOUTS.clear()
     deadline = time.monotonic() + TEST_TIMEOUT_SECONDS
     results: dict[str, int | Exception] = {}
     generated: dict[str, list[FP32SimulationCase]] = {}
-    with _ParallelLegalityAnalyzer(TRANSFORMS) as analyzer:
-        rollout_workers = min(len(ROLLOUT_WORKLOADS), analyzer.concurrent_rollouts)
-        print(f"legality_analyzer_workers={analyzer.max_workers}", flush=True)
-        print(f"concurrent_rollouts={rollout_workers}", flush=True)
-        print(f"simulation_hosts={','.join(cpu_hosts)}", flush=True)
-        rollout_executor = ThreadPoolExecutor(max_workers=rollout_workers)
-        try:
-            futures: dict[Future[list[FP32SimulationCase]], str] = {}
-            for name in ROLLOUT_WORKLOADS:
-                seed = random.SystemRandom().randrange(1 << 63)
-                print(f"{name} seed {seed}", flush=True)
-                futures[rollout_executor.submit(_generate_rollout_cases, name, seed, analyzer)] = name
-            for future in as_completed(futures):
-                name = futures.pop(future)
-                try:
-                    cases = future.result()
-                    if len(cases) != SIMULATIONS_PER_ROLLOUT:
-                        raise AssertionError(
-                            f"{name}: generated {len(cases)} cases, expected {SIMULATIONS_PER_ROLLOUT}"
-                        )
-                    generated[name] = cases
-                except Exception as error:
-                    results[name] = error
-        except BaseException:
-            _CANCEL_ROLLOUTS.set()
-            raise
-        finally:
-            cancelled = _CANCEL_ROLLOUTS.is_set()
-            rollout_executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
+    cpu_count = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1
+    rollout_workers = min(len(ROLLOUT_WORKLOADS), cpu_count)
+    print(f"concurrent_rollouts={rollout_workers}", flush=True)
+    print(f"simulation_hosts={','.join(cpu_hosts)}", flush=True)
+    rollout_executor = ProcessPoolExecutor(
+        max_workers=rollout_workers,
+        mp_context=_ROLLOUT_CONTEXT,
+        initializer=_initialize_rollout_worker,
+        initargs=(_CANCEL_ROLLOUTS,),
+    )
+    try:
+        futures: dict[Future[list[FP32SimulationCase]], str] = {}
+        for name in ROLLOUT_WORKLOADS:
+            seed = random.SystemRandom().randrange(1 << 63)
+            print(f"{name} seed {seed}", flush=True)
+            futures[rollout_executor.submit(_generate_rollout_cases, name, seed, deadline)] = name
+        for future in as_completed(futures, timeout=max(1, deadline - time.monotonic())):
+            name = futures.pop(future)
+            try:
+                cases = future.result()
+                if len(cases) != SIMULATIONS_PER_ROLLOUT:
+                    raise AssertionError(f"{name}: generated {len(cases)} cases, expected {SIMULATIONS_PER_ROLLOUT}")
+                generated[name] = cases
+            except Exception as error:
+                results[name] = error
+    except BaseException:
+        _CANCEL_ROLLOUTS.set()
+        raise
+    finally:
+        cancelled = _CANCEL_ROLLOUTS.is_set()
+        rollout_executor.shutdown(wait=not cancelled, cancel_futures=cancelled)
     results.update(_simulate_groups(cpu_hosts, generated, deadline))
     return results
 

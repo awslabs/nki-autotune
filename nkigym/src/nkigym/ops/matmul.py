@@ -9,7 +9,10 @@ from typing import Any, ClassVar, Literal
 
 import numpy as np
 
+from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import AxisRole, BilinearReductionContract, NKIOp, ReduceCombinator, _operand_role
+from nkigym.ops.reciprocal import align_matmul, matmul_target
+from nkigym.ops.tensor_copy import emit_matmul_drain
 
 
 class NKIMatmul(NKIOp):
@@ -32,6 +35,7 @@ class NKIMatmul(NKIOp):
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"K": AxisRole.ACCUMULATION}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"K": 128, "M": 128, "N": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"K": 128, "M": 128, "N": 512}
+    TENSORIZE_MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"N": 1}
     OUTPUT_ROLE: ClassVar[str] = "psum"
     OUTPUT_LOCATION: ClassVar[str] = "psum"
     OUTPUT_STORAGE_DTYPE: ClassVar[str | None] = "float32"
@@ -75,3 +79,22 @@ class NKIMatmul(NKIOp):
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: allocate and return ``stationary.T @ moving`` at fp32."""
         return kwargs["stationary"].astype(np.float32).T @ kwargs["moving"].astype(np.float32)
+
+
+def emit_product(
+    stationary: TorchValue,
+    moving: TorchValue,
+    target_name: str,
+    body: list[str],
+    imports: set[str],
+    native_name: str = "",
+) -> TorchValue:
+    """Emit the applicable vector or Tensor Engine product and its output drain."""
+    shape = (stationary.shape[0], moving.shape[1])
+    stationary, moving = align_matmul(stationary, moving, body, imports)
+    target, fp32 = matmul_target(target_name, shape, stationary, moving)
+    psum = "psum_" + target_name.removeprefix("sbuf_")
+    imports.add("NKIMatmul")
+    kwargs = f"name={native_name!r}" if native_name else ""
+    body.append(f"{psum} = NKIMatmul({kwargs})(stationary={stationary.name}, moving={moving.name})")
+    return emit_matmul_drain(psum, target, fp32, body, imports)

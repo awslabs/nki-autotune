@@ -58,9 +58,9 @@ class Dependency:
         self._leaf_of_block: dict[int, int] = {}
         self._owner_block: dict[int, int] = {}
         self._tree = tree
-        self._build(tree)
         self._order, self._ancestors, self._descendants = ordered_tree_topology(tree.graph, tree.root)
         self._topology_valid = True
+        self._build(tree)
         self._reachability = DAGReachability(self.graph)
 
     def _reachable(self, nid: int, backward: bool) -> frozenset[int]:
@@ -96,103 +96,71 @@ class Dependency:
         return self._reachability.precedes(self._resolve(producer), self._resolve(consumer))
 
     def first_backward_edge_for_insertion(
-        self, moved_leaf_nid: int, target_loop_nid: int, index: int, topology: _Topology | None = None
+        self,
+        moved_leaf_nid: int,
+        target_loop_nid: int,
+        index: int,
+        topology: _Topology | None = None,
+        moved_root_nid: int | None = None,
     ) -> tuple[int, int] | None:
-        """Pure ordering check for splicing ``moved_leaf_nid`` under
-        ``target_loop_nid`` at child slot ``index`` — no tree mutation.
+        """Return the first frozen dependency violated by a proposed insertion.
 
-        Computes the proposed execution spans in O(edges) without copying or
-        mutating the tree. Directions come from ``self.graph`` (build this
-        ``Dependency`` on the original program); positions come from ``self._tree``
-        with the moved leaf relocated to its effective slot.
-        ``index`` follows the ``_splice_under_target`` convention: ``-1``
-        append, ``-2`` prepend, ``>=0`` explicit slot.
+        Place the moved leaf between original preorder positions, excluding its
+        old child slot when moving among siblings. ``index`` follows the splice
+        convention: -1 appends, -2 prepends, and nonnegative values select a slot.
+        Targets must lie outside the moved subtree.
 
-        The move relocates only the moved block's subtree; every dependency
-        partner keeps its identity, so its position is read from the original
-        tree with two adjustments that the physical splice would induce:
+        A tensor carried across an enclosing loop expands the access span back
+        to that loop. Ancestors precede their leaves, so this changes only the
+        lower endpoint; the upper endpoint remains the instruction position.
+        Evaluate the moved leaf under the target's loop nest and keep every
+        other endpoint under its original nest. Incoming producers must end
+        before the moved span starts, and outgoing consumers must start after
+        it ends. Edge directions always come from the original dependency DAG.
 
-        - **Exclude the moved subtree** from each partner's span. A partner that
-          enclosed the moved block before the move (or the target's children
-          list, when re-moving an already-nested block) must not keep counting
-          the relocated nodes at their old positions.
-        - **Grow enclosing partners** to cover the new slot. Splicing the moved
-          leaf under ``target_loop_nid`` makes it a descendant of the target and
-          of every ancestor loop the target sits in, so a partner that
-          **encloses the insertion point** has its span extended by the moved
-          position. This is the carry-loop case ``K-loop -> drain``: sinking the
-          drain *inside* the K loop must read as backward.
-
-        Span-promotion evaluates the moved leaf's enclosing loops as the
-        TARGET's nest (``target_loop_nid`` + its ForNode ancestors), since the
-        splice makes it their descendant; every other endpoint keeps its own
-        ``self._tree`` ForNode ancestors minus the moved subtree.
-
-        ``topology`` may provide a snapshot already validated by a read-only
-        analysis pass, avoiding repeated graph mutation checks for each slot.
+        ``topology`` may supply the current analysis pass's preorder snapshot.
+        Sibling indices and unchanged dependency bounds are cached on this
+        sidecar; the query does not copy or mutate the program tree.
         """
         order, ancestors, descendants = self._topology() if topology is None else topology
-        owner = self._owner_block.get(moved_leaf_nid, moved_leaf_nid)
-        moved_descendants = descendants[owner]
-        children = [
-            child for child in self._tree.children(target_loop_nid) if child != owner and child not in moved_descendants
-        ]
-        if index == -1:
-            position = len(children)
-        elif index == -2:
-            position = 0
-        elif index >= 0:
-            position = index
-        else:
+        owner = self._owner_block.get(moved_leaf_nid, moved_leaf_nid) if moved_root_nid is None else moved_root_nid
+        if target_loop_nid == owner or target_loop_nid in descendants[owner]:
+            raise ValueError("insertion target must be outside the moved subtree")
+        children, indices = self.child_order(target_loop_nid)
+        removed = indices.get(owner)
+        count = len(children) - (removed is not None)
+        if index < -2:
             raise ValueError(f"unsupported index {index} (use -1 append, -2 prepend, or >=0)")
-        if position <= 0 or not children:
-            anchor = order[target_loop_nid]
-        else:
-            preceding = children[min(position, len(children)) - 1]
+        position = count if index == -1 else 0 if index == -2 else index
+        anchor = order[target_loop_nid]
+        if position > 0 and count:
+            slot = min(position, count) - 1
+            if removed is not None and slot >= removed:
+                slot += 1
+            preceding = children[slot]
             anchor = order[preceding] + len(descendants[preceding])
         moved_position = anchor + 0.5
-        target_loops = tuple(
-            nid for nid in (target_loop_nid, *ancestors[target_loop_nid]) if isinstance(self._tree.data(nid), ForNode)
-        )
-        moved_spans: dict[str, tuple[float, float]] = {}
+        loop_scopes = _LOOP_SCOPES.get(self)
+        if loop_scopes is None:
+            loop_scopes = {
+                nid: tuple(
+                    (parent, node.loop_var)
+                    for parent in (*parents, nid)
+                    if isinstance(node := self._tree.data(parent), ForNode)
+                )
+                for nid, parents in ancestors.items()
+            }
+            _LOOP_SCOPES[self] = loop_scopes
         static_spans = _PROMOTED_SPANS.setdefault(self, {})
 
-        def promoted_moved(tensor: str) -> tuple[float, float]:
-            """Return the moved leaf's span under the proposed target loops."""
-            result = moved_spans.get(tensor)
-            if result is None:
-                lo = hi = moved_position
-                for loop_nid in target_loops:
-                    loop = self._tree.loop(loop_nid)
-                    if _access_invariant_across(
-                        self._tree, moved_leaf_nid, loop.loop_var, tensor
-                    ) and _tensor_carried_across(self._tree, loop_nid, tensor):
-                        loop_position = float(order[loop_nid])
-                        lo = min(lo, loop_position)
-                        hi = max(hi, loop_position)
-                result = (lo, hi)
-                moved_spans[tensor] = result
-            return result
-
-        def promoted_static(nid: int, tensor: str) -> tuple[float, float]:
-            """Return one unchanged endpoint's cached carried-loop span."""
-            key = (nid, tensor)
-            result = static_spans.get(key)
-            if result is None:
-                lo = hi = float(order[nid])
-                for loop_nid in ancestors[nid]:
-                    loop = self._tree.data(loop_nid)
-                    if not isinstance(loop, ForNode):
-                        continue
-                    if _access_invariant_across(self._tree, nid, loop.loop_var, tensor) and _tensor_carried_across(
-                        self._tree, loop_nid, tensor
-                    ):
-                        loop_position = float(order[loop_nid])
-                        lo = min(lo, loop_position)
-                        hi = max(hi, loop_position)
-                result = (lo, hi)
-                static_spans[key] = result
-            return result
+        def lower_span(nid: int, tensor: str, start: float, loops: tuple[tuple[int, str], ...]) -> float:
+            """Expand only the lower endpoint: enclosing loops precede the leaf."""
+            for loop_nid, loop_var in loops:
+                if _access_invariant_across(self._tree, nid, loop_var, tensor) and _tensor_carried_across(
+                    self, loop_nid, tensor
+                ):
+                    start = min(start, float(order[loop_nid]))
+            return start
 
         bounds = _INSERTION_BOUNDS.setdefault(self, {}).get(moved_leaf_nid)
         if bounds is None:
@@ -201,13 +169,16 @@ class Dependency:
             for first, attrs in getattr(self.graph, "_pred")[moved_leaf_nid].items():
                 tensor = attrs.get("tensor")
                 if isinstance(tensor, str):
-                    high = promoted_static(first, tensor)[1]
+                    high = float(order[first])
                     if tensor not in incoming or high > incoming[tensor][0]:
                         incoming[tensor] = (high, first)
             for second, attrs in getattr(self.graph, "_succ")[moved_leaf_nid].items():
                 tensor = attrs.get("tensor")
                 if isinstance(tensor, str):
-                    low = promoted_static(second, tensor)[0]
+                    key = (second, tensor)
+                    if key not in static_spans:
+                        static_spans[key] = lower_span(second, tensor, float(order[second]), loop_scopes[second])
+                    low = static_spans[key]
                     if tensor not in outgoing or low < outgoing[tensor][0]:
                         outgoing[tensor] = (low, second)
             bounds = (
@@ -217,20 +188,32 @@ class Dependency:
             _INSERTION_BOUNDS.setdefault(self, {})[moved_leaf_nid] = bounds
         result: tuple[int, int] | None = None
         for tensor, high, first in bounds[0]:
-            if high >= promoted_moved(tensor)[0]:
+            if high >= lower_span(moved_leaf_nid, tensor, moved_position, loop_scopes[target_loop_nid]):
                 result = (first, moved_leaf_nid)
                 break
         if result is None:
             for tensor, low, second in bounds[1]:
-                if promoted_moved(tensor)[1] >= low:
+                if moved_position >= low:
                     result = (moved_leaf_nid, second)
                     break
+        return result
+
+    def child_order(self, nid: int) -> tuple[tuple[int, ...], dict[int, int]]:
+        """Return cached ordered children and their sibling indices."""
+        cache = _CHILD_ORDER.setdefault(self, {})
+        result = cache.get(nid)
+        if result is None:
+            children = tuple(self._tree.children(nid))
+            result = children, {child: index for index, child in enumerate(children)}
+            cache[nid] = result
         return result
 
     def _topology(self) -> _Topology:
         """Return cached topology or rebuild it when callers mutate the tree."""
         if not self._topology_valid:
             self._order, self._ancestors, self._descendants = ordered_tree_topology(self._tree.graph, self._tree.root)
+            _CHILD_ORDER.pop(self, None)
+            _LOOP_SCOPES.pop(self, None)
             self._topology_valid = True
         return self._order, self._ancestors, self._descendants
 
@@ -251,7 +234,7 @@ class Dependency:
         executes them, not in tree pre-order (which lists an enclosing block
         before the producer block nested within it).
         """
-        buffers = self._buffer_map(tree)
+        buffers = self._buffers = self._buffer_map(tree)
         last_writer: dict[str, int] = {}
         prior_readers: dict[str, list[int]] = {}
         for leaf_nid, block_nid in self._leaves_in_execution_order(tree):
@@ -271,8 +254,7 @@ class Dependency:
             for name in info.reads - info.writes:
                 prior_readers.setdefault(name, []).append(leaf_nid)
 
-    @staticmethod
-    def _leaves_in_execution_order(tree: KernelTree) -> list[tuple[int, int]]:
+    def _leaves_in_execution_order(self, tree: KernelTree) -> list[tuple[int, int]]:
         """Return (leaf_nid, owning_block_nid) pairs in ISA pre-order.
 
         Each ISA leaf is mapped to its nearest enclosing :class:`BlockNode`;
@@ -280,42 +262,42 @@ class Dependency:
         order. A block owning no ISA leaf (the synthetic root, or a pure
         loop-carrier) carries no hazard and never appears here.
         """
-        ordered: list[tuple[int, int]] = []
-        seen: set[int] = set()
-        for leaf in tree.preorder():
-            if not isinstance(tree.data(leaf), ISANode):
-                continue
-            owner = next(a for a in reversed(tree.ancestors(leaf)) if isinstance(tree.data(a), BlockNode))
-            if owner in seen:
-                raise AssertionError(f"block {owner} owns more than one ISA leaf; dependency model requires one")
-            seen.add(owner)
-            ordered.append((leaf, owner))
+        ordered = [
+            (leaf, next(a for a in reversed(self._ancestors[leaf]) if isinstance(tree.data(a), BlockNode)))
+            for leaf in self._order
+            if isinstance(tree.data(leaf), ISANode)
+        ]
+        if len({owner for _leaf, owner in ordered}) != len(ordered):
+            raise AssertionError("dependency blocks must each own exactly one ISA leaf")
         return ordered
 
     @staticmethod
     def _buffer_map(tree: KernelTree) -> dict[str, Buffer]:
         """Collect every Buffer declared anywhere in the tree."""
-        out: dict[str, Buffer] = {}
-        for nid in tree.blocks():
-            blk = tree.data(nid)
-            assert isinstance(blk, BlockNode)
-            for buf in blk.alloc_buffers:
-                out[buf.name] = buf
-        return out
+        declarations = [buffer for nid in tree.blocks() for buffer in tree.block(nid).alloc_buffers]
+        buffers = {buffer.name: buffer for buffer in declarations}
+        if len(buffers) != len(declarations):
+            raise ValueError("a buffer is declared by two blocks")
+        return buffers
 
     def _summarise(self, nid: int, block: BlockNode, tree: KernelTree, buffers: dict[str, Buffer]) -> _BlockInfo:
         """Build _BlockInfo with tensor-name sets, regions, extents, and buffers."""
-        extents: dict[str, int] = {}
-        for d in tree.descendants(nid):
-            dd = tree.data(d)
-            if isinstance(dd, ForNode):
-                extents[dd.loop_var] = dd.extent
-        reads = {r.tensor for r in block.reads}
+        _order, ancestors, descendants = self._topology()
+        extents = {
+            node.loop_var: node.extent for child in descendants[nid] if isinstance(node := tree.data(child), ForNode)
+        }
+        read_regions = tuple(block.reads) + tuple(
+            region
+            for ancestor in ancestors[nid]
+            if isinstance(scope := tree.data(ancestor), BlockNode) and "predicate" in scope.annotations
+            for region in scope.reads
+        )
+        reads = {r.tensor for r in read_regions}
         writes = {w.tensor for w in block.writes}
         return _BlockInfo(
             reads=frozenset(reads),
             writes=frozenset(writes),
-            read_regions=tuple(block.reads),
+            read_regions=read_regions,
             write_regions=tuple(block.writes),
             extents=extents,
             buffers=buffers,
@@ -446,7 +428,7 @@ def _access_invariant_across(tree: KernelTree, leaf_nid: int, loop_var: str, ten
     return invariant
 
 
-def _tensor_carried_across(tree: KernelTree, loop_nid: int, tensor: str) -> bool:
+def _tensor_carried_across(dependency: Dependency, loop_nid: int, tensor: str) -> bool:
     """True iff ``tensor`` is accumulated (live-carried) across ``loop_nid``.
 
     Two conditions. (1) Some ISA leaf inside the loop RMWs ``tensor`` invariantly
@@ -462,17 +444,18 @@ def _tensor_carried_across(tree: KernelTree, loop_nid: int, tensor: str) -> bool
     it re-initializes enclosing loops whose coordinates do not index any leaf
     operand, while the indexed reduction loop remains carried. This is
     role-blind: it reads regions and configured RMW operands, never axis roles.
+    The dependency index limits inspection to leaves that touch this tensor.
     """
-    cache = _CARRIED_TENSORS.setdefault(tree, {})
+    cache = _CARRIED_TENSORS.setdefault(tree := dependency._tree, {})
     key = (loop_nid, tensor)
     carried = cache.get(key)
     if carried is None:
         assert isinstance(loop := tree.data(loop_nid), ForNode), f"_tensor_carried_across: {loop_nid} is not a ForNode"
         has_invariant_rmw = has_enclosed_init = False
-        for nid in tree.descendants(loop_nid):
-            data = tree.data(nid)
-            if not isinstance(data, ISANode):
+        for nid in dependency.touches_by_tensor.get(tensor, ()):
+            if loop_nid not in dependency._topology()[1][nid]:
                 continue
+            data = tree.isa(nid)
             rmw_slots = _rmw_operand_slots(data)
             rmw_regions = _leaf_operand_regions(tree, nid, tensor, rmw_only=True)
             rmw_invariant = bool(rmw_regions) and not any(
@@ -502,7 +485,9 @@ def _tensor_carried_across(tree: KernelTree, loop_nid: int, tensor: str) -> bool
     return carried
 
 
-_PROMOTED_SPANS: WeakKeyDictionary[Dependency, dict[tuple[int, str], tuple[float, float]]] = WeakKeyDictionary()
+_PROMOTED_SPANS: WeakKeyDictionary[Dependency, dict[tuple[int, str], float]] = WeakKeyDictionary()
+_LOOP_SCOPES: WeakKeyDictionary[Dependency, dict[int, tuple[tuple[int, str], ...]]] = WeakKeyDictionary()
+_CHILD_ORDER: WeakKeyDictionary[Dependency, dict[int, tuple[tuple[int, ...], dict[int, int]]]] = WeakKeyDictionary()
 _INSERTION_BOUNDS: WeakKeyDictionary[
     Dependency, dict[int, tuple[tuple[tuple[str, float, int], ...], tuple[tuple[str, float, int], ...]]]
 ] = WeakKeyDictionary()

@@ -67,6 +67,12 @@ def _match(ir: KernelIR, option: TransposeThroughTensorCopyOption) -> tuple[Tran
             else:
                 result = _match_dma_transpose_chain(ir, option.transpose_nid, root_children[index + 1])
                 reverse = result is not None
+    if result is not None and set(ir.tree.isa(result.transpose_leaf).kwargs) - {
+        "name",
+        "no_reorder",
+        "program_ownership",
+    }:
+        result = None
     return result, reverse
 
 
@@ -123,7 +129,7 @@ def _apply_match(ir: KernelIR, match: TransposeChain, reverse: bool) -> None:
     ir.tree.graph.nodes[match.transpose_leaf]["data"] = ISANode(
         op_cls=NKITranspose if reverse else NKIDMATranspose,
         operand_bindings={("data" if reverse else "src"): source_region, "dst": output_region},
-        kwargs={},
+        kwargs=dict(transpose.kwargs),
     )
 
 

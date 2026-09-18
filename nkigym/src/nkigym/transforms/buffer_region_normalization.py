@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import prod
 from weakref import WeakKeyDictionary
 
 from nkigym.ir import KernelIR
@@ -15,9 +16,10 @@ from nkigym.ir.buffer_placement import (
 )
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.graph_index import ordered_tree_topology
+from nkigym.ir.operand_layout import access_pattern_allocation_view
 from nkigym.ir.program_sharding import configured_program_shards, owning_block
-from nkigym.ir.tree import AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
-from nkigym.ops.base import CopyContract
+from nkigym.ir.tree import PARTITION_DIM, AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
+from nkigym.ops.base import BilinearReductionContract, CopyContract, InitializerContract
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 
 _RegionFingerprint = tuple[str, int, int, tuple[tuple[Expr, Expr], ...]]
@@ -26,6 +28,12 @@ _NORMALIZATIONS: WeakKeyDictionary[KernelTree, dict[str, frozenset[_Normalizatio
 _PROGRAM_FRAMES: WeakKeyDictionary[KernelTree, dict[str, _ProgramFrame | None]] = WeakKeyDictionary()
 _AXIS_FOLDS: WeakKeyDictionary[KernelTree, tuple[BufferAxisFoldOption, ...]] = WeakKeyDictionary()
 _PROGRAM_ID = "nl.program_id(0)"
+
+
+def preserve_unaffected_normalizations(source: KernelTree, target: KernelTree, changed: frozenset[str]) -> None:
+    """Transfer per-tensor frame facts after a placement-only rewrite."""
+    if (cached := _NORMALIZATIONS.get(source)) is not None:
+        _NORMALIZATIONS[target] = {name: value for name, value in cached.items() if name not in changed}
 
 
 @dataclass(frozen=True)
@@ -65,13 +73,14 @@ class BufferRegionNormalization(Transform[_BufferNormalizationOption]):
 
     def analyze(self, ir: KernelIR) -> list[_BufferNormalizationOption]:
         """Return one option per buffer axis and allocation-frame anchor."""
-        tensors = frozenset(name for name, buffer in ir.all_buffers().items() if buffer.location in {"sbuf", "psum"})
+        buffers = ir.all_buffers()
+        tensors = frozenset(name for name, buffer in buffers.items() if buffer.location in {"sbuf", "psum"})
         changed = _normalizations_required(ir.tree, tensors)
         options: list[_BufferNormalizationOption] = [
             BufferRegionNormalizationOption(tensor=tensor, axis=axis, anchor_loop_nid=anchor)
             for tensor, axis, anchor in sorted(changed)
             if access_patterns_fit_buffer(
-                ir.tree, tensor, ir.buffer(tensor), {ir.tree.loop(anchor).loop_var: Const(value=0)}
+                ir.tree, tensor, buffers[tensor], {ir.tree.loop(anchor).loop_var: Const(value=0)}, axis=axis
             )
         ]
         options.extend(
@@ -102,7 +111,7 @@ class BufferRegionNormalization(Transform[_BufferNormalizationOption]):
 
 
 def _axis_fold_options(ir: KernelIR) -> tuple[BufferAxisFoldOption, ...]:
-    """Return cached free-axis coordinate folds for copy-produced buffers."""
+    """Return cached free-axis coordinate folds for contract-supported buffers."""
     cached = _AXIS_FOLDS.get(ir.tree)
     if cached is None:
         buffers = {
@@ -114,7 +123,7 @@ def _axis_fold_options(ir: KernelIR) -> tuple[BufferAxisFoldOption, ...]:
             and buffer.list_len == buffer.versions == 1
         }
         regions: dict[str, list[BufferRegion]] = {name: [] for name in buffers}
-        copy_writers: set[str] = set()
+        layout_writers: set[str] = set()
         invalid_writers: set[str] = set()
         patterned: set[str] = set()
         semantic_offsets: set[str] = set()
@@ -131,9 +140,16 @@ def _axis_fold_options(ir: KernelIR) -> tuple[BufferAxisFoldOption, ...]:
                         continue
                     regions[region.tensor].append(region)
                     if slot not in node.op_cls.INPUT_OPERANDS:
-                        if isinstance(contract, CopyContract) and slot == contract.output_operand:
-                            copy_writers.add(region.tensor)
-                        else:
+                        output = getattr(contract, "output_operand", None)
+                        copy_writer = slot == output and isinstance(contract, CopyContract)
+                        partial_bilinear = (
+                            slot == output
+                            and isinstance(contract, BilinearReductionContract)
+                            and buffers[region.tensor].partition_extent() < PARTITION_DIM
+                        )
+                        if copy_writer or partial_bilinear:
+                            layout_writers.add(region.tensor)
+                        elif not (slot == output and isinstance(contract, InitializerContract)):
                             invalid_writers.add(region.tensor)
                     if slot in node.access_patterns:
                         patterned.add(region.tensor)
@@ -152,7 +168,7 @@ def _axis_fold_options(ir: KernelIR) -> tuple[BufferAxisFoldOption, ...]:
                 ir,
                 buffer,
                 tuple(regions[name]),
-                name in copy_writers
+                name in layout_writers
                 and name not in invalid_writers
                 and name not in patterned
                 and name not in semantic_offsets,
@@ -176,7 +192,9 @@ def _foldable_free_tile(ir: KernelIR, buffer: Buffer, regions: tuple[BufferRegio
         width = next(iter(widths))
         aligned = 0 < width < buffer.shape[1] and buffer.shape[1] % width == 0
         aligned = aligned and all(_fold_region_is_aligned(region, buffer, width) for region in regions)
-        candidate = replace(buffer, shape=(buffer.shape[0] * buffer.shape[1] // width, width))
+        candidate = replace(
+            buffer, shape=(buffer.shape[0] * buffer.shape[1] // width, width), partition_size=buffer.partition_extent()
+        )
         if aligned and layout_satisfies_output_alignment(ir.tree, candidate):
             result = width
     return result
@@ -202,7 +220,9 @@ def _fold_free_axis(ir: KernelIR, option: BufferAxisFoldOption) -> None:
     """Reframe aligned free-axis slices as logical partition tiles."""
     buffer = ir.buffer(option.tensor)
     factor = buffer.shape[1] // option.free_tile
-    replacement = replace(buffer, shape=(buffer.shape[0] * factor, option.free_tile))
+    replacement = replace(
+        buffer, shape=(buffer.shape[0] * factor, option.free_tile), partition_size=buffer.partition_extent()
+    )
 
     def rewrite(region: BufferRegion) -> BufferRegion:
         """Rewrite one selected region into the folded coordinate frame."""
@@ -263,17 +283,25 @@ def _normalizations_required(tree: KernelTree, tensors: frozenset[str]) -> set[t
 
 def _program_frame(ir: KernelIR, tensor: str) -> _ProgramFrame | None:
     """Return an aligned program-local partition frame for one buffer."""
-    cached = _PROGRAM_FRAMES.setdefault(ir.tree, {})
-    if tensor not in cached:
-        cached[tensor] = _compute_program_frame(ir, tensor)
+    cached = _PROGRAM_FRAMES.get(ir.tree)
+    if cached is None:
+        shards = configured_program_shards(ir)
+        buffers = ir.all_buffers()
+        regions = _regions_by_tensor(ir.tree, frozenset(buffers)) if shards else {}
+        cached = {
+            name: _compute_program_frame(ir, buffer, regions.get(name, []), shards)
+            for name, buffer in buffers.items()
+            if buffer.location in {"sbuf", "psum"}
+        }
+        _PROGRAM_FRAMES[ir.tree] = cached
     return cached[tensor]
 
 
-def _compute_program_frame(ir: KernelIR, tensor: str) -> _ProgramFrame | None:
+def _compute_program_frame(
+    ir: KernelIR, buffer: Buffer, pairs: list[tuple[int, BufferRegion]], shards: dict[int, int]
+) -> _ProgramFrame | None:
     """Prove that every access covers one matching per-program buffer slice."""
-    buffer = ir.buffer(tensor)
-    pairs = _regions_by_tensor(ir.tree, frozenset((tensor,))).get(tensor, [])
-    shards = configured_program_shards(ir)
+    tensor = buffer.name
     if buffer.location not in {"sbuf", "psum"} or buffer.list_len != 1 or not pairs or not shards:
         return None
     leaf_loops: dict[int, int | None] = {}
@@ -456,6 +484,7 @@ def _frame_anchor_nids_from_facts(
 
 def _rewrite_region_axis(tree: KernelTree, tensor: str, axis: int, substitutions: dict[str, Expr]) -> None:
     """Apply one common allocation-frame translation to every tensor access."""
+    buffer = next(value for nid in tree.blocks() for value in tree.block(nid).alloc_buffers if value.name == tensor)
 
     def rewrite(region: BufferRegion) -> BufferRegion:
         """Rewrite only the selected tensor axis."""
@@ -465,17 +494,6 @@ def _rewrite_region_axis(tree: KernelTree, tensor: str, axis: int, substitutions
         lower, width = ranges[axis]
         ranges[axis] = (substitute(lower, substitutions), width)
         return replace(region, ranges=tuple(ranges))
-
-    def rewrite_pattern(pattern: AccessPattern) -> AccessPattern:
-        """Translate one explicit physical view into the same allocation frame."""
-        return replace(
-            pattern,
-            pattern=tuple(
-                (substitute(stride, substitutions), substitute(extent, substitutions))
-                for stride, extent in pattern.pattern
-            ),
-            offset=substitute(pattern.offset, substitutions),
-        )
 
     for block_nid in tree.blocks():
         block = tree.block(block_nid)
@@ -489,7 +507,11 @@ def _rewrite_region_axis(tree: KernelTree, tensor: str, axis: int, substitutions
             continue
         bindings = {slot: rewrite(region) for slot, region in isa.operand_bindings.items()}
         patterns = {
-            slot: rewrite_pattern(pattern) if bindings[slot].tensor == tensor else pattern
+            slot: (
+                _axis_pattern(pattern, isa.operand_bindings[slot], buffer, axis, substitutions)
+                if bindings[slot].tensor == tensor
+                else pattern
+            )
             for slot, pattern in isa.access_patterns.items()
         }
         if bindings != isa.operand_bindings or patterns != isa.access_patterns:
@@ -531,14 +553,26 @@ def _region_fingerprints(tree: KernelTree, tensors: frozenset[str]) -> dict[str,
     return {tensor: tuple(values) for tensor, values in records.items()}
 
 
+def _axis_pattern(
+    pattern: AccessPattern, region: BufferRegion, buffer: Buffer, axis: int, substitutions: dict[str, Expr]
+) -> AccessPattern:
+    """Translate only one logical axis contribution to a flattened physical address."""
+    lower = region.ranges[axis][0]
+    removed = Add(left=lower, right=Mul(left=Const(value=-1), right=substitute(lower, substitutions)))
+    stride = prod(buffer.shape[axis + 1 :])
+    offset = Add(left=pattern.offset, right=Mul(left=removed, right=Const(value=-stride)))
+    return replace(pattern, offset=Analyzer().simplify(offset))
+
+
 def access_patterns_fit_buffer(
     tree: KernelTree,
     tensor: str,
     buffer: Buffer,
     substitutions: dict[str, Expr] | None = None,
     prior: Buffer | None = None,
+    axis: int | None = None,
 ) -> bool:
-    """Return whether one tensor's explicit views fit one list-of-one allocation."""
+    """Require logical views and their per-list projections to stay within storage."""
     old = buffer if prior is None else prior
     for nid in tree.preorder():
         node = tree.data(nid)
@@ -547,10 +581,22 @@ def access_patterns_fit_buffer(
         for slot, pattern in node.access_patterns.items():
             if node.operand_bindings[slot].tensor != tensor:
                 continue
-            if buffer.list_len != 1:
+            selected = (
+                pattern
+                if axis is None
+                else _axis_pattern(pattern, node.operand_bindings[slot], old, axis, substitutions or {})
+            )
+            candidate = _translated_pattern(selected, substitutions or {} if axis is None else {}, old, buffer)
+            if candidate is None:
                 return False
-            candidate = _translated_pattern(pattern, substitutions or {}, old, buffer)
-            if candidate is None or not _pattern_fits(tree, nid, candidate, buffer):
+            try:
+                _index, allocation = access_pattern_allocation_view(candidate, buffer)
+                allocation = replace(allocation, offset=Analyzer().simplify(allocation.offset))
+                if not _pattern_fits(tree, nid, candidate, replace(buffer, list_len=1)) or not _pattern_fits(
+                    tree, nid, allocation, buffer
+                ):
+                    return False
+            except (ValueError, NonAffineError):
                 return False
     return True
 

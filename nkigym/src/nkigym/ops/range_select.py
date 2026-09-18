@@ -21,11 +21,12 @@ class NKIRangeSelect(NKIOp):
     NAME: ClassVar[str] = "range_select"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {
         "on_true_tile": ("P", "F"),
-        "bound0": ("P",),
-        "bound1": ("P",),
+        "bound0": ("P", "B"),
+        "bound1": ("P", "B"),
         "dst": ("P", "F"),
     }
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"on_true_tile", "bound0", "bound1"})
+    FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {"B": 1}
     INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {
         "on_true_tile": frozenset({"sbuf", "psum"}),
         "bound0": frozenset({"sbuf", "psum"}),

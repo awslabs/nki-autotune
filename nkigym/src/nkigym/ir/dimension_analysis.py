@@ -13,7 +13,7 @@ from math import prod
 from threading import RLock
 from typing import Any
 
-from nkigym.ops.base import NKIOp, OperationSSAName, collect_operation_ssa_names
+from nkigym.ops.base import NKIOp, OperationSSAName, _trace_repeats, collect_operation_ssa_names
 
 _DIMENSION_TRACE_LOCK = RLock()
 
@@ -75,6 +75,7 @@ class _AnalysisResult:
         dim_sizes: ``dim_name → extent``.
         tensors: All named tensors, keyed by name.
         ops: Compute ops in source order.
+        repetitions: Half-open operation intervals and their static repeat counts.
     """
 
     func_name: str
@@ -83,12 +84,15 @@ class _AnalysisResult:
     dim_sizes: dict[str, int]
     tensors: dict[str, TensorDims]
     ops: list[_OpRecord]
+    repetitions: list[tuple[int, int, int | tuple[str, bool]]]
 
 
 def analyze_dimensions(
     func: Callable[..., Any], input_specs: dict[str, tuple[tuple[int, ...], str]]
 ) -> _AnalysisResult:
-    """Trace ``func`` against sentinel inputs and run cross-op dim unification.
+    """Trace primitive bodies once and unify their dimensions.
+
+    Explicit repetitions retain their operation intervals for structural lowering.
 
     Args:
         func: An ``@nkigym_kernel``-decorated callable to analyse.
@@ -100,7 +104,7 @@ def analyze_dimensions(
         if name not in input_specs:
             raise ValueError(f"Missing input_spec for parameter: {name!r}")
 
-    state = _TraceState(ssa_names=collect_operation_ssa_names(unwrapped))
+    state = _TraceState(ssa_names=iter(tuple(collect_operation_ssa_names(unwrapped))))
     for name in param_names:
         shape, dtype = input_specs[name]
         sym = _Sym(tuple(shape), name)
@@ -134,6 +138,7 @@ def analyze_dimensions(
         dim_sizes=state.dim_sizes,
         tensors=tensors,
         ops=state.op_records,
+        repetitions=state.repetitions,
     )
 
 
@@ -159,6 +164,7 @@ class _TraceState:
         self.sentinels: dict[str, _Sym] = {}
         self.dim_sizes: dict[str, int] = {}
         self.op_records: list[_OpRecord] = []
+        self.repetitions: list[tuple[int, int, int | tuple[str, bool]]] = []
         self.ssa_names = ssa_names
         self.next_dim = 0
 
@@ -176,7 +182,7 @@ class _TraceState:
 
 def _run_trace(func: Callable[..., Any], args: list[_Sym], state: _TraceState) -> None:
     """Invoke ``func(*args)`` with :meth:`NKIOp.__call__` hooked for analysis."""
-    with _DIMENSION_TRACE_LOCK:
+    with _DIMENSION_TRACE_LOCK, _trace_repeats(state.op_records, state.repetitions):
         original = NKIOp.__call__
         NKIOp.__call__ = _make_hook(state)
         try:
@@ -308,6 +314,8 @@ def _synthesize_outputs(
         names = name
     if len(names) != len(output_slots):
         raise ValueError(f"{cls.__name__}: expected {len(output_slots)} output names, got {len(names)}")
+    if len(set(names)) != len(names) or any(name in state.sentinels for name in names):
+        raise ValueError(f"{cls.__name__}: new outputs require unique SSA names, got {names}")
     primary_sym: _Sym | None = None
     output_syms: list[_Sym] = []
     for slot, slot_name in zip(output_slots, names, strict=True):
@@ -337,16 +345,13 @@ def _synthesize_outputs(
 
 def _unify(old: str, new: str, state: _TraceState, local: dict[str, str]) -> None:
     """Rename ``old`` dim id to ``new`` across sentinels, op records, and ``local``."""
-    old_size = state.dim_sizes.get(old)
-    new_size = state.dim_sizes.get(new)
+    old_size, new_size = state.dim_sizes.get(old), state.dim_sizes.get(new)
     if old_size is not None and new_size is not None and old_size != new_size:
         raise ValueError(f"Cannot unify {old} (size {old_size}) with {new} (size {new_size})")
     if old in state.dim_sizes:
         state.dim_sizes.setdefault(new, state.dim_sizes.pop(old))
     _apply_rename(state, {old: new})
-    for abstract in local:
-        if local[abstract] == old:
-            local[abstract] = new
+    local.update({abstract: new for abstract, dimension in local.items() if dimension == old})
 
 
 def _factor_intervals(dimensions: tuple[str, ...], state: _TraceState) -> dict[tuple[int, int], str]:
@@ -366,20 +371,20 @@ def _canonicalize_dim_names(state: _TraceState) -> None:
     Unification can retire intermediate ids (e.g. ``d2`` merged into
     ``d1``), leaving gaps. Rename in discovery order of the sentinels so
     the public surface stays dense.
+
+    An input-only, non-tileable domain remains independent of output iteration
+    even when an in-place update has unified their tensor dimensions.
     """
-    order: list[str] = []
-    seen: set[str] = set()
-    for sym in state.sentinels.values():
-        for d in sym.dim_ids:
-            if d is not None and d not in seen:
-                seen.add(d)
-                order.append(d)
     for rec in state.op_records:
-        for dimension in rec.axis_map.values():
-            if dimension not in seen:
-                seen.add(dimension)
-                order.append(dimension)
-    remap = {old: f"d{i}" for i, old in enumerate(order)}
+        outputs = rec.operand_names.keys() - rec.op_cls.INPUT_OPERANDS
+        output_axes = {axis for slot in outputs for axis in rec.op_cls.OPERAND_AXES[slot]}
+        for abstract in sorted((set(getattr(rec.op_cls, "NON_TILABLE_AXES", ())) - output_axes) & rec.axis_map.keys()):
+            dimension = rec.axis_map[abstract]
+            if list(rec.axis_map.values()).count(dimension) > 1:
+                rec.axis_map[abstract] = state.fresh_dim(state.dim_sizes[dimension])
+    dimensions = [dimension for sym in state.sentinels.values() for dimension in sym.dim_ids if dimension is not None]
+    dimensions.extend(dimension for rec in state.op_records for dimension in rec.axis_map.values())
+    remap = {old: f"d{i}" for i, old in enumerate(dict.fromkeys(dimensions))}
     if all(old == new for old, new in remap.items()):
         return
     state.dim_sizes = {remap[old]: size for old, size in state.dim_sizes.items() if old in remap}
@@ -395,8 +400,7 @@ def _apply_rename(state: _TraceState, remap: dict[str, str]) -> None:
             for factors in sym.factor_dim_ids
         ]
     for rec in state.op_records:
-        for abstract in rec.axis_map:
-            rec.axis_map[abstract] = remap.get(rec.axis_map[abstract], rec.axis_map[abstract])
+        rec.axis_map = {abstract: remap.get(dimension, dimension) for abstract, dimension in rec.axis_map.items()}
 
 
 def _parse_return_names(func: Callable[..., Any]) -> tuple[str, ...]:

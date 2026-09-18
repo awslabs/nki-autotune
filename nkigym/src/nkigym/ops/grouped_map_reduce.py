@@ -6,6 +6,7 @@ from typing import Any, ClassVar, Literal
 import numpy as np
 
 from nkigym.ops.activation import NKIActivation
+from nkigym.ops.activation_reduce import activation_reduce_parameters
 from nkigym.ops.base import AxisRole, NKIOp, ReductionContract, _operand_role, reduction_combinator
 
 _MAPS = {"copy": lambda data: data, "exp": np.exp}
@@ -16,6 +17,7 @@ class NKIGroupedMapReduce(NKIOp):
     """Map and reduce uniform chunks while preserving row groups."""
 
     NAME: ClassVar[str] = "activation_reduce"
+    native_parameters = staticmethod(activation_reduce_parameters)
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {
         "data": ("P", "G", "T", "F"),
         "bias": ("P", "G"),
@@ -29,6 +31,7 @@ class NKIGroupedMapReduce(NKIOp):
         "reduce_res": (("P",), ("G", "T")),
     }
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data", "bias"})
+    INPLACE_OPERANDS: ClassVar[dict[str, frozenset[str]]] = {"dst": frozenset({"data"})}
     FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {"G": "groups", "P": "partitions", "T": "chunks", "F": "width"}
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {axis: 1 for axis in "GPTF"}
@@ -66,14 +69,15 @@ class NKIGroupedMapReduce(NKIOp):
         if any(_operand_role(kwargs.get(name)) not in {None, "sbuf", "psum"} for name in ("data", "bias")):
             raise TypeError("NKIGroupedMapReduce expects on-chip operands")
 
-    def _run(self, **kwargs: Any) -> np.ndarray:
-        """Return one row-major partial reduction per chunk."""
+    def _run(self, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
+        """Return mapped values and one row-major partial reduction per chunk."""
         g, p, t, f = (int(kwargs[name]) for name in ("groups", "partitions", "chunks", "width"))
         data = np.asarray(kwargs["data"], dtype=np.float32).reshape(p, g, t, f)
         if isinstance(bias := kwargs.get("bias"), np.ndarray):
             data = data + np.asarray(bias, dtype=np.float32).reshape(p, g, 1, 1)
         mapped = _MAPS[str(kwargs["op"])](data)
-        return np.asarray(_REDUCTIONS[str(kwargs["reduce_op"])](mapped, axis=3), dtype=np.float32).reshape(p, g * t)
+        reduced = np.asarray(_REDUCTIONS[str(kwargs["reduce_op"])](mapped, axis=3), dtype=np.float32)
+        return mapped.reshape(p, g * t * f), reduced.reshape(p, g * t)
 
 
 __all__ = ["NKIGroupedMapReduce"]

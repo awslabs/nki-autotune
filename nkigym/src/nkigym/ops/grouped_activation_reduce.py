@@ -4,6 +4,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+from nkigym.ops.activation_reduce import activation_reduce_parameters
 from nkigym.ops.base import AxisRole, NKIOp, _operand_role
 
 
@@ -11,6 +12,7 @@ class NKIGroupedActivationReduce(NKIOp):
     """Apply a grouped broadcast bias, exponentiate, and partially sum."""
 
     NAME: ClassVar[str] = "activation_reduce"
+    native_parameters = staticmethod(activation_reduce_parameters)
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {
         "data": ("G", "Q", "P", "T", "F"),
         "bias": ("P", "G", "Q"),

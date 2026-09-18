@@ -1,6 +1,4 @@
-"""Dedicated SSH transport for one installed Trn2 profile worker."""
-
-from __future__ import annotations
+"""SSH transport that runs the current backend in an isolated Trn2 directory."""
 
 import os
 import secrets
@@ -26,7 +24,6 @@ _SSH_OPTIONS = (
 )
 _REMOTE_PYTHON = '"$HOME"/venvs/kernel-env/bin/python'
 _REMOTE_RUN_ROOT = ".cache/nkigym-profile/runs"
-_TRANSPORT_LOG_FILE = "transport.log"
 
 
 class SSHTransportError(RuntimeError):
@@ -56,9 +53,9 @@ class _CommandRunner:
         """Return seconds remaining before the shared deadline."""
         return self.deadline - time.monotonic()
 
-    def run(self, stage: str, command: list[str], input_text: str | None) -> None:
-        """Run one stage and fail with its output when it is unsuccessful."""
-        remaining_s = self.deadline - time.monotonic()
+    def run(self, stage: str, command: list[str], input_text: str | None, timeout_s: float | None = None) -> str:
+        """Return stage output while enforcing the shared deadline and optional stage timeout."""
+        remaining_s = self.remaining_s if timeout_s is None else min(self.remaining_s, timeout_s)
         if remaining_s <= 0:
             raise SSHTransportError(f"{stage} exceeded the SSH profile timeout", self.log)
         self.lines.append(f"==> {stage}\n")
@@ -72,6 +69,7 @@ class _CommandRunner:
         self.lines.extend((completed.stdout, completed.stderr))
         if completed.returncode != 0:
             raise SSHTransportError(f"{stage} failed with exit {completed.returncode}", self.log)
+        return completed.stdout
 
     def cleanup(self, host: str, remote_run: str, terminate_process_group: bool) -> None:
         """Best-effort termination and removal of one remote scratch directory."""
@@ -107,11 +105,6 @@ def profile_over_ssh(host: str, input_path: Path, request_path: Path, output_dir
     """Execute one kernel request remotely and return the complete transport log."""
     if not input_path.is_file() and not input_path.is_dir():
         raise FileNotFoundError(f"kernel request input not found: {input_path}")
-    return _profile_over_ssh(host, input_path, request_path, output_dir, timeout_s)
-
-
-def _profile_over_ssh(host: str, input_path: Path, request_path: Path, output_dir: Path, timeout_s: int) -> str:
-    """Run one kernel execution/profile transport."""
     _validate_host(host)
     _require_command("ssh")
     _require_command("rsync")
@@ -125,22 +118,36 @@ def _profile_over_ssh(host: str, input_path: Path, request_path: Path, output_di
     directory_input = input_path.is_dir()
     remote_input = f"{remote_run}/input" if directory_input else f"{remote_run}/kernel.py"
     remote_output = f"{remote_run}/output"
+    remote_backend = f"{remote_run}/backend"
     rsync_shell = shlex.join(("ssh", *_SSH_OPTIONS))
     runner = _CommandRunner(timeout_s)
     upload_source = f"{input_path}/" if directory_input else str(input_path)
     upload_target = f"{host}:{remote_input}/" if directory_input else f"{host}:{remote_input}"
     try:
         runner.run(
-            "Checking installed profile worker",
+            "Preparing remote profile run",
             [
                 "ssh",
                 *_SSH_OPTIONS,
                 host,
                 (
                     f"test -x {_REMOTE_PYTHON} && "
-                    f"{_REMOTE_PYTHON} -c 'import nkigym.profile.worker' && "
-                    f'mkdir -p "$HOME"/{remote_input if directory_input else remote_run}'
+                    f'mkdir -p "$HOME"/{remote_input if directory_input else remote_run} '
+                    f'"$HOME"/{remote_backend}/nkigym'
                 ),
+            ],
+            None,
+        )
+        runner.run(
+            "Uploading current profile backend",
+            [
+                "rsync",
+                "-az",
+                *"--exclude=.cache --exclude=__pycache__ --include=*/ --include=*.py --exclude=*".split(),
+                "-e",
+                rsync_shell,
+                f"{Path(__file__).resolve().parents[1]}/",
+                f"{host}:{remote_backend}/nkigym/",
             ],
             None,
         )
@@ -152,7 +159,7 @@ def _profile_over_ssh(host: str, input_path: Path, request_path: Path, output_di
                 *_SSH_OPTIONS,
                 host,
                 (
-                    f"{_REMOTE_PYTHON} -m nkigym.profile.worker "
+                    f'PYTHONPATH="$HOME"/{remote_backend} {_REMOTE_PYTHON} -m nkigym.profile.worker '
                     f'{"--input" if directory_input else "--kernel"} "$HOME"/{remote_input} '
                     f'--output "$HOME"/{remote_output}'
                 ),
@@ -164,11 +171,9 @@ def _profile_over_ssh(host: str, input_path: Path, request_path: Path, output_di
             ["rsync", "-az", "-e", rsync_shell, f"{host}:{remote_output}/", f"{output_dir}/"],
             None,
         )
-    except SSHTransportError as error:
-        raise SSHTransportError(str(error), runner.log) from error
     finally:
         runner.cleanup(host, remote_run, False)
-        (output_dir / _TRANSPORT_LOG_FILE).write_text(runner.log, encoding="utf-8")
+        (output_dir / "transport.log").write_text(runner.log, encoding="utf-8")
     return runner.log
 
 

@@ -1,9 +1,8 @@
 """Elementwise tensor-tensor op: maps to ``nisa.tensor_tensor``.
 
 Applies ``dst = data1 <op> data2`` over two same-shape ``(P, F)`` tensors.
-RFactor's ``"rmw"`` write-back block uses this as the running combine
-``out_sbuf = out_sbuf + B_rf[ko]`` by binding both ``data1`` and ``dst`` to
-``out_sbuf``.
+RFactor uses this as a running combine with one input aliased to ``dst``.
+A PSUM partial occupies ``data1`` and the SBUF accumulator occupies ``data2``.
 """
 
 from collections.abc import Mapping
@@ -19,6 +18,9 @@ _OPS: dict[str, Any] = {
     "multiply": np.multiply,
     "max": np.maximum,
     "maximum": np.maximum,
+    "minimum": np.minimum,
+    "greater": lambda left, right: np.greater(left, right).astype(np.float32),
+    "equal": lambda left, right: np.equal(left, right).astype(np.float32),
 }
 
 
@@ -36,6 +38,7 @@ class NKITensorTensor(NKIOp):
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+    INPLACE_OPERANDS: ClassVar[dict[str, frozenset[str]]] = {"dst": frozenset({"data1", "data2"})}
 
     @classmethod
     def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> PointwiseContract:

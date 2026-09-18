@@ -15,15 +15,17 @@ class NKISendRecv(NKIOp):
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"src": ("P", "F"), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
     INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"src": frozenset({"sbuf"})}
-    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 1, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": 512}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
     SHARDED_SINGLE_PROGRAM_ZERO: ClassVar[bool] = True
+    CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"participating_programs"})
 
     @classmethod
     def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> PeerExchangeContract:
         """Return the value-preserving peer-exchange contract."""
-        _ = kwargs
+        if kwargs.get("participating_programs", 2) not in {1, 2}:
+            raise ValueError("peer exchange supports one or two participating programs")
         return PeerExchangeContract(input_operand="src", output_operand="dst")
 
     @classmethod
@@ -39,5 +41,5 @@ class NKISendRecv(NKIOp):
             raise TypeError(f"NKISendRecv(src=<role={role}>) expects sbuf")
 
     def _run(self, **kwargs: Any) -> Any:
-        """Return the zero peer contribution for one-program execution of a sharded IR."""
+        """Return the zero peer contribution for one-program execution."""
         return np.zeros_like(kwargs["src"])

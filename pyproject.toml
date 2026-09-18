@@ -5,7 +5,7 @@ include = '\.pyi?$'
 skip-magic-trailing-comma = true
 
 [tool.isort]
-known_first_party = ["kernel_library", "nkigym"]
+known_first_party = ["benchmark", "kernel_library", "nkigym"]
 profile = "black"
 line_length = 120
 

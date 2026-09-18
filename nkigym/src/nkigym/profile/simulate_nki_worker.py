@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import importlib
 import json
 import multiprocessing
 import pickle
@@ -13,10 +14,13 @@ import threading
 import traceback
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from functools import cache
+from math import erf
 from pathlib import Path
 from typing import Any, cast
 
+import ml_dtypes
 import nki
 import numpy as np
 
@@ -25,7 +29,7 @@ bfloat16 float16 float8_e4m3 float8_e4m3fn float8_e4m3fn_x4
 float8_e5m2 float8_e5m2_x4 float4_e2m1fn_x4 tfloat32
 """.split()
 ArrayResult = np.ndarray | tuple[np.ndarray, ...]
-_SerializedCase = tuple[int, str, str, str, dict[str, np.ndarray], ArrayResult]
+_SerializedCase = tuple[int, str, str, str, dict[str, np.ndarray], ArrayResult, tuple[str, dict[str, object]] | None]
 _FailurePayload = dict[str, int | str]
 _Provenance = dict[tuple[object, ...], dict[str, Any]]
 _ProvenanceStore = dict[tuple[object, ...], _Provenance]
@@ -33,6 +37,7 @@ _WORKER_CASES: list[_SerializedCase] = []
 _WORKER_ATOL, _WORKER_RTOL = 0.0, 0.0
 _SIMULATION_LOCK = threading.Lock()
 _LNC2 = re.compile(r"(?s)(?:(\w+)=nl\.program_id\(0\).*?\[[^\n]*\b\1|\[[^\n]*nl\.program_id\(0\)[^\n]*)")
+_OUTPUT = re.compile(r"(?m)^\s+(\w+) = nl\.ndarray\([^\n]*dtype=nl\.(\w+), buffer=nl\.shared_hbm\)")
 
 
 def _fp32_source(source: str) -> str:
@@ -47,9 +52,33 @@ def _fp32_source(source: str) -> str:
     return _coalesce_dma_copies(source.replace("nkigym_nl.", "nl."))
 
 
-def _node_names(node: ast.AST) -> set[str]:
-    """Return names referenced below one Python AST node."""
-    return {item.id for item in ast.walk(node) if isinstance(item, ast.Name)}
+def _output_dtypes(source: str, func_name: str) -> tuple[str, ...]:
+    """Read physical output dtypes from one rendered kernel."""
+    declarations = dict(_OUTPUT.findall(source))
+    returned = re.findall(r"(?m)^\s+return (.+)$", source)
+    names = tuple(name.strip() for name in returned[0].strip("()").split(",")) if len(returned) == 1 else ()
+    if f"def {func_name}(" not in source or not names or not set(names) <= declarations.keys():
+        raise ValueError(f"generated kernel {func_name!r} has invalid output declarations")
+    return tuple(declarations[name] for name in names)
+
+
+def _node_names(node: ast.AST, excluded: ast.AST | None = None) -> set[str]:
+    """Return referenced names outside an optional excluded subtree."""
+    nodes = set(ast.walk(node)) - (set(ast.walk(excluded)) if excluded is not None else set())
+    return {item.id for item in nodes if isinstance(item, ast.Name)}
+
+
+def _sliced_names(node: ast.expr) -> set[str]:
+    """Return names whose occurrences are confined to one indexed slice."""
+    slices = (part for part in ast.walk(node) if isinstance(part, ast.Slice))
+    return set().union(*(_node_names(part) - _node_names(node, part) for part in slices))
+
+
+def _array_root(node: ast.expr) -> str | None:
+    """Return the named allocation underlying a simple indexed operand."""
+    while isinstance(node, ast.Subscript):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
 
 
 def _affine_form(node: ast.AST) -> dict[str | None, int] | None:
@@ -87,22 +116,18 @@ class _ZeroLoops(ast.NodeTransformer):
         return ast.copy_location(ast.Constant(value=0), node) if node.id in self.names else node
 
 
-def _coalesced_operand(node: ast.expr, loops: tuple[tuple[str, int], ...]) -> tuple[ast.expr, int] | None:
-    """Collapse one proven contiguous slice across a perfect loop nest."""
+def _coalesced_operand(node: ast.expr, loops: tuple[tuple[str, int], ...]) -> tuple[ast.expr, tuple[int, ...]] | None:
+    """Merge contiguous loop digits while proving disjoint retained intervals."""
     result, names = copy.deepcopy(node), {name for name, _ in loops}
     candidates = [item for item in ast.walk(result) if isinstance(item, ast.Slice) and names & _node_names(item)]
-    if len(candidates) != 1:
+    if not isinstance(result, ast.Subscript) or len(candidates) != 1 or not names <= _sliced_names(result):
         return None
-    target, upper = candidates[0], candidates[0].upper
-    if target.lower is None or target.step is not None or not isinstance(upper, ast.BinOp):
-        return None
-    if not isinstance(upper.op, ast.Add) or ast.dump(upper.left) != ast.dump(target.lower):
-        return None
-    if not isinstance(upper.right, ast.Constant) or not isinstance(upper.right.value, int) or upper.right.value <= 0:
-        return None
-    lower, width = target.lower, int(upper.right.value)
-    if names & (_node_names(result) - _node_names(target)):
-        return None
+    match target := candidates[0]:
+        case ast.Slice(ast.expr() as lower, ast.BinOp(repeated, ast.Add(), ast.Constant(value=int() as width)), None):
+            if width <= 0 or ast.dump(repeated) != ast.dump(lower):
+                return None
+        case _:
+            return None
     form = _affine_form(lower)
     coefficients = [None if form is None else form.get(name, 0) for name, _ in loops]
     if any(value is None or value <= 0 or value % width for value in coefficients):
@@ -110,59 +135,60 @@ def _coalesced_operand(node: ast.expr, loops: tuple[tuple[str, int], ...]) -> tu
     digits = sorted(
         (cast(int, coefficient) // width, extent) for coefficient, (_, extent) in zip(coefficients, loops, strict=True)
     )
-    span = 1
+    span, covered = 1, 1
     for stride, extent in digits:
-        if stride != span:
+        if stride < covered:
             return None
-        span *= extent
-    target.lower = cast(ast.expr, _ZeroLoops(names).visit(target.lower))
+        span *= extent if stride == span else 1
+        covered = stride * extent
+    if span == 1:
+        return None
+    names = {name for (name, _), coefficient in zip(loops, coefficients) if cast(int, coefficient) < width * span}
+    target.lower = cast(ast.expr, _ZeroLoops(names).visit(lower))
     target.upper = ast.BinOp(left=copy.deepcopy(target.lower), op=ast.Add(), right=ast.Constant(value=width * span))
-    return result, width * span
+    return result, (*cast(tuple[int, ...], tuple(coefficients)), width, span)
 
 
 def _loop_info(node: ast.For) -> tuple[str, int] | None:
     """Return one simple positive constant-range loop."""
-    iterator = node.iter
-    if not isinstance(node.target, ast.Name) or node.orelse or len(node.body) != 1:
-        return None
-    if not isinstance(iterator, ast.Call) or not isinstance(iterator.func, ast.Name) or iterator.func.id != "range":
-        return None
-    argument = iterator.args[0] if len(iterator.args) == 1 else None
-    if not isinstance(argument, ast.Constant) or not isinstance(argument.value, int) or argument.value <= 0:
-        return None
-    return node.target.id, int(argument.value)
+    match node:
+        case ast.For(ast.Name(id=name), ast.Call(ast.Name(id="range"), [ast.Constant(value=value)]), _, []):
+            return (name, int(value)) if isinstance(value, int) and value > 0 else None
+    return None
 
 
-def _coalescible_call(node: ast.stmt) -> tuple[ast.Call, tuple[str, ...]] | None:
+def _coalescible_call(node: ast.stmt) -> tuple[str, ...] | None:
     """Return one direct NKI call and its contiguous tensor operands."""
-    call = node.value if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) else None
-    function = None if call is None else call.func
-    if isinstance(call, ast.Call) and isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name):
-        operands = {"dma_copy": ("src", "dst"), "memset": ("dst",)}.get(function.attr)
-        operands = ("src", "dst") if function.attr == "tensor_copy" else operands
-        if function.attr == "range_select":
-            operands = ("on_true_tile", "dst")
-        if function.value.id == "nisa" and operands is not None:
-            return call, operands
+    match node:
+        case ast.Expr(ast.Call(ast.Attribute(ast.Name(id="nisa"), attr=operation)) as call):
+            operands = {"memset": ("dst",), "range_select": ("on_true_tile", "dst")}.get(operation)
+            if operation in {"dma_copy", "tensor_copy"}:
+                operands = ("src", "dst")
+            if operation == "activation" and {k.arg for k in call.keywords} == {"data", "dst", "op"}:
+                operands = ("data", "dst")
+            return operands
     return None
 
 
 def _coalesced_call(node: ast.For) -> ast.stmt | None:
-    """Collapse one perfect tensor-call loop nest with contiguous tile coverage."""
-    loops, statement = [], cast(ast.stmt, node)
-    while isinstance(statement, ast.For) and (loop := _loop_info(statement)) is not None:
+    """Merge equal copy mappings, retaining loops over disjoint strided intervals."""
+    loops, nests, statement = [], [], cast(ast.stmt, node)
+    while isinstance(statement, ast.For) and len(statement.body) == 1 and (loop := _loop_info(statement)) is not None:
+        nests.append(statement)
         loops.append(loop)
         statement = statement.body[0]
-    if (info := _coalescible_call(statement)) is None:
+    if (operand_names := _coalescible_call(statement)) is None:
         return None
-    result, (_call, operand_names) = copy.deepcopy(statement), info
+    result = copy.deepcopy(statement)
     bindings = {keyword.arg: keyword for keyword in cast(ast.Call, cast(ast.Expr, result).value).keywords}
-    names = {name for name, _ in loops}
-    if any(
-        names & _node_names(keyword.value)
-        for name, keyword in bindings.items()
-        if name not in operand_names and name != "range_start"
-    ):
+    left, right = (bindings[name].value for name in (operand_names[0], operand_names[-1]))
+    roots = (_array_root(left), _array_root(right))
+    if None in roots or roots[0] == roots[1] and ast.dump(left) != ast.dump(right):
+        return None
+    names = {name for name, _ in loops} & _sliced_names(left) & _sliced_names(right)
+    loops = [(name, extent) for name, extent in loops if name in names]
+    fixed = bindings.keys() - set(operand_names) - {"range_start"}
+    if any(names & _node_names(bindings[name].value) for name in fixed):
         return None
     if "range_start" in bindings:
         source = bindings[operand_names[0]].value
@@ -172,37 +198,82 @@ def _coalesced_call(node: ast.For) -> ast.stmt | None:
         ):
             return None
     operands = {name: _coalesced_operand(bindings[name].value, tuple(loops)) for name in operand_names}
-    if any(value is None for value in operands.values()):
+    layouts = {None if value is None else value[1] for value in operands.values()}
+    if None in layouts or len(layouts) != 1:
         return None
     for name, value in operands.items():
-        bindings[name].value = cast(tuple[ast.expr, int], value)[0]
+        bindings[name].value = cast(tuple[ast.expr, tuple[int, ...]], value)[0]
+    names.difference_update(*(_node_names(bindings[name].value) for name in operand_names))
     if "range_start" in bindings:
         bindings["range_start"].value = cast(ast.expr, _ZeroLoops(names).visit(bindings["range_start"].value))
+    for nest in reversed(nests):
+        if cast(ast.Name, nest.target).id not in names:
+            result = ast.For(nest.target, nest.iter, [result], [])
     return ast.copy_location(result, node)
 
 
 class _CoalesceDMACopies(ast.NodeTransformer):
-    """Collapse contiguous DMA-only loop nests for CPU simulation."""
+    """Coalesce contiguous CPU simulator calls."""
 
-    def visit_For(self, node: ast.For) -> ast.AST:
-        """Replace one proven contiguous tensor-call loop nest."""
-        node = cast(ast.For, self.generic_visit(node))
-        return _coalesced_call(node) or node
+    def visit_For(self, node: ast.For) -> ast.stmt:
+        """Collapse complete contiguous copy nests without moving memory accesses."""
+        return _coalesced_call(cast(ast.For, self.generic_visit(node))) or node
 
 
 def _coalesce_dma_copies(source: str) -> str:
-    """Coalesce proven contiguous DMA loop nests in standalone simulator source."""
+    """Coalesce proven contiguous tensor calls in standalone simulator source."""
     tree = _CoalesceDMACopies().visit(ast.parse(source))
-    ast.fix_missing_locations(tree)
-    return ast.unparse(tree) + "\n"
+    return ast.unparse(ast.fix_missing_locations(tree)) + "\n"
 
 
 def _view_key(view: Any) -> tuple[object, ...]:
-    """Return the simulator's identity for one PSUM view."""
+    """Return the simulator's identity for one tensor view."""
     identity = (view.tensor_id, view.tensor.__array_interface__["data"][0])
-    return (
-        identity if view._is_identity() else identity + (view.offset, tuple(tuple(pattern) for pattern in view.pattern))
-    )
+    return identity if view._is_identity() else identity + (view.offset, tuple(tuple(row) for row in view.pattern))
+
+
+@contextmanager
+def _regular_tensor_views() -> Iterator[None]:
+    """Use checked NumPy strides for regular views, retaining SDK fallbacks."""
+    view_type = importlib.import_module("nki._backends.simulator.tensor_view").SimulatorTensorView
+    from_numpy_dtype = importlib.import_module("nki._backends.simulator.dtypes").from_numpy_dtype
+    original_get, original_set = view_type.get_data, view_type.set_data
+
+    def array(view: Any) -> np.ndarray | None:
+        """Return an in-bounds, injective view with unchanged element dtype."""
+        indexed = any(value is not None for value in (view.ti_state, view.scalar_offset, view.vector_offset))
+        compatible = view.tensor.flags.c_contiguous and from_numpy_dtype(view.tensor.dtype) == view.dtype
+        if view.pattern is None or indexed or not compatible:
+            return None
+        span = 1
+        for step, count in sorted(view.pattern):
+            if count <= 0 or step < span:
+                return None
+            span += step * (count - 1)
+        if view.offset < 0 or view.offset + span > view.tensor.size:
+            return None
+        storage, size = view.tensor, view.tensor.itemsize
+        strides = tuple(step * size for step, _ in view.pattern)
+        return np.ndarray(view.view_shape, storage.dtype, buffer=storage, offset=view.offset * size, strides=strides)
+
+    def get_data(view: Any) -> np.ndarray:
+        """Preserve the SDK's nonidentity read snapshot semantics."""
+        target = array(view)
+        return original_get(view) if target is None else target.copy()
+
+    def set_data(view: Any, value: object) -> None:
+        """Write regular views with the SDK's flattened assignment semantics."""
+        target, values = array(view), np.asarray(value).ravel()
+        if target is None or values.size not in (1, target.size):
+            original_set(view, value)
+        else:
+            target[...] = values.reshape(target.shape) if values.size == target.size else values[0]
+
+    view_type.get_data, view_type.set_data = get_data, set_data
+    try:
+        yield
+    finally:
+        view_type.get_data, view_type.set_data = original_get, original_set
 
 
 def _outer_fma(left: np.ndarray, right: np.ndarray, addend: np.ndarray) -> np.ndarray:
@@ -211,17 +282,17 @@ def _outer_fma(left: np.ndarray, right: np.ndarray, addend: np.ndarray) -> np.nd
     return np.asarray(product + addend.astype(np.float64), dtype=np.float32)
 
 
-def _mkl_gemv_result(stationary: list[np.ndarray], moving: list[np.ndarray]) -> np.ndarray:
-    """Match the eight-term reduction tree used by MKL AVX-512 GEMV."""
-    left, right = (np.concatenate(parts, axis=0) for parts in (stationary, moving))
-    result = np.zeros((left.shape[1], right.shape[1]), dtype=np.float32)
+def _mkl_gemv_result(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Match four MKL thread chunks, each using the AVX-512 eight-term tree."""
+    partials = np.zeros((4, left.shape[1], right.shape[1]), dtype=np.float32)
     for start in range(0, left.shape[0], 8):
+        chunk = start // (left.shape[0] // 4)
         tile_left, tile_right = left[start : start + 8], right[start : start + 8]
         products = np.asarray(tile_left[:, :, None] * tile_right[:, None, :], dtype=np.float32)
         pairs = [_outer_fma(tile_left[i], tile_right[i], products[j]) for i, j in ((5, 7), (0, 2), (1, 3))]
-        carried = _outer_fma(tile_left[4], tile_right[4], _outer_fma(tile_left[6], tile_right[6], result))
-        result = np.add(np.add(pairs[1], pairs[2]), np.add(carried, pairs[0]), dtype=np.float32)
-    return result
+        carried = _outer_fma(tile_left[4], tile_right[4], _outer_fma(tile_left[6], tile_right[6], partials[chunk]))
+        partials[chunk] = np.add(np.add(pairs[1], pairs[2]), np.add(carried, pairs[0]), dtype=np.float32)
+    return np.add.accumulate(partials, axis=0, dtype=np.float32)[-1]
 
 
 def _torch_add_reduce(values: np.ndarray) -> np.ndarray:
@@ -242,15 +313,16 @@ def _torch_add_reduce(values: np.ndarray) -> np.ndarray:
 
 @contextmanager
 def _grouped_matmul_accumulation() -> Iterator[None]:
-    """Group three hardware contraction tiles per FP32 reference matmul."""
-    from nki._backends import simulator
-    from nki._backends.simulator.dtypes import to_numpy_dtype
-    from nki._backends.simulator.lnc import LncContext
-    from nki._backends.simulator.matmul import _flatten_to_2d
-    from nki._backends.simulator.state import get_current_context
-    from nki._backends.simulator.tensor_view import SimulatorTensorView
-    from nki.language import _ops as language_ops
+    """Preserve logical contractions and the CPU reference's blocked sum order."""
+    simulator = cast(Any, importlib.import_module("nki._backends.simulator"))
+    to_numpy_dtype = importlib.import_module("nki._backends.simulator.dtypes").to_numpy_dtype
+    LncContext = importlib.import_module("nki._backends.simulator.lnc").LncContext
+    _flatten_to_2d = importlib.import_module("nki._backends.simulator.matmul")._flatten_to_2d
+    get_current_context = importlib.import_module("nki._backends.simulator.state").get_current_context
+    SimulatorTensorView = importlib.import_module("nki._backends.simulator.tensor_view").SimulatorTensorView
+    language_ops = cast(Any, importlib.import_module("nki.language._ops"))
 
+    original_activation = simulator.activation
     original_matmul, original_copy, original_sendrecv = simulator.nc_matmul, simulator.tensor_copy, simulator.sendrecv
     original_tensor_tensor, original_reduce_op = simulator.tensor_tensor_arith, language_ops.get_numpy_reduce_op
     original_get, original_set = SimulatorTensorView.get_data, SimulatorTensorView.set_data
@@ -261,7 +333,7 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
 
     def allocation(items: _ProvenanceStore, view: Any) -> _Provenance:
         """Return provenance views belonging to one allocation."""
-        return items.get(_view_key(view)[:2], {})
+        return items.get((view.tensor_id, view.tensor.__array_interface__["data"][0]), {})
 
     def view_indices(view: Any) -> np.ndarray:
         """Return flattened storage indices in view iteration order."""
@@ -272,6 +344,22 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
         """Return inclusive storage bounds for one regular tensor view."""
         deltas, offset = [int(step) * (int(count) - 1) for step, count in view._get_pattern()], int(view.offset)
         return offset + sum(min(0, delta) for delta in deltas), offset + sum(max(0, delta) for delta in deltas)
+
+    def item_indices(item: dict[str, Any]) -> np.ndarray:
+        """Return and cache one provenance view's storage indices."""
+        if (indices := item.get("indices")) is None:
+            item["indices"] = indices = view_indices(item["view"])
+        return cast(np.ndarray, indices)
+
+    item_overlaps = lambda item, target: (span := view_span(item["view"]))[0] <= target[1] and target[0] <= span[1]
+
+    def item_pages(item: dict[str, Any]) -> frozenset[int]:
+        """Return and cache storage pages touched by one provenance view."""
+        pages = item.get("pages")
+        if pages is None:
+            pages = frozenset(item_indices(item) // (1 << 13))
+            item["pages"] = pages
+        return cast(frozenset[int], pages)
 
     def remap_positions(view: Any, absolute: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Map storage indices to positions in one target view."""
@@ -301,22 +389,33 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
         selected = (locations >= 0) & (indices[safe] == absolute)
         return selected, order[safe]
 
-    def spans_overlap(left: Any, right: Any) -> bool:
-        """Return whether two views in one allocation can overlap."""
-        left_span, right_span = view_span(left), view_span(right)
-        return left_span[0] <= right_span[1] and right_span[0] <= left_span[1]
-
-    def grouped_result(stationary: list[np.ndarray], moving: list[np.ndarray]) -> np.ndarray:
-        """Evaluate one logical contraction using the reference grouping."""
+    def grouped_result(stationary: list[np.ndarray], moving: list[np.ndarray], names: list[str]) -> np.ndarray:
+        """Match blocked BLAS sums, reducing K workers before the main thread."""
+        ordered = sorted(zip(names, stationary, moving), key=lambda item: int(item[0].rsplit("_", 1)[1]))
+        names, stationary, moving = (list(values) for values in zip(*ordered))
+        name = names[0].rsplit("_", 1)[0]
         count, widths = len(stationary), (stationary[0].shape[1], moving[0].shape[1])
+        left, right = (np.concatenate(parts, axis=0) for parts in (stationary, moving))
+        if name.startswith("conv_"):
+            active, channels = int(np.flatnonzero(np.any(right, axis=1))[-1]) + 1, int(name.split("_")[1])
+            kernel, result = active // channels, np.zeros(widths, dtype=np.float32)
+            for start in range(0, channels, 16):
+                stop = min(channels, start + 16)
+                indices = np.arange(start * kernel, stop * kernel).reshape(-1, kernel).T.reshape(-1)
+                result += np.matmul(left[indices].T, right[indices])
+            return result
         if count == 32 and min(widths) == 1 and max(widths) % 16 == 0:
-            return _mkl_gemv_result(stationary, moving)
-        group = {4: 4, 8: 3, 64: 1 + 2 * (widths[0] >= 128), 128: 2}.get(count, 1)
-        result = np.zeros(widths, dtype=np.float32)
-        for start in range(0, count, group):
-            left, right = (np.concatenate(parts[start : start + group], axis=0) for parts in (stationary, moving))
-            result += np.matmul(left.T, right)
-        return result
+            return _mkl_gemv_result(left, right)
+        threads = 4 if left.shape[0] >= 4096 and left.shape[0] % 512 == 0 and min(widths) < 128 else 1
+        group = {4: 4, 8: 3, 24: 2, 32: 3, 64: 1 + 2 * (widths[0] >= 128), 128: 2}.get(count, 1)
+        group = 384 if threads == 4 else group * stationary[0].shape[0]
+        partials = np.zeros((threads, *widths), dtype=np.float32)
+        for thread in range(threads):
+            start, stop = thread * (left.shape[0] // threads), (thread + 1) * (left.shape[0] // threads)
+            for index in range(start, stop, group):
+                end = min(index + group, stop)
+                partials[thread] += np.matmul(left[index:end].T, right[index:end])
+        return partials[0] if threads == 1 else ((partials[1] + partials[2]) + partials[3]) + partials[0]
 
     def write_materialized(key: tuple[object, ...], view: Any, value: np.ndarray) -> None:
         """Write one value without invalidating its provenance."""
@@ -328,10 +427,11 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
 
     def flush(view: Any) -> None:
         """Write every pending subview overlapping one read or write."""
+        target_span = view_span(view)
         for key, item in tuple(allocation(pending, view).items()):
-            if not spans_overlap(view, item["view"]) or not item["dirty"]:
+            if not item_overlaps(item, target_span) or not item["dirty"]:
                 continue
-            result = grouped_result(item["stationary"], item["moving"])
+            result = grouped_result(item["stationary"], item["moving"], item["name"])
             if item["base"] is not None:
                 result = item["base"] + result
             target = item["view"]
@@ -351,7 +451,8 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
             selected.sort(key=lambda panel: panel.get("rank", 0))
             stationary = [array for panel in selected for array in panel["stationary"]]
             moving = [array for panel in selected for array in panel["moving"]]
-            result = grouped_result(stationary, moving)
+            names = [name for panel in selected for name in panel["name"]]
+            result = grouped_result(stationary, moving, names)
             bases = [panel["base"] for panel in selected if panel["base"] is not None]
             if bases:
                 result += sum(bases[1:], start=bases[0].copy())
@@ -367,15 +468,17 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
     def pending_panels(view: Any) -> list[dict[str, Any]]:
         """Return pending contraction panels selected by one result subview."""
         panels = []
+        target_span = view_span(view)
         for item in allocation(pending, view).values():
-            if spans_overlap(view, item["view"]):
-                selected, remapped = remap_positions(view, view_indices(item["view"]))
+            if item_overlaps(item, target_span):
+                selected, remapped = remap_positions(view, item_indices(item))
                 selected = selected.reshape(item["view"].view_shape)
                 columns = np.flatnonzero(selected[0])
                 complete = bool(columns.size and np.all(selected[:, columns]))
                 complete &= np.count_nonzero(selected) == selected.shape[0] * columns.size
                 if complete:
-                    panel = {"base": item["base"], "moving": item["moving"], "stationary": list(item["stationary"])}
+                    panel = {key: item[key] for key in ("base", "moving", "name", "stationary")}
+                    panel["name"], panel["stationary"] = list(panel["name"]), list(panel["stationary"])
                     panels.append(slice_panel(panel, columns, remapped[selected.reshape(-1)]))
         return panels
 
@@ -390,15 +493,25 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
 
     def take_symbolic(view: Any) -> list[dict[str, Any]]:
         """Remove and remap symbolic subviews contained by ``view``."""
-        matches = [(key, item) for key, item in allocation(symbolic, view).items() if spans_overlap(item["view"], view)]
-        if not matches:
+        items = allocation(symbolic, view)
+        if not items:
             return []
-        panels: list[dict[str, Any]] = []
+        key = _view_key(view)
+        exact = items.pop(key, None)
+        panels = [] if exact is None else list(exact["panels"])
+        target_span = view_span(view)
+        matches = [(item_key, item) for item_key, item in items.items() if item_overlaps(item, target_span)]
+        if len(matches) > 1:
+            target_pages = frozenset(view_indices(view) // (1 << 13))
+            matches = [(item_key, item) for item_key, item in matches if not target_pages.isdisjoint(item_pages(item))]
         for key, item in matches:
-            item_selected, item_remapped = remap_positions(view, view_indices(item["view"]))
+            positions = tuple(panel["positions"] for panel in item["panels"])
+            ends = np.cumsum([value.size for value in positions])
+            selected, remapped = remap_positions(view, item_indices(item)[np.concatenate(positions)])
             remaining = []
-            for panel in item["panels"]:
-                selected, remapped = (values[panel["positions"]] for values in (item_selected, item_remapped))
+            for panel, selected, remapped in zip(
+                item["panels"], np.split(selected, ends[:-1]), np.split(remapped, ends[:-1]), strict=True
+            ):
                 if not np.any(selected):
                     remaining.append(panel)
                     continue
@@ -423,26 +536,35 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
         flush_symbolic(view)
         return cast(np.ndarray, original_get(view))
 
+    def invalidate_written_view(view: Any) -> None:
+        """Preserve untouched data and discard provenance overlapped by a new write."""
+        target_span = view_span(view)
+        candidates = [
+            (pending_key, item)
+            for pending_key, item in allocation(pending, view).items()
+            if item_overlaps(item, target_span)
+        ]
+        if candidates:
+            flush(view)
+            for pending_key, item in candidates:
+                if np.any(remap_positions(view, item_indices(item))[0]):
+                    del allocation(pending, view)[pending_key]
+        take_symbolic(view)
+
     def set_data(view: Any, value: object) -> None:
         """Preserve pending subviews before an explicit write resets them."""
-        if (key := _view_key(view)) not in materializing:
-            candidates = [
-                (pending_key, item)
-                for pending_key, item in allocation(pending, view).items()
-                if spans_overlap(view, item["view"])
-            ]
-            if candidates:
-                flush(view)
-                for pending_key, item in candidates:
-                    if np.any(remap_positions(view, view_indices(item["view"]))[0]):
-                        del allocation(pending, view)[pending_key]
-            take_symbolic(view)
+        if _view_key(view) not in materializing:
+            invalidate_written_view(view)
         original_set(view, value)
 
     def tensor_copy(dst: Any, src: Any, engine: object, name: object) -> None:
-        """Copy values and retain matmul provenance across an RFactor drain."""
-        panels = pending_panels(src)
-        original_copy(dst, src, engine, name)
+        """Match native integer rounding or retain provenance across an RFactor drain."""
+        integer = str(engine) == "engine.vector" and str(dst.dtype).startswith(("int", "uint"))
+        panels = [] if integer else pending_panels(src)
+        if integer and (values := get_data(src)).dtype.kind == "f":
+            set_data(dst, np.rint(values).astype(to_numpy_dtype(dst.dtype)))
+        else:
+            original_copy(dst, src, engine, name)
         if panels:
             key = _view_key(dst)
             symbolic.setdefault(key[:2], {})[key] = {"dirty": True, "panels": panels, "view": dst}
@@ -477,37 +599,47 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
         if panels:
             symbolic.setdefault(destination[:2], {})[destination] = {"dirty": True, "panels": panels, "view": dst}
 
-    def matmul(
-        dst: Any,
-        stationary: Any,
-        moving: Any,
-        is_transpose: object,
-        row_pos: object,
-        col_pos: object,
-        perf_mode: object,
-        accumulate: object,
-        name: object,
-    ) -> None:
+    def activation(**keywords: object) -> None:
+        """Evaluate erf-based activations in FP32 when simulator approximations are too coarse."""
+        operation = str(keywords["op"])
+        if operation not in {"erf", "gelu"} or keywords["reduce_op"] is not None:
+            original_activation(**keywords)
+            return
+        values = get_data(keywords["data"]).astype(np.float32) * cast(float, keywords["scale"])
+        bias = keywords["bias"]
+        if bias is not None:
+            values = values + (get_data(bias).astype(np.float32) if hasattr(bias, "tensor") else cast(float, bias))
+        transformed = values / np.sqrt(2.0) if operation == "gelu" else values
+        result = np.asarray(np.frompyfunc(erf, 1, 1)(transformed), dtype=np.float32)
+        result = 0.5 * values * (1.0 + result) if operation == "gelu" else result
+        set_data(keywords["dst"], result)
+
+    def matmul(**keywords: object) -> None:
         """Record one contraction tile or delegate unsupported matmul modes."""
-        if is_transpose or stationary.ti_state is not None or moving.ti_state is not None:
-            original_matmul(dst, stationary, moving, is_transpose, row_pos, col_pos, perf_mode, accumulate, name)
+        dst, stationary, moving = (cast(Any, keywords[name]) for name in ("dst", "stationary", "moving"))
+        if keywords["is_transpose"] or stationary.ti_state is not None or moving.ti_state is not None:
+            original_matmul(**keywords)
             return
         left, right = (
-            _flatten_to_2d(original_get(operand).astype(np.float32), perf_mode) for operand in (stationary, moving)
+            _flatten_to_2d(original_get(operand).astype(np.float32), keywords["perf_mode"])
+            for operand in (stationary, moving)
         )
         key, written = _view_key(dst), get_current_context().psum_written
         bucket = pending.setdefault(key[:2], {})
-        should_accumulate = accumulate if accumulate is not None else key in written
-        if accumulate is False or key not in bucket:
+        should_accumulate = keywords["accumulate"] if keywords["accumulate"] is not None else key in written
+        if keywords["accumulate"] is False or key not in bucket:
+            invalidate_written_view(dst)
             bucket[key] = {
                 "base": original_get(dst).copy() if should_accumulate else None,
                 "dirty": False,
                 "moving": [],
+                "name": [],
                 "stationary": [],
                 "view": dst,
             }
         bucket[key]["stationary"].append(left.copy())
         bucket[key]["moving"].append(right.copy())
+        bucket[key]["name"].append(str(keywords["name"]))
         bucket[key]["dirty"] = True
         written[key] = True
 
@@ -526,38 +658,62 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
 
         return reduce
 
-    with _SIMULATION_LOCK:
-        language_ops.get_numpy_reduce_op = numpy_reduce_op
-        simulator.nc_matmul, simulator.tensor_copy, simulator.tensor_tensor_arith = matmul, tensor_copy, tensor_tensor
-        simulator.sendrecv = sendrecv
-        SimulatorTensorView.get_data, SimulatorTensorView.set_data = get_data, set_data
-        try:
-            yield
-        finally:
-            language_ops.get_numpy_reduce_op = original_reduce_op
-            simulator.nc_matmul, simulator.tensor_copy = original_matmul, original_copy
-            simulator.tensor_tensor_arith = original_tensor_tensor
-            simulator.sendrecv = original_sendrecv
-            SimulatorTensorView.get_data, SimulatorTensorView.set_data = original_get, original_set
+    language_ops.get_numpy_reduce_op = numpy_reduce_op
+    simulator.activation = activation
+    simulator.nc_matmul, simulator.tensor_copy, simulator.tensor_tensor_arith = matmul, tensor_copy, tensor_tensor
+    simulator.sendrecv = sendrecv
+    SimulatorTensorView.get_data, SimulatorTensorView.set_data = get_data, set_data
+    try:
+        yield
+    finally:
+        language_ops.get_numpy_reduce_op = original_reduce_op
+        simulator.activation = original_activation
+        simulator.nc_matmul, simulator.tensor_copy = original_matmul, original_copy
+        simulator.tensor_tensor_arith = original_tensor_tensor
+        simulator.sendrecv = original_sendrecv
+        SimulatorTensorView.get_data, SimulatorTensorView.set_data = original_get, original_set
 
 
-def _simulate_kernel_fp32(kernel: object, call: tuple[tuple[object, ...], dict[str, object]]) -> object:
-    """Run one rewritten kernel with grouped tiled matmul reduction."""
-    with _grouped_matmul_accumulation():
+def _simulate_kernel_fp32(
+    kernel: object, call: tuple[tuple[object, ...], dict[str, object]], grouped: bool = True
+) -> object:
+    """Run one rewritten kernel, optionally matching grouped reference reductions."""
+    with _SIMULATION_LOCK, _regular_tensor_views(), _grouped_matmul_accumulation() if grouped else nullcontext():
         return nki.simulate(kernel)(*call[0], **call[1])
 
 
-def _simulate_source_fp32(source: str, func_name: str, inputs: dict[str, np.ndarray]) -> ArrayResult:
-    """Execute one standalone rendered kernel through the fp32 simulator."""
+def _simulate_source_fp32(
+    source: str, func_name: str, inputs: dict[str, np.ndarray], grouped: bool = False
+) -> ArrayResult:
+    """Execute native FP32 simulation or the explicit reference-grouping fallback."""
+    output_dtypes = _output_dtypes(source, func_name)
     namespace: dict = {}
     exec(compile(_fp32_source(source), f"<batch-case-{func_name}>", "exec"), namespace)  # noqa: S102
     kernel = namespace[func_name][1 + bool(_LNC2.search(source.replace(" ", "")))]
-    result = _simulate_kernel_fp32(kernel, ((), cast(dict[str, object], inputs)))
-    return tuple(np.asarray(value) for value in result) if isinstance(result, tuple) else np.asarray(result)
+    result = _simulate_kernel_fp32(kernel, ((), cast(dict[str, object], inputs)), grouped)
+    values = [np.asarray(value) for value in (result if isinstance(result, tuple) else (result,))]
+    if len(values) != len(output_dtypes):
+        raise ValueError(f"generated kernel returned {len(values)} outputs for {len(output_dtypes)} ABI dtypes")
+    for index, (value, dtype) in enumerate(zip(values, output_dtypes, strict=True)):
+        if dtype in _FP_DTYPES_NON_FP32:
+            values[index] = value.astype(np.float32 if dtype == "tfloat32" else np.dtype(dtype)).astype(np.float32)
+    return values[0] if len(values) == 1 else tuple(values)
 
 
-def _assert_outputs(label: str, actual: ArrayResult, expected: ArrayResult) -> None:
+@cache
+def _custom_validator(source: str) -> Any:
+    """Compile a caller-supplied NumPy validator once per worker."""
+    namespace: dict[str, Any] = {"np": np}
+    exec(compile(source, "<simulation-validator>", "exec"), namespace)  # noqa: S102
+    return next(value for name, value in namespace.items() if name != "np" and callable(value))
+
+
+def _assert_outputs(actual: ArrayResult, case: _SerializedCase) -> None:
     """Compare one simulated result with its reference outputs."""
+    _index, label, _source, _name, inputs, expected, validation = case
+    if validation is not None:
+        _custom_validator(validation[0])(actual, expected, inputs, validation[1])
+        return
     actuals, expecteds = (value if isinstance(value, tuple) else (value,) for value in (actual, expected))
     assert len(actuals) == len(expecteds), f"{label}: returned {len(actuals)} outputs, expected {len(expecteds)}"
     for pair in zip(actuals, expecteds, strict=True):
@@ -566,9 +722,12 @@ def _assert_outputs(label: str, actual: ArrayResult, expected: ArrayResult) -> N
 
 def _simulate_case(position: int) -> _FailurePayload | None:
     """Simulate one globally initialized case and return its failure."""
-    case_index, label, source, func_name, inputs, expected = _WORKER_CASES[position]
+    case_index, label, source, func_name, inputs, _expected, _validation = case = _WORKER_CASES[position]
     try:
-        _assert_outputs(label, _simulate_source_fp32(source, func_name, inputs), expected)
+        try:
+            _assert_outputs(_simulate_source_fp32(source, func_name, inputs), case)
+        except AssertionError:
+            _assert_outputs(_simulate_source_fp32(source, func_name, inputs, grouped=True), case)
     except Exception as error:
         return {
             "case_index": case_index,
@@ -586,7 +745,7 @@ def _worker_result(
     global _WORKER_ATOL, _WORKER_CASES, _WORKER_RTOL
     input_bytes = max((sum(value.nbytes for value in case[4].values()) for case in cases), default=0)
     for inputs in {id(case[4]): case[4] for case in cases}.values():
-        inputs.update({name: value.astype(np.float32) for name, value in inputs.items() if value.dtype.kind == "f"})
+        inputs.update({n: v.astype("f4") for n, v in inputs.items() if v.dtype.kind == "f" and v.dtype != "f4"})
     cases.sort(key=lambda c: sum(16 ** (s.find("nisa") // 4) for s in c[2].splitlines() if "nisa." in s), reverse=True)
     _WORKER_CASES, _WORKER_ATOL, _WORKER_RTOL = cases, atol, rtol
     failures: list[_FailurePayload | None] = []
@@ -604,8 +763,8 @@ def _worker_result(
 
 def _run_worker(request_path: Path, result_path: Path) -> None:
     """Run one remote request and atomically write its result metadata."""
-    payload = pickle.loads(request_path.read_bytes())
-    cases, atol, rtol, worker_count = cast(tuple[list[_SerializedCase], float, float, int], payload)
+    with request_path.open("rb") as request:
+        cases, atol, rtol, worker_count = cast(tuple[list[_SerializedCase], float, float, int], pickle.load(request))
     result, temporary_path = _worker_result(cases, atol, rtol, worker_count), result_path.with_suffix(".tmp")
     temporary_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     temporary_path.replace(result_path)

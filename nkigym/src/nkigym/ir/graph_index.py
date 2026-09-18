@@ -11,22 +11,20 @@ def ordered_tree_topology(
     """Return preorder positions, root-first ancestors, and descendants in one traversal."""
     preorder: list[int] = []
     ancestors: dict[int, tuple[int, ...]] = {root: ()}
-    pending = [root]
+    pending, successors = [root], getattr(graph, "_succ")
     while pending:
         nid = pending.pop()
         preorder.append(nid)
-        children = tuple(graph.successors(nid))
+        children = successors[nid]
         child_ancestors = (*ancestors[nid], nid)
         for child in children:
             ancestors[child] = child_ancestors
         pending.extend(reversed(children))
-    mutable_descendants: dict[int, set[int]] = {nid: set() for nid in preorder}
-    for nid in reversed(preorder):
-        for child in graph.successors(nid):
-            mutable_descendants[nid].add(child)
-            mutable_descendants[nid].update(mutable_descendants[child])
     order = {nid: index for index, nid in enumerate(preorder)}
-    descendants = {nid: frozenset(values) for nid, values in mutable_descendants.items()}
+    ends: dict[int, int] = {}
+    for nid in reversed(preorder):
+        ends[nid] = ends[next(reversed(successors[nid]))] if successors[nid] else order[nid] + 1
+    descendants = {nid: frozenset(preorder[order[nid] + 1 : ends[nid]]) for nid in preorder}
     return order, ancestors, descendants
 
 

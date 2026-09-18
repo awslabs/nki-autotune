@@ -18,6 +18,8 @@ class NKIHBMFreeSlice(NKIOp):
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None, "O": None}
     INPUT_SLICES: ClassVar[dict[str, tuple[tuple[int, str, str], ...]]] = {"src": ((1, "start", "width"),)}
     CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"start", "width"})
+    OUTPUT_DTYPE: ClassVar[str | None] = "float32"
+    OUTPUT_STORAGE_DTYPE: ClassVar[str | None] = "float32"
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
     def _check_roles(self, **kwargs: Any) -> None:
@@ -31,7 +33,7 @@ class NKIHBMFreeSlice(NKIOp):
     def _run(self, **kwargs: Any) -> np.ndarray:
         """Return one copied HBM free-axis interval."""
         start, width = int(kwargs["start"]), int(kwargs["width"])
-        return np.asarray(kwargs["src"])[:, start : start + width].copy()
+        return np.asarray(kwargs["src"], dtype=np.float32)[:, start : start + width].copy()
 
 
 __all__ = ["NKIHBMFreeSlice"]

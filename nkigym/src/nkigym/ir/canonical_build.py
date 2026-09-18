@@ -6,8 +6,8 @@ fully-shaped :class:`KernelTree` whose root is a :class:`BlockNode`
 (empty iter_vars/reads/writes) containing one leaf ``BlockNode`` per
 non-alloc op, in source order.
 
-Every compute op (including memset) becomes a sibling leaf block under
-the root block, preserving source order.
+Every compute op (including memset) becomes one leaf block in source order.
+Explicit repeated bodies group those blocks under sequential loop scopes.
 
 Buffer placement is delegated to
 :func:`nkigym.ir.buffer_placement.place_buffers`.
@@ -19,6 +19,12 @@ from dataclasses import replace
 
 from nkigym.ir.arith.expr import Const, Var
 from nkigym.ir.dimension_analysis import _AnalysisResult, _OpRecord
+from nkigym.ir.operand_layout import (
+    build_access_patterns,
+    build_operand_region,
+    canonical_tile_size,
+    canonical_trip_count,
+)
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole
 from nkigym.ops.memset import NKIMemset
@@ -28,17 +34,20 @@ def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
     """Build the canonical :class:`BlockNode`-rooted tree.
 
     Tree.root is already an empty BlockNode from KernelTree.__init__.
-    Build leaf blocks under it, seed all Buffers on the root, then run
-    LCA placement to distribute them to their lifetime-dominating blocks.
+    Build leaf blocks, wrap explicit repetitions, seed all Buffers on the root,
+    then use LCA placement to distribute their lifetime-dominating declarations.
     """
     from nkigym.ir.buffer_placement import collect_buffers, place_buffers
 
     tree = KernelTree()
-    op_records = list(analysis.ops)
-    for rec in op_records:
+    groups: list[list[int]] = []
+    for rec in analysis.ops:
+        group = []
         if rec.op_cls.SYNTHESIZE_RMW_INITIALIZER and rec.op_cls.rmw_operands(rec.kwargs):
-            _build_memset_subblock(tree, tree.root, rec, analysis)
-        _build_subblock(tree, tree.root, rec, analysis)
+            group.append(_build_memset_subblock(tree, tree.root, rec, analysis))
+        group.append(_build_subblock(tree, tree.root, rec, analysis))
+        groups.append(group)
+    _wrap_repetitions(tree, analysis, groups)
     buffers_by_name = collect_buffers(analysis.tensors, analysis.param_names, tree)
     """Seed every Buffer on the root block, then let place_buffers redistribute by LCA."""
     root_blk = tree.data(tree.root)
@@ -47,10 +56,43 @@ def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
     return tree
 
 
+def _wrap_repetitions(tree: KernelTree, analysis: _AnalysisResult, groups: list[list[int]]) -> None:
+    """Wrap traced operation intervals in ordinary sequential loop scopes."""
+    for first, last, count in analysis.repetitions:
+        if count == 1:
+            continue
+        selected = [nid for group in groups[first:last] for nid in group]
+        children = tree.children(tree.root)
+        position = children.index(selected[0])
+        if children[position : position + len(selected)] != selected:
+            raise ValueError("repeated operation intervals must be properly nested")
+        if isinstance(count, tuple):
+            region = BufferRegion(tensor=count[0], ranges=((Const(value=0), Const(value=1)),) * 2)
+            body = tree.add_node(replace(tree.block(tree.root), reads=(region,), annotations={"predicate": count}))
+            replacement = body
+        else:
+            axis = f"d{len(analysis.dim_sizes)}"
+            analysis.dim_sizes[axis] = count
+            loop_var = f"i_{axis}_0"
+            replacement = tree.add_node(ForNode(loop_var=loop_var, extent=count))
+            body = tree.add_node(
+                replace(
+                    tree.block(tree.root),
+                    iter_vars=(IterVar(axis=axis, dom=(0, count), role=AxisRole.SEQUENTIAL),),
+                    iter_values=(Var(name=loop_var),),
+                    axis_map={"R": axis},
+                ),
+                parent=replacement,
+            )
+        children[position : position + len(selected)] = [replacement]
+        tree.graph.remove_edges_from((tree.root, nid) for nid in tree.children(tree.root))
+        tree.graph.add_edges_from((tree.root, nid) for nid in children)
+        tree.graph.add_edges_from((body, nid) for nid in selected)
+        groups[first:last] = [[replacement], *([] for _ in range(last - first - 1))]
+
+
 def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysis: "_AnalysisResult") -> int:
     """Construct one :class:`BlockNode` + its loop chain + ISA leaf; return the block's nid."""
-    from nkigym.ir.operand_layout import build_access_patterns, canonical_tile_size, canonical_trip_count
-
     iter_vars: list[IterVar] = []
     iter_values: list = []
     loop_var_names: dict[str, str] = {}
@@ -60,16 +102,22 @@ def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysi
         iter_vars.append(IterVar(axis=concrete, dom=(0, extent), role=role))
         loop_var = f"i_{concrete}_0"
         loop_var_names[abstract] = loop_var
-        if canonical_trip_count(rec, abstract, analysis) > 1:
-            iter_values.append(Var(name=loop_var))
-        else:
-            iter_values.append(Const(value=0))
-    reads, writes = _operand_regions(rec, loop_var_names, analysis)
+        iter_values.append(Var(name=loop_var) if canonical_trip_count(rec, abstract, analysis) > 1 else Const(value=0))
+    operand_bindings = {
+        slot: build_operand_region(rec, slot, loop_var_names, analysis, canonical_tile_size, canonical_trip_count)
+        for slot in rec.op_cls.OPERAND_AXES
+        if slot in rec.operand_names
+    }
+    rmw_operands = rec.op_cls.rmw_operands(rec.kwargs)
     block = BlockNode(
         iter_vars=tuple(iter_vars),
         iter_values=tuple(iter_values),
-        reads=tuple(reads),
-        writes=tuple(writes),
+        reads=tuple(
+            region
+            for slot, region in operand_bindings.items()
+            if slot in rec.op_cls.INPUT_OPERANDS or slot in rmw_operands
+        ),
+        writes=tuple(region for slot, region in operand_bindings.items() if slot not in rec.op_cls.INPUT_OPERANDS),
         alloc_buffers=(),
         axis_map=dict(rec.axis_map),
     )
@@ -81,7 +129,6 @@ def _build_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", analysi
             loop_var = loop_var_names[abstract]
             for_nid = tree.add_node(ForNode(loop_var=loop_var, extent=trip), parent=parent_for_loops)
             parent_for_loops = for_nid
-    operand_bindings = _operand_bindings(rec, loop_var_names, analysis)
     access_patterns = build_access_patterns(rec, loop_var_names, analysis, canonical_tile_size, canonical_trip_count)
     op_kwargs = dict(rec.kwargs)
     for abstract, (key, slot) in getattr(rec.op_cls, "SPLIT_OFFSET_KWARGS", {}).items():
@@ -107,13 +154,11 @@ def _build_memset_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", 
     The dependency edge falls out by sibling pre-order: memset writes the
     PSUM region, the matmul RMW-reads+writes it (WAW/RAW after memset).
 
-    ``rec``'s RMW slot axes (e.g. matmul dst ``(M, N)``) are remapped onto
-    memset's own abstract axes ``(P, F)`` positionally, so the synthesized
-    record renders correctly against the PSUM tensor.
+    The accumulator's physical dimension IDs are mapped onto memset's
+    ``(P, F)`` axes, preserving the complete extent of packed axis groups.
     """
     rmw_slot = next(iter(rec.op_cls.rmw_operands(rec.kwargs)))
-    rmw_axes = rec.op_cls.OPERAND_AXES[rmw_slot]
-    memset_concrete = [rec.axis_map[a] for a in rmw_axes if a in rec.axis_map]
+    memset_concrete = analysis.tensors[rec.operand_names[rmw_slot]].dim_ids
     memset_axis_map = {abstract: concrete for abstract, concrete in zip(NKIMemset.OPERAND_AXES["dst"], memset_concrete)}
     memset_rec = _OpRecord(
         op_cls=NKIMemset,
@@ -122,46 +167,3 @@ def _build_memset_subblock(tree: KernelTree, parent_nid: int, rec: "_OpRecord", 
         kwargs={"value": 0.0},
     )
     return _build_subblock(tree, parent_nid, memset_rec, analysis)
-
-
-def _operand_regions(
-    rec: "_OpRecord", loop_var_names: dict[str, str], analysis: "_AnalysisResult"
-) -> tuple[list[BufferRegion], list[BufferRegion]]:
-    """Build (reads, writes) BufferRegion lists from ``rec.operand_names`` and OPERAND_AXES."""
-    reads: list[BufferRegion] = []
-    writes: list[BufferRegion] = []
-    rmw_operands = rec.op_cls.rmw_operands(rec.kwargs)
-    for slot, axes in rec.op_cls.OPERAND_AXES.items():
-        if slot not in rec.operand_names:
-            continue
-        region = _build_region(rec, slot, axes, loop_var_names, analysis)
-        if slot in rec.op_cls.INPUT_OPERANDS:
-            reads.append(region)
-        elif slot in rmw_operands:
-            reads.append(region)
-            writes.append(region)
-        else:
-            writes.append(region)
-    return reads, writes
-
-
-def _operand_bindings(
-    rec: "_OpRecord", loop_var_names: dict[str, str], analysis: "_AnalysisResult"
-) -> dict[str, BufferRegion]:
-    """Build the per-slot :class:`BufferRegion` map for the ISA leaf."""
-    out: dict[str, BufferRegion] = {}
-    for slot, axes in rec.op_cls.OPERAND_AXES.items():
-        if slot not in rec.operand_names:
-            continue
-        out[slot] = _build_region(rec, slot, axes, loop_var_names, analysis)
-    return out
-
-
-def _build_region(
-    rec: "_OpRecord", slot: str, axes: tuple[str, ...], loop_var_names: dict[str, str], analysis: "_AnalysisResult"
-) -> BufferRegion:
-    """Construct one dependency region from the operation's physical axis groups."""
-    from nkigym.ir.operand_layout import build_operand_region, canonical_tile_size, canonical_trip_count
-
-    _ = axes
-    return build_operand_region(rec, slot, loop_var_names, analysis, canonical_tile_size, canonical_trip_count)

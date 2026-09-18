@@ -1,8 +1,12 @@
 """Grouped HBM-to-SBUF reshaping through ``nisa.dma_copy``."""
 
+import operator
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import numpy as np
+import torch
+from torch.fx import GraphModule, Node
 
 from nkigym.codegen.torch_values import TorchSegments, TorchValue
 from nkigym.ops.base import NKIOp, _operand_role
@@ -61,6 +65,46 @@ def emit_rotational_topk(
     state = prepare_rotational_topk(source, config, rotation, stem, body, imports)
     selected = emit_rotational_topk_stages(*state, config, stem, body, imports)
     return emit_rotational_topk_outputs(*selected, k, config, stem, body, imports)
+
+
+def configure_topk_layout(
+    graph: GraphModule, reference: object, specs: dict[str, tuple[tuple[int, ...], str]]
+) -> GraphModule:
+    """Attach reference precision contracts and fold large interchangeable selections."""
+    for node in tuple(graph.graph.nodes):
+        node.meta["activation_storage_dtype"] = getattr(reference, "activation_storage_dtype", None)
+        node.meta["arithmetic"] = getattr(reference, "arithmetic", "reference")
+        node.meta["activation_residency"] = getattr(reference, "activation_residency", "auto")
+        node.meta["matmul_input_dtype"] = getattr(reference, "matmul_input_dtype", None)
+        if node.target is not torch.topk:
+            continue
+        node.meta["selection_ties"] = getattr(reference, "selection_ties", "reference")
+        source, count = node.args[0], node.kwargs.get("k", node.args[1] if len(node.args) > 1 else None)
+        if node.meta["selection_ties"] != "any" or not isinstance(source, Node) or source.op != "placeholder":
+            continue
+        shape = specs[str(source.target)][0]
+        if len(shape) != 2 or not isinstance(count, int) or not 256 <= count <= shape[1] <= 32768:
+            continue
+        rows, width = shape
+        partitions = min(128, max(32, 32768 // count))
+        stages = next(
+            (
+                value
+                for value in (32, 16, 8, 4, 2)
+                if rows * value <= partitions and width % value == count % (value * 8) == 0
+            ),
+            0,
+        )
+        if not stages:
+            continue
+        config = (1, rows, stages, width // stages, count // stages)
+        with graph.graph.inserting_before(node):
+            packed = graph.graph.call_function(operator.getitem, (source, ("rotational_topk", *config)))
+        packed.meta["example_value"] = SimpleNamespace(shape=(rows, stages * (width // stages + count)))
+        node.replace_input_with(source, packed)
+        node.meta["rotational_topk"] = config
+    graph.recompile()
+    return graph
 
 
 def emit_output_stores(outputs: tuple[TorchValue, ...], body: list[str]) -> tuple[str, ...]:

@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from nkigym.ir import KernelIR
 from nkigym.ir.program_sharding import PROGRAM_SHARDS_ANNOTATION, configured_program_shards
 from nkigym.ir.tree import BlockNode, ISANode
-from nkigym.ops.base import CopyContract, PermutationContract, PointwiseContract
+from nkigym.ops.base import CopyContract, PermutationContract, PointwiseContract, SliceContract
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -93,7 +93,7 @@ class EliminateDeadProducer(Transform[EliminateDeadProducerOption]):
             return result
         leaf = ir.tree.isa(leaf_nid)
         contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
-        if not isinstance(contract, (CopyContract, PermutationContract, PointwiseContract)):
+        if not isinstance(contract, (CopyContract, PermutationContract, PointwiseContract, SliceContract)):
             return result
         output = leaf.operand_bindings.get(contract.output_operand)
         if output is None or output.tensor in ir.param_buffers or output.tensor in ir.return_names:

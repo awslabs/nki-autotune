@@ -7,7 +7,7 @@ from math import prod
 
 from nkigym.ir import AccessPattern, BufferRegion, KernelIR
 from nkigym.ir.arith.analyzer import Analyzer
-from nkigym.ir.arith.expr import Const, Expr, Mod, Mul, NonAffineError, Var, expr_variables, substitute, to_affine
+from nkigym.ir.arith.expr import Add, Const, Expr, Mod, Mul, NonAffineError, Var, expr_variables, substitute, to_affine
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.program_sharding import PROGRAM_SHARDS_ANNOTATION, configured_program_shards
 from nkigym.ir.tree import BlockNode, Buffer, ForNode, ISANode, KernelTree
@@ -147,8 +147,13 @@ class Fuse(Transform[FuseOption]):
             axis = _axis_of_loop(ir.tree, option.target_nids[0])
             if axis is None or axis != _axis_of_loop(ir.tree, option.target_nids[1]):
                 raise TransformLegalityError("Fuse outer-trip loops must bind the same concrete block axis")
-            if len(sharded_targets) > 1:
-                raise TransformLegalityError("Fuse cannot merge multiple program-sharded loops")
+            if any(
+                isinstance((node := ir.tree.data(nid)), ISANode) and "reduce_cmd" in node.kwargs
+                for nid in ir.tree.preorder(option.target_nids[0])
+            ):
+                raise TransformLegalityError("Fuse cannot merge loop scopes around a stateful reduction command")
+            if option.target_nids[1] in shards:
+                raise TransformLegalityError("Fuse cannot change the iteration ownership of an inner program shard")
             _check_no_partial_loop_dependence(ir.tree, option.target_nids)
         else:
             """Tensorize flavour: prefix is ForNodes; last is the ISA leaf."""
@@ -177,6 +182,7 @@ class Fuse(Transform[FuseOption]):
                 if iter_var.axis == option.target_axis
             ]
             loop_var = ir.tree.loop(option.target_nids[0]).loop_var
+            _check_ownership_absorption(leaf, block, loop_var)
             if len(target_values) != 1 or loop_var not in expr_variables(target_values[0]):
                 raise TransformLegalityError(
                     f"Fuse.target_axis={option.target_axis!r} is not bound by loop {option.target_nids[0]}"
@@ -226,7 +232,7 @@ class Fuse(Transform[FuseOption]):
                 if index == target_index:
                     coefficient = to_affine(_local_loop_expr(lower, loop_var, local_extent)).get(loop_var, 0)
                     width_terms = to_affine(width)
-                    if coefficient and (set(width_terms) != {None} or coefficient != width_terms[None]):
+                    if set(width_terms) != {None} or coefficient != width_terms[None]:
                         invalid_uses.append(f"non-contiguous operand {slot}[{index}]")
         if invalid_uses:
             uses = ", ".join(invalid_uses)
@@ -287,6 +293,7 @@ class Fuse(Transform[FuseOption]):
         if contract is None or set(contract.operands) != set(leaf.operand_bindings):
             raise TransformLegalityError("Fuse operation has no complete partition-tile batching contract")
         block = ir.tree.block(block_nid)
+        _check_ownership_absorption(leaf, block, loop.loop_var)
         roles = [
             iter_var.role
             for iter_var, value in zip(block.iter_vars, block.iter_values)
@@ -295,11 +302,18 @@ class Fuse(Transform[FuseOption]):
         if roles != [AxisRole.PARALLEL]:
             raise TransformLegalityError("Fuse operation batching requires one parallel tile axis")
         buffer_map = ir.all_buffers() if buffers is None else buffers
+        partitions = {
+            buffer_map[region.tensor].partition_extent()
+            for region in leaf.operand_bindings.values()
+            if buffer_map[region.tensor].location in {"sbuf", "psum"}
+        }
+        if len(partitions) != 1:
+            raise TransformLegalityError("Fuse operation batching requires matching on-chip partition extents")
+        partition = next(iter(partitions))
         analyzer = Analyzer()
         for slot in contract.operands:
             region = leaf.operand_bindings[slot]
             buffer = buffer_map[region.tensor]
-            partition = buffer.partition_extent() if buffer.location != "shared_hbm" else 0
             valid = bool(
                 buffer.location in {"sbuf", "psum"}
                 and len(buffer.shape) == 2
@@ -308,9 +322,12 @@ class Fuse(Transform[FuseOption]):
                 and loop.extent == buffer.logical_tile_count()
                 and len(region.ranges) == 2
                 and region.ranges[0][1] == Const(value=partition)
-                and region.ranges[1] == (Const(value=0), Const(value=buffer.shape[1]))
+                and region.ranges[1][1] == Const(value=buffer.shape[1])
+                and analyzer.can_prove_equal(region.ranges[1][0], Const(value=0))
                 and analyzer.can_prove_equal(region.ranges[0][0], Var(name=loop.loop_var))
             )
+            if buffer.location == "shared_hbm" and leaf.op_cls.NAME == "dma_copy":
+                valid = _hbm_batch_region_matches(buffer, region, loop, partition)
             if not valid:
                 raise TransformLegalityError(
                     f"Fuse {leaf.op_cls.__name__}.{slot} is not one contiguous partition-tile family"
@@ -338,15 +355,33 @@ class Fuse(Transform[FuseOption]):
         leaf = ir.tree.isa(match.leaf_nid)
         buffers = ir.all_buffers()
         bindings = {
-            slot: _tile_regions(buffers[leaf.operand_bindings[slot].tensor])[0] for slot in match.contract.operands
+            slot: (
+                _batch_iteration_region(leaf.operand_bindings[slot], loop, 0)
+                if buffers[leaf.operand_bindings[slot].tensor].location == "shared_hbm"
+                else _tile_regions(buffers[leaf.operand_bindings[slot].tensor])[0]
+            )
+            for slot in match.contract.operands
         }
         patterns = {
-            slot: _full_buffer_pattern(buffers[leaf.operand_bindings[slot].tensor]) for slot in match.contract.operands
+            slot: (
+                _hbm_batch_pattern(buffers[region.tensor], region, loop)
+                if buffers[region.tensor].location == "shared_hbm"
+                else _full_buffer_pattern(buffers[region.tensor])
+            )
+            for slot, region in leaf.operand_bindings.items()
         }
 
         def expand(regions: tuple[BufferRegion, ...]) -> tuple[BufferRegion, ...]:
             """Replace each one-tile footprint with its complete logical family."""
-            return tuple(tile for region in regions for tile in _tile_regions(buffers[region.tensor]))
+            return tuple(
+                tile
+                for region in regions
+                for tile in (
+                    tuple(_batch_iteration_region(region, loop, index) for index in range(loop.extent))
+                    if buffers[region.tensor].location == "shared_hbm"
+                    else _tile_regions(buffers[region.tensor])
+                )
+            )
 
         block = ir.tree.block(match.block_nid)
         ir.tree.graph.nodes[match.block_nid]["data"] = replace(
@@ -480,6 +515,18 @@ class Fuse(Transform[FuseOption]):
             output_axis = current.op_cls.operand_dimension(output_slot, abstract_axis)
             kwargs = {**current.kwargs, offset_key: current.operand_bindings[output_slot].ranges[output_axis][0]}
             ir.tree.graph.nodes[leaf_nid]["data"] = replace(current, kwargs=kwargs)
+
+
+def _check_ownership_absorption(leaf: ISANode, block: BlockNode, loop_var: str) -> None:
+    """Require loop absorption to preserve every store's owning program."""
+    ownership = leaf.kwargs.get("program_ownership")
+    if ownership is not None:
+        axis, programs = ownership
+        value = next(value for variable, value in zip(block.iter_vars, block.iter_values) if variable.axis == axis)
+        original = Mod(left=value, right=Const(value=programs))
+        absorbed = substitute(original, {loop_var: Const(value=0)})
+        if not Analyzer().can_prove_equal(original, absorbed):
+            raise TransformLegalityError("Fuse cannot absorb a loop that selects store program ownership")
 
 
 def _maximum_tensorize_width(leaf: ISANode, abstract_axis: str | None, buffers: dict[str, Buffer]) -> int | None:
@@ -694,6 +741,52 @@ def _full_buffer_pattern(buffer: Buffer) -> AccessPattern:
             (Const(value=1), Const(value=free)),
         ),
         offset=Const(value=0),
+    )
+
+
+def _batch_iteration_region(region: BufferRegion, loop: ForNode, index: int) -> BufferRegion:
+    """Return the exact region accessed by one removed loop iteration."""
+    replacements: dict[str, Expr] = {loop.loop_var: Const(value=index)}
+    analyzer = Analyzer()
+    return replace(
+        region,
+        ranges=tuple(
+            (analyzer.simplify(substitute(lower, replacements)), analyzer.simplify(substitute(width, replacements)))
+            for lower, width in region.ranges
+        ),
+    )
+
+
+def _hbm_batch_region_matches(buffer: Buffer, region: BufferRegion, loop: ForNode, partition: int) -> bool:
+    """Require consecutive HBM row tiles with an invariant column slice."""
+    valid = False
+    if len(buffer.shape) == len(region.ranges) == 2:
+        base = _batch_iteration_region(region, loop, 0).ranges[0][0]
+        valid = (
+            buffer.shape[0] >= loop.extent * partition
+            and region.ranges[0][1] == Const(value=partition)
+            and isinstance(region.ranges[1][1], Const)
+            and 0 < region.ranges[1][1].value <= buffer.shape[1]
+            and loop.loop_var not in expr_variables(region.ranges[1][0])
+            and Analyzer().can_prove_equal(
+                region.ranges[0][0],
+                Add(left=base, right=Mul(left=Var(name=loop.loop_var), right=Const(value=partition))),
+            )
+        )
+    return valid
+
+
+def _hbm_batch_pattern(buffer: Buffer, region: BufferRegion, loop: ForNode) -> AccessPattern:
+    """Map row-major HBM rows to the same P, tile, F coordinates as packed SBUF."""
+    first = _batch_iteration_region(region, loop, 0)
+    free = Const(value=buffer.shape[1])
+    return AccessPattern(
+        pattern=(
+            (free, first.ranges[0][1]),
+            (Analyzer().simplify(Mul(left=first.ranges[0][1], right=free)), Const(value=loop.extent)),
+            (Const(value=1), first.ranges[1][1]),
+        ),
+        offset=Analyzer().simplify(Add(left=Mul(left=first.ranges[0][0], right=free), right=first.ranges[1][0])),
     )
 
 

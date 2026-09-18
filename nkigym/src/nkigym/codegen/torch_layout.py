@@ -1,7 +1,5 @@
 """FX graph layouts normalized by the generated Torch kernel ABI."""
 
-from __future__ import annotations
-
 import operator
 from typing import cast
 
@@ -25,7 +23,7 @@ def input_layouts(graph_module: GraphModule) -> Layouts:
                 targets = cast(Node, targets.args[0])
             if logits.op == targets.op == "placeholder" and operation == "cross_entropy":
                 rows, vocab = _graph_shape(logits)
-                divisors = filter(lambda extent: rows % extent == 0, range(1, min(32, rows // 2) + 1))
+                divisors = filter(lambda extent: rows % extent == 0, range(1, min(128, rows) + 1))
                 partitions = max(divisors, default=rows)
                 groups = rows // partitions
                 layouts[str(logits.target)] = (("cross_entropy_rows", groups), (partitions, groups * vocab))
@@ -163,7 +161,14 @@ def _convolution_layouts(node: Node, operation: str) -> Layouts:
         node.kwargs[name] if name in node.kwargs else node.args[index] if len(node.args) > index else default
         for name, index, default in (("stride", 3, 1), ("padding", 4, 0), ("dilation", 5, 1))
     )
-    arguments = tuple((value,) * rank if isinstance(value, int) else tuple(value) for value in raw_arguments)
+    arguments: list[tuple[int, ...]] = []
+    for value in raw_arguments:
+        if isinstance(value, int):
+            arguments.append((value,) * rank)
+        elif isinstance(value, (tuple, list)) and all(isinstance(item, int) for item in value):
+            arguments.append(tuple(cast(tuple[int, ...], value)))
+        else:
+            raise ValueError("convolution stride, padding, and dilation must be integers or integer sequences")
     rows = ((output_shape[0] * int(np.prod(output_shape[2:])) + 15) // 16) * 16
     columns = channels * int(np.prod(kernel))
     return {

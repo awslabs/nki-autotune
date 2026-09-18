@@ -96,9 +96,10 @@ def _emit_grouped_attention_prefix(
             f"{base}_maximum_broadcast_ps = NKITransposeBroadcast(partitions={width})(data={base}_maximum)",
             f"{base}_maximum_broadcast = NKITensorCopy()(src={base}_maximum_broadcast_ps)",
             f"{base}_maximum_full = NKITileBroadcast(chunks={chunks}, tiles={tiles}, groups={groups}, "
-            f"queries={queries})(data={base}_maximum_broadcast)",
+            f"queries={queries})(src={base}_maximum_broadcast)",
             f'{base}_centered = NKITensorTensor(op="subtract")(data1={base}_masked, data2={base}_maximum_full)',
-            f'{base}_exponential = NKIActivation(op="exp")(data={base}_centered)',
+            f'{base}_exponential_fp32 = NKIActivation(op="exp")(data={base}_centered)',
+            f"{base}_exponential = NKIBF16Cast()(data={base}_exponential_fp32)",
             f"{base}_one_iota = NKIIota(partitions={width}, width=1, pattern=[[0, 1]], "
             f"offset=1, channel_multiplier=0)()",
             f"{base}_ones = NKIBF16Cast()(data={base}_one_iota)",

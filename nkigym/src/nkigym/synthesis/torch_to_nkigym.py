@@ -17,14 +17,9 @@ from torch.fx import GraphModule, Node
 from nkigym.codegen.torch_abi import (
     OUTPUT_LAYOUTS,
     attention_graph,
-    cross_entropy_backward,
     direct_hbm_placeholder,
-    nonzero_compact,
-    packed_attention,
-    routed_gather,
     routed_graph,
     special_graph,
-    stable_softmax,
     token_attention_graph,
     trace_function,
 )
@@ -32,23 +27,30 @@ from nkigym.codegen.torch_layout import Layouts as _Layouts
 from nkigym.codegen.torch_layout import input_layouts as discover_input_layouts
 from nkigym.codegen.torch_layout import layout_graph
 from nkigym.codegen.torch_moe import emit_moe
+from nkigym.codegen.torch_selection import emit_torch_topk
 from nkigym.codegen.torch_values import TorchSegments as _Segments
 from nkigym.codegen.torch_values import TorchValue as _Value
-from nkigym.codegen.torch_values import emit_activation, emit_cast, emit_cumsum, emit_reduce, emit_slice, emit_topk
-from nkigym.codegen.torch_wide_topk import emit_wide_topk
+from nkigym.codegen.torch_values import emit_cast, emit_cumsum, emit_reduce, emit_slice, emit_topk
 from nkigym.ir import build_initial_ir
 from nkigym.ir.dimension_analysis import _DIMENSION_TRACE_LOCK, analyze_dimensions
 from nkigym.ir.operand_layout import CanonicalTileError
 from nkigym.ops import _OP_MODULES
-from nkigym.ops.dma_transpose import emit_oriented_value
+from nkigym.ops.bfloat16_cast import cast_matmul_producer, emit_activation_with_storage
+from nkigym.ops.find_index8 import emit_max_with_indices
+from nkigym.ops.float32_cast import emit_torch_cast
 from nkigym.ops.float32_scale import emit_tensor_scalar_or_divide
 from nkigym.ops.gather import emit_routed_gather
 from nkigym.ops.grouped_counts_copy import emit_bincount_source, emit_grouped_bincount
-from nkigym.ops.grouped_load import emit_output_stores, emit_rotational_topk
+from nkigym.ops.grouped_int32_cast import emit_rotational_selection
+from nkigym.ops.grouped_load import configure_topk_layout, emit_output_stores
 from nkigym.ops.grouped_vector_store import emit_grouped_cross_entropy
 from nkigym.ops.index_iota import emit_packed_topk_indices
+from nkigym.ops.load import emit_loaded_oriented_value
+from nkigym.ops.matmul import emit_product
+from nkigym.ops.max8 import emit_native_topk, static_prefix_width
 from nkigym.ops.reciprocal import emit_activation_or_reciprocal
 from nkigym.ops.stream_shuffle_broadcast import _stream_shuffle_source, _supports_free_broadcast
+from nkigym.ops.tensor_reduce import emit_reference_sum
 from nkigym.ops.tensor_scalar import _tensor_scalar_operands, _vector_broadcast
 from nkigym.ops.tiled_grouped_matmul import lower_grouped_attention
 from nkigym.profile import InputSpecs
@@ -63,7 +65,7 @@ _BINARY_OPERATIONS = {
 }
 _DIRECT_LOWERINGS = frozenset(
     "argsort bincount cat cross_entropy cross_entropy_backward cumsum logsumexp moe_experts nonzero_compact "
-    "grouped_attention packed_attention routed_gather sparse_topk_affinity "
+    "grouped_attention packed_attention routed_gather sorted_prefix sparse_topk_affinity "
     "stable_softmax topk".split()
 )
 _TORCH_TRACE_LOCK = Lock()
@@ -78,6 +80,7 @@ class _Program:
     input_specs: InputSpecs
     edge_axes: dict[str, frozenset[int]]
     output_shapes: tuple[tuple[int, ...], ...]
+    output_dtypes: tuple[str, ...]
     output_groups: tuple[int, ...]
     sort_topk_output: bool | None
 
@@ -117,8 +120,9 @@ class _Lowerer:
             raise ValueError("Torch synthesis graph has no tensor output")
         emit_output_stores(self.outputs, self.body)
         imports = ["from nkigym.ops import nkigym_kernel"]
+        modules = {**_OP_MODULES, "nkigym_repeat": "base", "nkigym_when": "register_load"}
         imports.extend(
-            f"from nkigym.ops.{_OP_MODULES[class_name]} import {class_name}" for class_name in sorted(self.imports)
+            f"from nkigym.ops.{modules[class_name]} import {class_name}" for class_name in sorted(self.imports)
         )
         header = "\n".join(imports)
         body = "\n".join(f"    {line}" for line in self.body)
@@ -132,7 +136,10 @@ class _Lowerer:
     def _lower_placeholder(self, node: Node) -> None:
         """Emit one HBM-to-SBUF load for an input placeholder."""
         name, direct = str(node.target), direct_hbm_placeholder(node)
-        self.values[node] = value = _Value(name if direct else f"sbuf_{name}", self.input_specs[name][0], is_hbm=direct)
+        shape, dtype = self.input_specs[name]
+        self.values[node] = value = _Value(
+            name if direct else f"sbuf_{name}", shape, is_hbm=direct, storage_dtype=dtype
+        )
         if not direct:
             self.body.append(f"{value.name} = NKILoad()(src={name})")
 
@@ -146,7 +153,7 @@ class _Lowerer:
         elif operation == "tensor":
             self.values[node] = float(cast(Real, node.args[0]))
         elif operation in _DIRECT_LOWERINGS:
-            getattr(self, f"_lower_{operation}")(node)
+            getattr(self, f"_lower_{'topk' if operation == 'sorted_prefix' else operation}")(node)
         elif operation == "neg":
             self._lower_unary(node, "copy", -1.0)
         elif operation in {"conv1d", "conv2d", "conv3d"}:
@@ -180,11 +187,12 @@ class _Lowerer:
     def _lower_call_method(self, node: Node) -> None:
         """Lower supported tensor methods."""
         raw_source = self.values[cast(Node, node.args[0])]
-        if isinstance(raw_source, _Segments) and node.target in {"float", "to"}:
-            self.values[node] = raw_source
+        if node.target in {"float", "to"}:
+            assert isinstance(raw_source, (_Value, _Segments))
+            self.values[node] = emit_torch_cast(raw_source, node, self.body, self.imports)
             return
         source = self._value(cast(Node, node.args[0]))
-        if node.target in {"detach", "float", "long", "permute", "to", "unsqueeze", "view_as"}:
+        if node.target in {"detach", "long", "permute", "unsqueeze", "view_as"}:
             self.values[node] = source
         elif node.target == "abs" and all(_operation_name(user.target) == "max" for user in node.users):
             self.values[node] = source
@@ -226,7 +234,7 @@ class _Lowerer:
                     axis=0,
                 )
                 return
-            width = _static_prefix_width(node.args[1])
+            width = static_prefix_width(node.args[1])
             if width != sum(value.shape[1] for value in source.values):
                 raise ValueError("segmented tensor indexing requires its complete static prefix")
             self.values[node] = source
@@ -260,7 +268,8 @@ class _Lowerer:
 
     def _lower_unary(self, node: Node, operation: str, scale: float = 1.0) -> None:
         """Emit one unary activation."""
-        self.values[node] = self._activate(self._value(cast(Node, node.args[0])), operation, f"sbuf_{node.name}", scale)
+        source = self._value(cast(Node, node.args[0]))
+        self.values[node] = emit_activation_with_storage(source, node, operation, scale, self.body, self.imports)
 
     def _activate(self, source: _Value, operation: str, name: str, scale: float = 1.0) -> _Value:
         """Emit one unary activation value."""
@@ -288,9 +297,11 @@ class _Lowerer:
         arguments = 'op0="abs", operand0=0.0, reduce_op="max"' if absolute else f'op="copy", reduce_op="{reduction}"'
         self.imports.add(class_name)
         reduced = target if reduction != "add" else _Value(f"{target.name}_sum", target.shape)
-        self.body.append(f"{reduced.name} = {class_name}({arguments})(data={source.name})")
         if reduction == "add":
+            reduced = emit_reference_sum(source, node, reduced.name, self.body, self.imports)
             target = self._activate(reduced, "copy", target.name, 1.0 / source.shape[1])
+        else:
+            self.body.append(f"{reduced.name} = {class_name}({arguments})(data={source.name})")
         self.values[node] = (target,) if node.target == "max" else target
 
     def _lower_max_with_indices(self, node: Node) -> None:
@@ -300,19 +311,21 @@ class _Lowerer:
         keepdim = node.kwargs.get("keepdim", node.kwargs.get("keepdims"))
         if len(source.shape) != 2 or dimension not in {-1, 1} or not keepdim:
             raise ValueError("Torch max with indices requires rank two, dim=-1, and keepdim=True")
-        self.values[node] = self._emit_topk(source, 1, node)
+        source = self._orient(source, False, node, "_data")
+        self.values[cast(Node, node.args[0])] = source
+        self.values[node] = emit_max_with_indices(source, node.name, self.body, self.imports)
 
     def _lower_cast(self, node: Node) -> None:
         """Lower wrapped NumPy casts used by Torch references."""
         source, dtype = self._value(cast(Node, node.args[0])), node.args[1]
-        if dtype in {"bfloat16", "float16", "physical_bfloat16"}:
+        if isinstance(dtype, str) and dtype in {"bfloat16", "float16", "physical_bfloat16"}:
             class_name = {"bfloat16": "NKISemanticBF16Cast", "float16": "NKIFloat8Cast"}.get(dtype, "NKIBF16Cast")
             source = self._cast(
                 source, class_name, f"sbuf_{'semantic_' if dtype != 'physical_bfloat16' else ''}{node.name}"
             )
         elif dtype != "float32":
             raise ValueError(f"Torch synthesis does not support cast dtype {dtype!r}")
-        self.values[node] = source
+        self.values[node] = emit_torch_cast(source, node, self.body, self.imports)
 
     def _lower_clip(self, node: Node) -> None:
         """Lower scalar lower and upper clipping bounds."""
@@ -356,7 +369,8 @@ class _Lowerer:
         if isinstance(left, _Segments) or isinstance(right, _Segments):
             self.values[node] = self._emit_segment_binary(left, right, operation, node)
             return
-        self.values[node] = self._emit_binary(left, right, operation, f"sbuf_{node.name}", node)
+        value = self._emit_binary(left, right, operation, f"sbuf_{node.name}", node)
+        self.values[node] = cast_matmul_producer(value, node, self.body, self.imports)
 
     def _emit_segment_binary(
         self, left: _Value | _Segments | float, right: _Value | _Segments | float, operation: str, node: Node
@@ -406,7 +420,8 @@ class _Lowerer:
         if isinstance(left, _Value) and isinstance(right, _Value) and left.shape == right.shape:
             left = self._orient(left, False, node, "_left")
             right = self._orient(right, False, node, "_right")
-            target = _Value(target_name, left.shape)
+            dtype = "float32" if "float32" in (left.storage_dtype, right.storage_dtype) else None
+            target = _Value(target_name, left.shape, storage_dtype=dtype)
             self.imports.add("NKITensorTensor")
             self.body.append(
                 f'{target.name} = NKITensorTensor(op="{operation}")(data1={left.name}, data2={right.name})'
@@ -433,8 +448,9 @@ class _Lowerer:
                 transposed, operand = tensor.transposed, repr(scalar)
             if operation not in {"add", "divide", "greater_equal", "less", "maximum", "subtract", "multiply"}:
                 raise ValueError(f"NKITensorScalar does not support {operation}")
+            native = node.meta.get("arithmetic") == "native"
             target = emit_tensor_scalar_or_divide(
-                tensor, operation, operand, reverse, target_name, self.body, self.imports
+                tensor, operation, operand, reverse, target_name, self.body, self.imports, native
             )
         return target
 
@@ -443,30 +459,18 @@ class _Lowerer:
         left, right = (self._value(cast(Node, argument)) for argument in node.args)
         self.values[node] = self._emit_matmul(left, right, node)
 
-    def _emit_matmul(self, left: _Value, right: _Value, node: Node, suffix: str = "") -> _Value:
+    def _emit_matmul(self, left: _Value, right: _Value, node: Node, suffix: str = "", name: str = "matmul") -> _Value:
         """Emit one rank-two logical matrix product."""
-        if len(left.shape) != 2 or len(right.shape) != 2:
-            raise ValueError(f"Torch matmul requires rank-two tensors, got {left.shape} @ {right.shape}")
-        target_shape = (left.shape[0], right.shape[1])
-        if left.shape[1] != right.shape[0]:
-            raise ValueError(f"Torch matmul dimensions are inconsistent: {left.shape} @ {right.shape}")
+        if not (len(left.shape) == len(right.shape) == 2 and left.shape[1] == right.shape[0]):
+            raise ValueError(f"Torch matmul requires compatible rank-two tensors, got {left.shape} @ {right.shape}")
         stationary = self._orient(left, True, node, f"{suffix}_stationary")
         right = self._orient(right, False, node, f"{suffix}_moving")
-        psum_name = f"psum_{node.name}{suffix}"
-        target = _Value(name=f"sbuf_{node.name}{suffix}", shape=target_shape)
-        self.imports.update(("NKIMatmul", "NKITensorCopy"))
-        self.body.extend(
-            (
-                f"{psum_name} = NKIMatmul()(stationary={stationary.name}, moving={right.name})",
-                f"{target.name} = NKITensorCopy()(src={psum_name})",
-            )
-        )
-        return target
+        return emit_product(stationary, right, f"sbuf_{node.name}{suffix}", self.body, self.imports, name)
 
     def _lower_convolution(self, node: Node) -> None:
         """Lower one adapter-normalized convolution as a matrix product."""
         data, weights = (self._value(cast(Node, argument)) for argument in node.args[:2])
-        target = self._emit_matmul(data, weights, node)
+        target = self._emit_matmul(data, weights, node, name=f"conv_{_node_shape(cast(Node, node.args[0]))[1]}")
         bias = node.args[2] if len(node.args) > 2 else None
         if isinstance(bias, Node):
             target = self._orient(target, True, node, "_bias_data")
@@ -555,9 +559,9 @@ class _Lowerer:
             raise ValueError("Torch cross_entropy requires packed rank-two logits and row targets")
         if not logits.is_hbm:
             raise ValueError("Torch cross_entropy logits must remain in HBM until grouped loading")
-        loss, lse = emit_grouped_cross_entropy(logits, targets, node.name, self.body, self.imports)
-        self.logsumexp_values[logits.name] = lse
-        self.values[node] = loss
+        flat_logits = _Value(f"{logits.name}_flat", self.input_specs[f"{logits.name}_flat"][0], is_hbm=True)
+        loss, lse = emit_grouped_cross_entropy(logits, flat_logits, targets, node.name, self.body, self.imports)
+        self.values[node], self.logsumexp_values[logits.name] = loss, lse
 
     def _lower_cross_entropy_backward(self, node: Node) -> None:
         """Lower the analytical gradient of summed or mean cross entropy."""
@@ -567,7 +571,7 @@ class _Lowerer:
         )
         if logits.shape != targets.shape or len(logits.shape) != 2:
             raise ValueError("cross entropy backward requires matching rank-two logits and one-hot targets")
-        reduction, positions = node.kwargs["reduction"], int(node.kwargs["positions"])
+        reduction, positions = node.kwargs["reduction"], int(cast(int, node.kwargs["positions"]))
         if reduction not in {"mean", "sum"}:
             raise ValueError(f"unsupported cross entropy backward reduction {reduction!r}")
         base = f"sbuf_{node.name}"
@@ -590,7 +594,7 @@ class _Lowerer:
     def _lower_nonzero_compact(self, node: Node) -> None:
         """Lower stable nonzero indices and counts through the native instruction."""
         source = self._orient(self._value(cast(Node, node.args[0])), False, node, "_data")
-        columns, tokens = int(node.args[1]), int(node.args[2])
+        columns, tokens = int(cast(int, node.args[1])), int(cast(int, node.args[2]))
         if source.shape != (1, columns * tokens):
             raise ValueError("nonzero compaction requires one flattened row per logical column")
         self.imports.add("NKINonzeroWithCount")
@@ -606,12 +610,14 @@ class _Lowerer:
         inputs = cast(
             tuple[_Value, _Value, _Value, _Value, _Value], tuple(self._value(cast(Node, arg)) for arg in node.args[:5])
         )
-        self.values[node] = emit_moe(inputs, int(node.args[5]), int(node.args[6]), node.name, self.body, self.imports)
+        self.values[node] = emit_moe(
+            inputs, int(cast(int, node.args[5])), int(cast(int, node.args[6])), node.name, self.body, self.imports
+        )
 
     def _lower_bincount(self, node: Node) -> None:
         """Lower grouped histogram metadata with replicated threshold reductions."""
         source = emit_bincount_source(self._value(cast(Node, node.args[0])), node.name, self.body, self.imports)
-        groups, experts = int(node.kwargs["groups"]), int(node.kwargs["minlength"])
+        groups, experts = int(cast(int, node.kwargs["groups"])), int(cast(int, node.kwargs["minlength"]))
         if source.shape[0] != 128 or groups < 1 or experts % groups:
             raise ValueError("grouped bincount requires 128 replicated rows and experts divisible by groups")
         if groups > 128 and groups == experts:
@@ -644,76 +650,62 @@ class _Lowerer:
         """Lower an exact descending top-k selection."""
         source = self._value(cast(Node, node.args[0]))
         k = node.kwargs.get("k", node.args[1] if len(node.args) > 1 else None)
-        self.sort_topk_output = bool(self.sort_topk_output) or not bool(node.kwargs.get("sorted", True))
-        if isinstance(config := node.kwargs.get("rotational_config"), tuple) and isinstance(k, int):
-            layout = cast(tuple[int, int, int, int, int], config)
-            self.values[node] = emit_rotational_topk(
-                source, k, layout, node.name, self.body, self.imports, self.input_specs
-            )
-            return
-        if "wide_width" in node.kwargs:
-            self.values[node] = emit_wide_topk(
-                source, int(k), int(node.kwargs["wide_width"]), node.name, self.body, self.imports
-            )
-            return
         dimension, largest = (node.kwargs.get(name, default) for name, default in (("dim", -1), ("largest", True)))
-        valid_k = isinstance(k, int) and 1 <= k <= source.shape[1]
-        if len(source.shape) != 2 or not valid_k or dimension not in {-1, 1} or not largest:
+        valid_k = len(source.shape) == 2 and isinstance(k, int) and 1 <= k <= source.shape[1]
+        if not valid_k or dimension not in {-1, 1} or not largest:
             raise ValueError("Torch topk requires rank two, valid k, dim=-1, and largest=True")
-        self.values[node] = self._emit_topk(source, k, node)
+        if source.transposed:
+            source = self._orient(source, False, node, "_data")
+        self.sort_topk_output = False
+        if config := node.meta.get("rotational_topk"):
+            self.values[node] = emit_rotational_selection(
+                source, cast(int, k), config, node.name, self.body, self.imports, self.input_specs
+            )
+            return
+        if node.meta.get("selection_ties") == "any" and source.shape[1] <= 8192:
+            self.values[node] = emit_native_topk(source, cast(int, k), node.name, self.body, self.imports)
+            return
+        self.values[node] = emit_torch_topk(
+            source,
+            cast(int, k),
+            bool(node.kwargs.get("sorted", True)),
+            node.name,
+            self.body,
+            self.imports,
+            full_sort=_operation_name(node.target) == "sorted_prefix",
+        )
 
     def _lower_sparse_topk_affinity(self, node: Node) -> None:
-        """Lower exact sparse sigmoid or softmax router affinities."""
+        """Build sparse affinities from the selected indices instead of equal values."""
         logits = self._orient(self._value(cast(Node, node.args[0])), False, node, "_logits")
-        raw_values, raw_indices = (self.values[cast(Node, argument)] for argument in node.args[1:3])
-        if not all(isinstance(value, _Segments) and len(value.values) == 1 for value in (raw_values, raw_indices)):
-            raise ValueError("sparse top-k affinity requires one native selection segment")
-        assert isinstance(raw_values, _Segments) and isinstance(raw_indices, _Segments)
-        values, indices = raw_values.values[0], raw_indices.values[0]
-        k, activation = values.shape[1], node.args[3]
-        if k not in {1, 8} or activation not in {"sigmoid", "softmax"}:
-            raise ValueError("sparse top-k affinity supports sigmoid or softmax with k=1 or k=8")
-        sources = [logits]
-        if k == 8:
-            replaced = _Value(f"sbuf_{node.name}_replaced", logits.shape)
-            self.imports.add("NKIMatchReplace8")
-            self.body.append(
-                f"{replaced.name} = NKIMatchReplace8(imm=float('-inf'))(data={logits.name}, vals={values.name})"
-            )
-            sources.append(replaced)
-        else:
-            bounds = self._cast(indices, "NKIFloat32Cast", f"sbuf_{node.name}_bounds")
-            selected = _Value(f"sbuf_{node.name}_selected", logits.shape)
-            self.imports.add("NKIRangeSelect")
-            self.body.append(
-                f'{selected.name} = NKIRangeSelect(width={logits.shape[1]}, comp_op0="equal", comp_op1="equal")'
-                f"(on_true_tile={logits.name}, bound0={bounds.name}, bound1={bounds.name})"
-            )
-            sources = [selected]
-        operation = "sigmoid"
+        values, indices = (self._value(cast(Node, argument)) for argument in node.args[1:3])
+        count, activation = values.shape[1], node.args[3]
+        if count not in {1, 8} or activation not in {"sigmoid", "softmax"}:
+            raise ValueError("sparse affinity requires sigmoid or softmax and one or eight indices")
+        source = logits
         if activation == "softmax":
             maximum = self._reduce(values, f"sbuf_{node.name}_maximum", "copy", "max")
-            self.imports.add("NKITensorScalar")
-            centered = [
-                _Value(f"sbuf_{node.name}_centered_{index}", source.shape) for index, source in enumerate(sources)
-            ]
-            self.body.extend(
-                f'{target.name} = NKITensorScalar(op0="subtract")(data={source.name}, operand0={maximum.name})'
-                for target, source in zip(centered, sources, strict=True)
-            )
-            sources, operation = centered, "exp"
-        transformed = [
-            self._activate(source, operation, f"sbuf_{node.name}_transformed_{index}")
-            for index, source in enumerate(sources)
-        ]
-        target = transformed[0]
-        if k == 8:
-            target = _Value(f"sbuf_{node.name}", logits.shape)
-            self.imports.add("NKITensorTensor")
+            source = self._emit_binary(logits, maximum, "subtract", f"sbuf_{node.name}_centered", node)
+        transformed = self._activate(
+            source, "exp" if activation == "softmax" else "sigmoid", f"sbuf_{node.name}_activated"
+        )
+        selected = []
+        self.imports.add("NKIRangeSelect")
+        for position in range(count):
+            index = self._slice_value(indices, position, 1, node, f"_index_{position}")
+            bounds = self._cast(index, "NKIFloat32Cast", f"sbuf_{node.name}_bounds_{position}")
+            value = _Value(f"sbuf_{node.name}_selected_{position}", logits.shape, storage_dtype="float32")
             self.body.append(
-                f'{target.name} = NKITensorTensor(op="subtract")'
-                f"(data1={transformed[0].name}, data2={transformed[1].name})"
+                f'{value.name} = NKIRangeSelect(width={logits.shape[1]}, comp_op0="equal", comp_op1="equal")'
+                f"(on_true_tile={transformed.name}, bound0={bounds.name}, bound1={bounds.name})"
             )
+            self.imports.add("NKITensorScalar")
+            nonnegative = _Value(f"{value.name}_nonnegative", value.shape, storage_dtype="float32")
+            self.body.append(f'{nonnegative.name} = NKITensorScalar(op0="maximum")(data={value.name}, operand0=0.0)')
+            selected.append(nonnegative)
+        target = selected[0]
+        for position, value in enumerate(selected[1:], 1):
+            target = self._emit_binary(target, value, "add", f"sbuf_{node.name}_sum_{position}", node)
         if bool(node.args[4]) or activation == "softmax":
             total = self._reduce(target, f"sbuf_{node.name}_total", "copy", "add")
             reciprocal = self._activate(total, "reciprocal", f"sbuf_{node.name}_reciprocal")
@@ -730,9 +722,7 @@ class _Lowerer:
             source = self._value(source_node)
         else:
             raise ValueError("Torch argsort requires descending values or ascending negated values")
-        widths = {
-            _static_prefix_width(user.args[1]) for user in node.users if _operation_name(user.target) == "getitem"
-        }
+        widths = {static_prefix_width(user.args[1]) for user in node.users if _operation_name(user.target) == "getitem"}
         if None in widths or len(widths) != 1 or len(widths) != len(node.users):
             raise ValueError("Torch argsort requires one static prefix width")
         if not isinstance(width := widths.pop(), int) or width < 1 or width > source.shape[1]:
@@ -746,7 +736,6 @@ class _Lowerer:
     def _emit_topk(self, source: _Value, k: int, node: Node) -> tuple[_Segments, _Segments]:
         """Emit repeated native top-eight selection rounds."""
         source = self._orient(source, False, node, "_data")
-        self.values[cast(Node, node.args[0])] = source
         return emit_topk(source, k, node.name, self.body, self.imports)
 
     def _slice_value(self, value: _Value, start: int, width: int, node: Node | None, suffix: str = "") -> _Value:
@@ -756,10 +745,10 @@ class _Lowerer:
 
     def _orient(self, source: _Value, transposed: bool, node: Node, suffix: str) -> _Value:
         """Materialize one requested physical orientation."""
-        if source.transposed == transposed:
+        if source.transposed == transposed and not source.is_hbm:
             return source
         target = _Value(f"sbuf_{node.name}{suffix}", source.shape, transposed, False, source.storage_dtype)
-        emit_oriented_value(source, target, f"psum_{node.name}{suffix}", self.body, self.imports)
+        emit_loaded_oriented_value(source, target, f"psum_{node.name}{suffix}", self.body, self.imports)
         return target
 
     def _lower_output(self, node: Node) -> None:
@@ -809,7 +798,9 @@ def synthesize_torch_to_nkigym(
     graph_module = _trace_torch(f_torch, input_specs)
     operations = {_operation_name(node.target) for node in graph_module.graph.nodes}
     flatten_scan, has_convolution = "cumsum" in operations, bool(operations & {"conv1d", "conv2d", "conv3d"})
-    has_topk = bool(operations & {"argsort", "nonzero_compact", "topk"}) and "moe_experts" not in operations
+    has_topk = (
+        bool(operations & {"argsort", "nonzero_compact", "sorted_prefix", "topk"}) and "moe_experts" not in operations
+    )
     input_layouts = discover_input_layouts(graph_module)
     small_free_widths = frozenset(
         shape[1]
@@ -841,6 +832,7 @@ def synthesize_torch_to_nkigym(
         program.edge_axes,
         flatten_output,
         program.output_shapes,
+        program.output_dtypes,
         program.output_groups,
         program.sort_topk_output,
         has_convolution,
@@ -867,7 +859,7 @@ def synthesize_torch_to_nkigym(
     )
     reference_inputs = _validation_inputs(validation_specs, seed)
     adapted = adapt_inputs(
-        reference_inputs,
+        dict(reference_inputs),
         validation_specs,
         validation_program.input_specs,
         validation_layouts,
@@ -881,11 +873,13 @@ def synthesize_torch_to_nkigym(
         validation_program.sort_topk_output,
         has_convolution,
         output_layout,
-        next(iter(reference_inputs.values())).float().numpy() if has_topk else None,
     )
     with _DIMENSION_TRACE_LOCK:
         actual = validation_program.function(**adapted)
-    if not _results_match(actual, expected):
+    selection_input = (
+        reference_inputs["inp"].numpy() if getattr(f_torch, "selection_ties", "reference") == "any" else None
+    )
+    if not _results_match(actual, expected, selection_input):
         raise RuntimeError("programmatic synthesis validation failed: fp32 output mismatch")
     return artifact
 
@@ -895,12 +889,10 @@ def _lower_program(graph_module: GraphModule, input_specs: InputSpecs) -> _Progr
     normalized = dict(input_specs)
     edge_axes: dict[str, set[int]] = {}
     while True:
-        lowerer = _Lowerer(graph_module, normalized)
-        source = lowerer.build()
-        function = _exec_nkigym_source(source)
+        function = _exec_nkigym_source(source := (lowerer := _Lowerer(graph_module, normalized)).build())
         analysis = analyze_dimensions(function, normalized)
         try:
-            _ = build_initial_ir(function, normalized)
+            initial_ir = build_initial_ir(function, normalized)
         except CanonicalTileError as error:
             output_dims = {dimension for name in analysis.return_names for dimension in analysis.tensors[name].dim_ids}
             changed = False
@@ -922,6 +914,7 @@ def _lower_program(graph_module: GraphModule, input_specs: InputSpecs) -> _Progr
             normalized,
             {name: frozenset(axes) for name, axes in edge_axes.items()},
             tuple(tuple(reversed(value.shape)) if value.transposed else value.shape for value in lowerer.outputs),
+            tuple(initial_ir.buffer(name).physical_dtype() for name in initial_ir.return_names),
             lowerer.output_groups,
             lowerer.sort_topk_output,
         )
@@ -937,7 +930,7 @@ def _trace_torch(f_torch: Callable[..., object], input_specs: InputSpecs) -> Gra
         or reference_graph(f_torch, input_specs)
     )
     if rewritten is not None:
-        return rewritten
+        return configure_topk_layout(rewritten, f_torch, input_specs)
     target = f_torch if inspect.isfunction(f_torch) else _named_wrapper(f_torch, tuple(input_specs))
     try:
         inputs = tuple(
@@ -954,7 +947,7 @@ def _trace_torch(f_torch: Callable[..., object], input_specs: InputSpecs) -> Gra
             node.target = name
     except Exception as error:
         raise ValueError(f"failed to trace Torch reference: {type(error).__name__}: {error}") from error
-    return graph_module
+    return configure_topk_layout(graph_module, f_torch, input_specs)
 
 
 def _named_wrapper(function: Callable[..., object], parameters: tuple[str, ...]) -> Callable[..., object]:
@@ -1003,14 +996,6 @@ def _operation_name(target: object) -> str:
     return str(getattr(target, "__name__", target)).removeprefix("wrapped_")
 
 
-def _static_prefix_width(index: object) -> int | None:
-    """Return the width of one ``[..., :k]`` index."""
-    selector = index[-1] if isinstance(index, tuple) and index else None
-    valid = isinstance(selector, slice) and selector.start is None and selector.step is None
-    candidate = cast(slice, selector).stop if valid else None
-    return candidate if isinstance(candidate, int) else None
-
-
 def _free_slice(index: object, source_extent: int, normalized_extent: int) -> tuple[int, int] | None:
     """Map one last-axis slice into a normalized rank-two free-axis interval."""
     selector = index[-1] if isinstance(index, tuple) and index else index
@@ -1023,8 +1008,7 @@ def _free_slice(index: object, source_extent: int, normalized_extent: int) -> tu
     if normalized_extent % source_extent:
         raise ValueError(f"normalized free extent {normalized_extent} is not a multiple of {source_extent}")
     scale = normalized_extent // source_extent
-    interval = (start * scale, (stop - start) * scale)
-    return None if interval == (0, normalized_extent) else interval
+    return None if start == 0 and stop == source_extent else (start * scale, (stop - start) * scale)
 
 
 def _flatten_output(value: object) -> tuple[Node, ...]:
@@ -1098,13 +1082,19 @@ def _normalize_specs(input_specs: InputSpecs, preserve_matrix_vectors: frozenset
     for name, (shape, dtype) in input_specs.items():
         if name in layouts:
             transform, shape = layouts[name]
-            float_layout = transform[0] == "one_hot" or transform[:2] == ("routed_tokens", "keys")
-            dtype = "float32" if float_layout or transform[:2] == ("token_attention", "mask") else dtype
+            float_layout = transform[:2] == ("routed_tokens", "keys") or transform[:2] == ("token_attention", "mask")
+            dtype = (
+                "bfloat16"
+                if transform[0] == "one_hot"
+                else "uint32" if transform[0] == "cross_entropy_targets" else "float32" if float_layout else dtype
+            )
         elif len(shape) > 2:
             shape = (int(np.prod(shape[:-1])), shape[-1])
         elif len(shape) == 2 and 1 in shape and name not in preserve_matrix_vectors:
             shape = (max(shape),)
         normalized[name] = (shape, dtype)
+        if name in layouts and layouts[name][0][0] == "cross_entropy_rows":
+            normalized[f"{name}_flat"] = ((int(np.prod(shape)), 1), dtype)
     return normalized
 
 

@@ -22,7 +22,7 @@ from weakref import WeakKeyDictionary
 import networkx as nx
 
 from nkigym.ir import KernelIR, KernelTree
-from nkigym.ir.tree import BlockNode, BufferRegion, ISANode
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ISANode
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.base import PointwiseContract
 from nkigym.ops.reciprocal import NKIReciprocal
@@ -146,6 +146,7 @@ def resolve_activation_composition(
     producer_block_nid: int,
     consumer_block_nid: int,
     unique_consumer: Callable[[KernelIR, str, int, int], bool],
+    buffers: dict[str, Buffer],
 ) -> ActivationComposition | None:
     """Resolve one affine or sqrt producer into one activation consumer."""
     result: ActivationComposition | None = None
@@ -174,8 +175,8 @@ def resolve_activation_composition(
                     and not consumer_leaf.access_patterns
                     and intermediate.tensor not in ir.param_buffers
                     and intermediate.tensor not in ir.return_names
-                    and ir.buffer(intermediate.tensor).location != "shared_hbm"
-                    and ir.buffer(data.tensor).location in NKIActivation.INPUT_LOCATIONS["data"]
+                    and buffers[intermediate.tensor].location != "shared_hbm"
+                    and buffers[data.tensor].location in NKIActivation.INPUT_LOCATIONS["data"]
                     and all(buffer.name == intermediate.tensor for buffer in producer_block.alloc_buffers)
                     and unique_consumer(ir, intermediate.tensor, producer_leaf_nid, consumer_leaf_nid)
                 )

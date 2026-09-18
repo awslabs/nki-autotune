@@ -61,4 +61,26 @@ class NKIGroupedVectorBroadcast(NKIOp):
         return _OPERATIONS[str(kwargs["op0"])](data, vector).reshape(p, g * t * f)
 
 
-__all__ = ["NKIGroupedVectorBroadcast"]
+def emit_grouped_compensated_sum(
+    base: str, logits: str, negative_maximum: str, chunked: str, width: int, body: list[str], imports: set[str]
+) -> str:
+    """Emit one residual-corrected sum for each grouped chunk."""
+    imports.update(("NKIActivation", "NKIGroupedChunkBroadcast", "NKIGroupedChunkLoad", "NKITensorTensor"))
+    body.extend(
+        (
+            f'{base}_negative_mean = NKIActivation(op="copy", scale={-1.0 / width!r})(data={base}_sum_parts)',
+            f"{base}_residual_logits = NKIGroupedChunkLoad({chunked})(src={logits})",
+            f"{base}_residual_exp, {base}_recomputed_parts = NKIGroupedMapReduce({chunked}, "
+            f'op="exp", reduce_op="add")(data={base}_residual_logits, bias={negative_maximum})',
+            f'{base}_residual = NKIGroupedChunkBroadcast({chunked}, op0="add")'
+            f"(data={base}_residual_exp, operand0={base}_negative_mean)",
+            f"{base}_residual_values, {base}_residual_parts = NKIGroupedMapReduce({chunked}, "
+            f'op="copy", reduce_op="add")(data={base}_residual)',
+            f'{base}_corrected_parts = NKITensorTensor(op="add")'
+            f"(data1={base}_sum_parts, data2={base}_residual_parts)",
+        )
+    )
+    return f"{base}_corrected_parts"
+
+
+__all__ = ["NKIGroupedVectorBroadcast", "emit_grouped_compensated_sum"]

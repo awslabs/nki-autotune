@@ -5,7 +5,37 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
+from nkigym.ops.batched_matmul import emit_rotational_topk_stages
+from nkigym.ops.grouped_tensor_scalar import prepare_rotational_topk
+
+
+def emit_rotational_selection(
+    source: TorchValue,
+    count: int,
+    config: tuple[int, int, int, int, int],
+    stem: str,
+    body: list[str],
+    imports: set[str],
+    specs: dict[str, tuple[tuple[int, ...], str]],
+) -> tuple[TorchValue, TorchValue]:
+    """Emit an unordered exact prefix using existing rotational primitives."""
+    groups, rows, stages, _width, _local = config
+    rotation = f"rotation_topk_{stages}"
+    specs[rotation] = ((rows * stages, rows * stages), "float32")
+    state = prepare_rotational_topk(source, config, rotation, stem, body, imports)
+    selected, positions = emit_rotational_topk_stages(*state, config, stem, body, imports)
+    imports.update(("NKIGroupedInt32Cast", "NKIGroupedStore", "NKILoad"))
+    integer = f"sbuf_{stem}_global_indices"
+    body.append(f"{integer} = NKIGroupedInt32Cast(groups={groups}, partitions={rows * stages})(data={positions.name})")
+    outputs = []
+    for suffix, value, dtype in (("values", selected.name, "float32"), ("indices", integer, "int32")):
+        stored, loaded = f"hbm_{stem}_{suffix}", f"sbuf_{stem}_flat_{suffix}"
+        body.append(f"{stored} = NKIGroupedStore(groups={groups}, rows={rows}, stages={stages})(src={value})")
+        body.append(f"{loaded} = NKILoad()(src={stored})")
+        outputs.append(TorchValue(loaded, (groups * rows, count), storage_dtype=dtype))
+    return outputs[0], outputs[1]
 
 
 class NKIGroupedInt32Cast(NKIOp):

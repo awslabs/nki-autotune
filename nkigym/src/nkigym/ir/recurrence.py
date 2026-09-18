@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from math import prod
 from numbers import Real
 from typing import cast
 
@@ -235,7 +236,7 @@ def _reduce(
 
 
 def _compatible_block(ir: KernelIR, block_nid: int, progress_axis: str) -> bool:
-    """Accept canonical blocks and exact non-progress factorizations."""
+    """Accept explicit legal tiles and exact non-progress factorizations."""
     if is_canonical_block(ir, block_nid):
         return True
     chain = block_chain(ir.tree, block_nid)
@@ -244,7 +245,7 @@ def _compatible_block(ir: KernelIR, block_nid: int, progress_axis: str) -> bool:
     block = ir.tree.block(block_nid)
     leaf = chain[-1]
     names = {slot: region.tensor for slot, region in leaf.operand_bindings.items()}
-    spec = canonical_spec(ir, leaf.op_cls, names, block.axis_map, leaf.kwargs)
+    spec = canonical_spec(ir, leaf.op_cls, names, block.axis_map, leaf.kwargs, tile_template=leaf)
     if spec is None:
         return False
     substitutions = _iter_substitutions(spec.block, block)
@@ -287,26 +288,21 @@ def _factored_loops_match(
     actual: tuple[ForNode, ...],
     progress_axis: str,
 ) -> bool:
-    """Check dense loop groups and forbid progress-axis factorization."""
-    cursor = 0
+    """Accept explicit loop permutations while preserving each axis's factors."""
+    groups: dict[str | None, list[ForNode]] = {}
+    for loop in actual:
+        groups.setdefault(_binding_axis(actual_block, loop.loop_var), []).append(loop)
     for expected in canonical:
         axis = _binding_axis(canonical_block, expected.loop_var)
-        if axis is None:
-            return False
-        group: list[ForNode] = []
-        while cursor < len(actual) and _binding_axis(actual_block, actual[cursor].loop_var) == axis:
-            group.append(actual[cursor])
-            cursor += 1
-        product = 1
-        for loop in group:
-            product *= loop.extent
+        group = groups.pop(axis, [])
         if (
-            not group
-            or product != expected.extent
-            or (axis == progress_axis and (len(group) != 1 or group[0].extent != expected.extent))
+            axis is None
+            or not group
+            or prod(loop.extent for loop in group) != expected.extent
+            or (axis == progress_axis and len(group) != 1)
         ):
             return False
-    return cursor == len(actual)
+    return not groups
 
 
 def _binding_axis(block: BlockNode, loop_var: str) -> str | None:
@@ -337,13 +333,7 @@ def _build_match(
     stages = evaluation.stages if stage_count is None else evaluation.stages[:stage_count]
     stage_leaves = {stage.reducer_leaf for stage in stages}
     relevant = _ancestors(graph, stage_leaves)
-    absorbed = {
-        nid
-        for nid in relevant
-        if nid in stage_leaves
-        or evaluation.by_leaf[nid].depends_on_progress
-        or bool(_factor_states(evaluation.by_leaf[nid].factor))
-    }
+    absorbed = {nid for nid in relevant if nid in stage_leaves or bool(_factor_states(evaluation.by_leaf[nid].factor))}
     incremental = stage_count is not None
     for nid in tuple(absorbed):
         absorbed.update(graph.initializers.get(graph.outputs[nid], ()))

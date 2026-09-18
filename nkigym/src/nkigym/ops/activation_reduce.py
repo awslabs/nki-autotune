@@ -9,9 +9,6 @@ import numpy as np
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.base import AxisRole, NKIOp, ReductionContract, _operand_role, reduction_combinator
 
-VE_PARTITION_MAX = 128
-VE_FREE_MAX = 512
-
 _ACT_FNS: dict[str, Any] = {
     "square": np.square,
     "exp": np.exp,
@@ -24,10 +21,29 @@ _ACT_FNS: dict[str, Any] = {
 _RED_FNS: dict[str, Any] = {"add": np.sum, "max": np.max}
 
 
+def activation_reduce_parameters(kwargs: dict[str, Any], operands: frozenset[str]) -> tuple[str, dict[str, Any]]:
+    """Select the native encoding for a configured activation reduction."""
+    name = "activation_reduce"
+    if kwargs.get("reduce_op") in {"max", "maximum"}:
+        if (
+            kwargs.get("op") != "copy"
+            or kwargs.get("scale", 1.0) != 1.0
+            or kwargs.get("bias", 0.0) != 0.0
+            or "bias" in operands
+        ):
+            raise ValueError("maximum reduction requires a separate nonidentity mapping instruction")
+        name = "tensor_scalar_reduce"
+        for key in ("op", "scale", "bias"):
+            kwargs.pop(key, None)
+        kwargs.update(op0="add", operand0=0.0)
+    return name, kwargs
+
+
 class NKIActivationReduce(NKIOp):
     """Apply an activation and reduce the result along the free axis."""
 
     NAME: ClassVar[str] = "activation_reduce"
+    native_parameters = staticmethod(activation_reduce_parameters)
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {
         "data": ("P", "F"),
         "bias": ("P",),
@@ -44,6 +60,7 @@ class NKIActivationReduce(NKIOp):
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+    INPLACE_OPERANDS: ClassVar[dict[str, frozenset[str]]] = {"dst": frozenset({"data"})}
     SUPPORTED_MAP_OPERATORS: ClassVar[frozenset[str]] = frozenset(_ACT_FNS)
     SUPPORTED_REDUCERS: ClassVar[frozenset[str]] = frozenset(_RED_FNS)
 

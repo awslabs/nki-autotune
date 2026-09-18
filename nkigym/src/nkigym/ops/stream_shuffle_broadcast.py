@@ -5,6 +5,9 @@ from typing import Any, ClassVar
 import numpy as np
 
 from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.nc_gather import emit_clamped_gather
+from nkigym.ops.register_load import ControlEmitter
+from nkigym.ops.transpose import emit_partition_row_sum
 
 _POINTWISE_OPERATIONS = frozenset({"add", "maximum", "multiply", "subtract"})
 
@@ -47,6 +50,51 @@ class NKIStreamShuffleBroadcast(NKIOp):
     def _run(self, **kwargs: Any) -> np.ndarray:
         """Replicate the source row across the configured partitions."""
         return np.tile(np.asarray(kwargs["src"]), (int(kwargs["partitions"]), 1))
+
+
+def emit_local_sort_permutation(emit: ControlEmitter, source: str, width: int, span: int) -> str:
+    """Compute insertion-equivalent ranks for values displaced by fewer than ``span`` positions."""
+    if not 2 <= span <= min(16, width):
+        raise ValueError("local rank sorting requires a span between 2 and 16 within the row width")
+
+    def positions(partitions: int, step: int, offset: int) -> str:
+        """Generate neighboring source positions across one shuffle quadrant."""
+        return emit.emit(
+            "NKIIota",
+            "",
+            f"partitions={partitions}, width={width}, pattern=[[1, {width}]], "
+            f"channel_multiplier={step}, offset={offset}",
+        )
+
+    data = emit.emit("NKIStreamShuffleBroadcast", f"src={source}", f"partitions={span - 1}")
+    right, left = positions(span - 1, 1, 1), positions(span - 1, -1, -1)
+    later = emit_clamped_gather(emit, data, right, width)
+    missing = emit.scalar("subtract", emit.binary("equal", later, later), 1.0, reverse=True)
+    before = emit.binary(
+        "maximum",
+        emit.binary("greater", later, data),
+        emit.binary("multiply", missing, emit.binary("equal", data, data)),
+    )
+    inverted = emit.binary("multiply", before, emit.scalar("less", right, float(width)))
+    incoming = emit_clamped_gather(emit, inverted, left, width)
+    delta = emit.binary(
+        "subtract", inverted, emit.binary("multiply", incoming, emit.scalar("greater_equal", left, 0.0))
+    )
+    ranks = emit.binary("add", emit.iota(width), emit_partition_row_sum(emit, delta, width))
+    partitions = 2 * span - 1
+    replicated = emit.emit("NKIStreamShuffleBroadcast", f"src={ranks}", f"partitions={partitions}")
+    target, candidate = positions(partitions, 0, 0), positions(partitions, 1, 1 - span)
+    valid = emit.binary(
+        "multiply", emit.scalar("greater_equal", candidate, 0.0), emit.scalar("less", candidate, float(width))
+    )
+    safe = emit.emit(
+        "NKITensorScalarSequence",
+        f"data={candidate}, operand0=0.0, operand1={float(width - 1)}",
+        "op0='maximum', op1='minimum', engine='vector'",
+    )
+    matches = emit.binary("equal", emit_clamped_gather(emit, replicated, safe, width), target)
+    weighted = emit.binary("multiply", emit.binary("multiply", matches, valid), safe)
+    return emit_partition_row_sum(emit, weighted, width)
 
 
 __all__ = ["NKIStreamShuffleBroadcast"]

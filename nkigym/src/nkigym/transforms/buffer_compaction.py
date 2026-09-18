@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 
 from nkigym.codegen.compact import _compact_one, compact_buffer_shapes
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Expr, to_affine
+from nkigym.ir.arith.expr import Expr
 from nkigym.ir.buffer_placement import _offsets_consistently, layout_satisfies_output_alignment
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
@@ -170,9 +170,12 @@ def _shape_only_shrinks(current: Buffer, compacted: Buffer) -> bool:
 
 
 def _list_layout_compatible(buffer: Buffer) -> bool:
-    """Return whether the unchanged list length divides the compacted tile count."""
-    logical_tiles = buffer.logical_tile_count()
-    return buffer.list_len >= 1 and logical_tiles % buffer.list_len == 0
+    """Check that the unchanged partition and list sizes divide the new extent."""
+    return (
+        (buffer.partition_size is None or buffer.shape[0] % buffer.partition_size == 0)
+        and buffer.list_len >= 1
+        and buffer.logical_tile_count() % buffer.list_len == 0
+    )
 
 
 def _compaction_facts(tree: KernelTree, tensors: frozenset[str]) -> _CompactionFacts:
@@ -242,6 +245,3 @@ def _compacted_buffers(tensors: frozenset[str], facts: _CompactionFacts) -> dict
             shapes[geometry] = shape
         compacted[tensor] = replace(buffer, shape=shape)
     return compacted
-
-
-__all__ = ["BufferCompaction", "BufferCompactionOption"]

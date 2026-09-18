@@ -74,8 +74,8 @@ class NKIGroupedRangeSelectReduceRow(NKIOp):
         ):
             raise TypeError("NKIGroupedRangeSelectReduceRow expects on-chip operands")
 
-    def _run(self, **kwargs: Any) -> np.ndarray:
-        """Return one selected maximum per row and chunk."""
+    def _run(self, **kwargs: Any) -> tuple[np.ndarray, np.ndarray]:
+        """Return selected values and one maximum per row and chunk."""
         g, p, t, f = (int(kwargs[name]) for name in ("groups", "partitions", "chunks", "width"))
         data = np.asarray(kwargs["on_true_tile"]).reshape(p, g, t, f)
         lower = np.asarray(kwargs["bound0"]).reshape(p, g, 1, 1)
@@ -87,7 +87,7 @@ class NKIGroupedRangeSelectReduceRow(NKIOp):
             data,
             np.finfo(np.float32).min,
         )
-        return np.max(selected, axis=3).reshape(p, g * t)
+        return selected.reshape(p, g * t * f), np.max(selected, axis=3).reshape(p, g * t)
 
 
 __all__ = ["NKIGroupedRangeSelectReduceRow"]

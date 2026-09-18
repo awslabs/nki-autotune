@@ -14,6 +14,7 @@ When explicitly invoked:
    Debug and improve the NKIGym backend until all repository tests pass.
    Modify only files under nkigym/src/nkigym and kernel_library. Limit
    kernel_library edits to recording or updating best NKIGym ladders.
+   Keep benchmark/ and its checksum in test/test_repository_structure.py unchanged.
    Do not modify any other repository files.
    ```
 
@@ -26,4 +27,6 @@ When explicitly invoked:
    but create, modify, move, delete, or format files only under
    `nkigym/src/nkigym/` and `kernel_library/`. Limit `kernel_library/` edits to
    recording or updating best NKIGym ladders.
+   The NAKB targets and accuracy criteria in `benchmark/` are frozen; do not
+   modify them or the checksum in `test/test_repository_structure.py`.
 5. Call `update_goal` with `complete` only after all repository tests pass.

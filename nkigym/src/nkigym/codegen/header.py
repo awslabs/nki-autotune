@@ -5,8 +5,6 @@ body — imports, the ``@nki.jit`` decorator, the ``def`` line, and one
 ``assert <param>.shape == (...)`` line per kernel parameter.
 """
 
-from __future__ import annotations
-
 from nkigym.ir import KernelIR
 
 
@@ -25,10 +23,7 @@ def emit_header(ir: KernelIR) -> str:
     """
     return (
         "import nki\nimport nki.isa as nisa\nimport nki.language as nl\n"
-        "from nki.isa.constants import oob_mode\n\n\n@nki.jit\n"
+        "from nki.experimental.control_flow import fori_loop\nfrom nki.isa.constants import oob_mode\n\n\n@nki.jit\n"
         f"def nki_{ir.func_name}({', '.join(ir.param_names)}):\n"
         + "".join(f"    assert {name}.shape == {tuple(ir.buffer(name).shape)}\n" for name in ir.param_names)
     )
-
-
-__all__ = ["emit_header"]

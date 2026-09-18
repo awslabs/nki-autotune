@@ -12,7 +12,9 @@ import functools
 import inspect
 import textwrap
 from abc import abstractmethod
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sized
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, ClassVar, Literal
@@ -20,6 +22,37 @@ from typing import Any, ClassVar, Literal
 import numpy as np
 
 OperationSSAName = str | tuple[str, ...]
+_RepeatTrace = tuple[Sized, list[tuple[int, int, int | tuple[str, bool]]]]
+_REPEAT_TRACE: ContextVar[_RepeatTrace | None] = ContextVar("nkigym_repeat_trace", default=None)
+
+
+@contextmanager
+def _trace_repeats(operations: Sized, repetitions: list[tuple[int, int, int | tuple[str, bool]]]) -> Iterator[None]:
+    """Collect operation intervals for explicitly repeated primitive bodies."""
+    token = _REPEAT_TRACE.set((operations, repetitions))
+    try:
+        yield
+    finally:
+        _REPEAT_TRACE.reset(token)
+
+
+def nkigym_repeat(count: int) -> Iterator[None]:
+    """Repeat a state-updating primitive body a positive, static number of times."""
+    if type(count) is not int or count < 1:
+        raise ValueError("nkigym_repeat requires a positive integer count")
+    context = _REPEAT_TRACE.get()
+    start = 0 if context is None else len(context[0])
+    for _ in range(count if context is None else 1):
+        yield None
+    if context is not None:
+        stop = len(context[0])
+        if start == stop:
+            raise ValueError("nkigym_repeat requires a nonempty primitive body")
+        context[1].append((start, stop, count))
+
+
+_CONTROL_ITERATORS: set[Callable[..., Iterator[None]]] = {nkigym_repeat}
+
 
 """Role lattice for CPU-sim role tracking:
 
@@ -84,12 +117,12 @@ def _operand_role(value: Any) -> str | None:
 
 
 def collect_operation_ssa_names(func: Callable[..., Any]) -> Iterator[OperationSSAName]:
-    """Yield assigned names for straight-line ``NKIOp`` invocations."""
+    """Yield assigned primitive names in lexical order, entering repeated bodies once."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
     function = tree.body[0]
     if not isinstance(function, ast.FunctionDef):
         raise ValueError("Expected a function definition")
-    for statement in function.body:
+    for statement in _kernel_statements(function.body, func.__globals__):
         if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
             continue
         target, value = statement.targets[0], statement.value
@@ -103,6 +136,26 @@ def collect_operation_ssa_names(func: Callable[..., Any]) -> Iterator[OperationS
             yield target.id
         elif operation and isinstance(target, ast.Tuple) and all(isinstance(item, ast.Name) for item in target.elts):
             yield tuple(item.id for item in target.elts if isinstance(item, ast.Name))
+
+
+def _kernel_statements(statements: list[ast.stmt], definitions: dict[str, Any]) -> Iterator[ast.stmt]:
+    """Traverse static repeat bodies while rejecting unsupported control flow."""
+    for statement in statements:
+        if isinstance(statement, ast.For):
+            iterator = statement.iter
+            if (
+                not isinstance(iterator, ast.Call)
+                or not isinstance(iterator.func, ast.Name)
+                or definitions.get(iterator.func.id) not in _CONTROL_ITERATORS
+                or statement.orelse
+                or any(isinstance(node, (ast.Break, ast.Continue, ast.Return)) for node in ast.walk(statement))
+            ):
+                raise ValueError("kernel loops must use nkigym_repeat without early exits")
+            yield from _kernel_statements(statement.body, definitions)
+        elif isinstance(statement, (ast.If, ast.While, ast.Try)):
+            raise ValueError("kernel control flow must use explicit primitive predicates")
+        else:
+            yield statement
 
 
 def _tag_as_param(value: Any) -> Any:
@@ -247,6 +300,17 @@ class CopyContract:
 
 
 @dataclass(frozen=True)
+class SliceContract:
+    """Copy one contiguous interval along a source dimension."""
+
+    input_operand: str
+    output_operand: str
+    axis: int
+    start: int
+    width: int
+
+
+@dataclass(frozen=True)
 class PeerExchangeContract:
     """Algebraic contract for exchanging one local value with a peer program."""
 
@@ -269,6 +333,7 @@ OperatorContract = (
     | BilinearReductionContract
     | PermutationContract
     | CopyContract
+    | SliceContract
     | PeerExchangeContract
     | InitializerContract
 )
@@ -551,10 +616,9 @@ class NKIOp:
     AXIS_ROLES: ClassVar[dict[str, "AxisRole"]] = {}
 
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {}
-    """Minimum legal innermost-tile extent per abstract axis.
+    """Canonical minimum innermost-tile extent per abstract axis.
 
-    Going below this extent is a hardware- or performance-floor violation.
-    Split/Fuse reject atoms that would produce a smaller innermost tile.
+    Split uses this bound unless the operation declares a tensorization override.
     Empty = no floor for any axis (legal by default).
     """
 
@@ -569,6 +633,9 @@ class NKIOp:
 
     TENSORIZE_MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {}
     """Per-axis Fuse override for widening an already materialized tile."""
+
+    TENSORIZE_MIN_TILE_SIZE: ClassVar[dict[str, int]] = {}
+    """Per-axis ISA minimum for Split when the canonical minimum is larger."""
 
     RMW_OPERANDS: ClassVar[frozenset[str]] = frozenset()
     """Operand slot names that this op reads AND writes (RMW semantics).
@@ -631,6 +698,8 @@ class NKIOp:
     """Accepted physical dtypes for input operands used by storage rewrites."""
 
     INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {}
+    INPLACE_OPERANDS: ClassVar[dict[str, frozenset[str]]] = {}
+    """Output slots that may share storage with the listed input slots."""
     """Accepted physical locations for input operands used by storage rewrites.
 
     An absent entry means the operation has not declared that operand safe for

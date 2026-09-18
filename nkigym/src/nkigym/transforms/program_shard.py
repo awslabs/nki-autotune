@@ -4,8 +4,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from nkigym.ir import Add, BlockNode, Buffer, BufferRegion, Const, Expr, ForNode, ISANode, KernelIR, Var, substitute
-from nkigym.ir.arith.expr import expr_variables
+from nkigym.ir import (
+    Add,
+    BlockNode,
+    Buffer,
+    BufferRegion,
+    Const,
+    Expr,
+    ForNode,
+    ISANode,
+    KernelIR,
+    Mod,
+    Mul,
+    Var,
+    substitute,
+)
+from nkigym.ir.arith.expr import expr_variables, to_affine
 from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.program_sharding import (
     PROGRAM_SHARDS_ANNOTATION,
@@ -32,6 +46,7 @@ from nkigym.transforms.base import (
     software_pipeline_overlap_nodes,
 )
 from nkigym.transforms.helper.canonical_rewrite import finalize_rewrite, fresh_name
+from nkigym.transforms.helper.operation_builder import NameSupply, OperationBuilder, OperationScope
 from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
 _PROGRAM_ID = "nl.program_id(0)"
@@ -39,12 +54,18 @@ _PROGRAM_ID = "nl.program_id(0)"
 
 @dataclass(frozen=True)
 class ProgramShardOption(TransformOption):
-    """Assign one loop to two programs, or remove one isolated assignment."""
+    """Prepare a reduction with one program, or assign a loop to two programs.
+
+    A one-program option with ``reduction_tensor`` inserts its peer completion.
+    ``stage_drain`` instead separates an accumulator-precision drain from its cast.
+    Without ``reduction_tensor``, one program removes an isolated output shard.
+    """
 
     loop_nid: int
     axis: str
     programs: int
     reduction_tensor: str | None = None
+    stage_drain: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,10 +82,10 @@ class _ReductionMatch:
 
 
 @dataclass(frozen=True)
-class _OwnedCombineMatch:
-    """One additive combine loop matching an already owned store."""
+class _OwnedOperationMatch:
+    """One operation feeding an already partitioned consumer."""
 
-    combine_leaf: int
+    leaf_nid: int
 
 
 @dataclass(frozen=True)
@@ -91,13 +112,7 @@ class _ShardFacts:
 
 
 class ProgramShard(Transform[ProgramShardOption]):
-    """Partition disjoint output work or one complete additive reduction across cores.
-
-    A reduction shard requires peer exchange and combination to reconstruct the
-    complete value. Codegen permits the zero-peer fallback only after the shard
-    annotation exists, so that communication is intrinsic to this one SPMD
-    partition decision rather than a valid standalone rewrite.
-    """
+    """Prepare reduction communication or partition one loop across cores."""
 
     def analyze(self, ir: KernelIR) -> list[ProgramShardOption]:
         """Offer every legal single-loop output or additive-reduction LNC-2 shard."""
@@ -126,21 +141,30 @@ class ProgramShard(Transform[ProgramShardOption]):
         return options
 
     def apply(self, ir: KernelIR, option: ProgramShardOption) -> KernelIR:
-        """Apply one SPMD partition and its required reduction communication."""
+        """Prepare one completion or change one program assignment."""
         match = self._check_legality(ir, option, _shard_facts(ir))
         new_ir = copy_for_rewrite(ir)
-        if isinstance(match, _OwnedCombineMatch):
-            self._set_operation_ownership(new_ir, option, (match.combine_leaf,))
+        if isinstance(match, _OwnedOperationMatch):
+            self._set_operation_ownership(new_ir, option, (match.leaf_nid,))
             finalize_rewrite(new_ir)
             return new_ir
         if isinstance(match, _OwnedExchangeMatch):
             self._apply_owned_exchange(new_ir, option, match)
             finalize_rewrite(new_ir)
             return new_ir
-        self._set_shard_annotation(new_ir, option)
-        if match is not None:
+        if isinstance(match, _ReductionMatch) and option.programs == 1:
             self._insert_partial_combine(new_ir, option, match)
             finalize_rewrite(new_ir)
+        else:
+            self._set_shard_annotation(new_ir, option)
+            if isinstance(match, _ReductionMatch):
+                exchange = _peer_completion(new_ir, match)
+                assert exchange is not None
+                node = new_ir.tree.isa(exchange)
+                new_ir.tree.graph.nodes[exchange]["data"] = replace(
+                    node, kwargs={**node.kwargs, "participating_programs": 2}
+                )
+                finalize_rewrite(new_ir)
         return new_ir
 
     def _reduction_options_by_candidate(
@@ -172,9 +196,12 @@ class ProgramShard(Transform[ProgramShardOption]):
             loop_nid, axis = candidate
             legal = []
             for tensor in sorted(candidate_tensors):
-                option = ProgramShardOption(loop_nid, axis, 2, reduction_tensor=tensor)
-                if self._is_legal(ir, option, facts):
-                    legal.append(option)
+                for programs, stage_drain in ((1, True), (1, False), (2, False)):
+                    option = ProgramShardOption(
+                        loop_nid, axis, programs, reduction_tensor=tensor, stage_drain=stage_drain
+                    )
+                    if self._is_legal(ir, option, facts):
+                        legal.append(option)
             options[candidate] = tuple(legal)
         return options
 
@@ -188,12 +215,15 @@ class ProgramShard(Transform[ProgramShardOption]):
 
     def _check_legality(
         self, ir: KernelIR, option: ProgramShardOption, facts: _ShardFacts
-    ) -> _ReductionMatch | _OwnedCombineMatch | _OwnedExchangeMatch | None:
+    ) -> _ReductionMatch | _OwnedOperationMatch | _OwnedExchangeMatch | None:
         """Reject one loop shard that duplicates output or exposes partial values."""
-        if option.programs == 1:
+        preparing = option.programs == 1 and option.reduction_tensor is not None
+        if option.stage_drain and not preparing:
+            raise TransformLegalityError("drain staging requires a one-program reduction option")
+        if option.programs == 1 and not preparing:
             self._check_unshard(ir, option, facts)
             return None
-        if option.programs != 2:
+        if option.programs not in {1, 2}:
             raise TransformLegalityError("ProgramShard currently supports exactly two logical NeuronCores")
         if option.loop_nid in facts.configured:
             raise TransformLegalityError(f"ProgramShard loop {option.loop_nid} is already sharded")
@@ -208,12 +238,13 @@ class ProgramShard(Transform[ProgramShardOption]):
                 f"ProgramShard loop {option.loop_nid} does not materialize axis {option.axis!r}"
             )
         reduction = option.reduction_tensor is not None
-        self._check_axis_roles(ir, option, block_nids, reduction)
+        partition = replace(option, programs=2)
+        self._check_axis_roles(ir, partition, block_nids, reduction)
         axis_blocks = frozenset(block_nids)
         ownership_match = None if reduction else self._ownership_match(ir, option, axis_blocks, facts)
         if (
             not reduction
-            and not isinstance(ownership_match, _OwnedExchangeMatch)
+            and ownership_match is None
             and any(
                 ir.tree.isa(leaf_nid).op_cls is NKISendRecv
                 for leaf_nid in ir.dependency.graph.nodes
@@ -227,8 +258,24 @@ class ProgramShard(Transform[ProgramShardOption]):
         if ownership_match is not None:
             return ownership_match
         match = self._reduction_match(ir, option, axis_blocks, facts) if reduction else None
-        self._check_dependencies(ir, option, axis_blocks, match, facts)
-        self._check_hbm_writes(ir, option, axis_blocks, match, facts)
+        if match is not None and preparing:
+            needs_staging = (
+                facts.buffers[match.local_region.tensor].physical_dtype()
+                != facts.buffers[match.accumulator_region.tensor].physical_dtype()
+            )
+            if needs_staging != option.stage_drain:
+                raise TransformLegalityError("stage a narrowing drain separately before preparing its completion")
+        completion = None if match is None else _peer_completion(ir, match)
+        if reduction and preparing and completion is not None:
+            raise TransformLegalityError("reduction completion is already prepared")
+        if (
+            reduction
+            and not preparing
+            and (completion is None or ir.tree.isa(completion).kwargs.get("participating_programs") != 1)
+        ):
+            raise TransformLegalityError("prepare an inactive reduction completion before partitioning its loop")
+        self._check_dependencies(ir, partition, axis_blocks, match, facts)
+        self._check_hbm_writes(ir, partition, axis_blocks, match, facts)
         return match
 
     def _check_unshard(self, ir: KernelIR, option: ProgramShardOption, facts: _ShardFacts) -> None:
@@ -290,16 +337,12 @@ class ProgramShard(Transform[ProgramShardOption]):
             raise TransformLegalityError("ProgramShard reduction tensor is not produced by the selected loop")
         drain_block = facts.owners[drain_leaf]
         drain = ir.tree.isa(drain_leaf)
-        drain_loop = ir.tree.parent(drain_leaf)
-        if (
-            drain_loop is None
-            or not isinstance(ir.tree.data(drain_loop), ForNode)
-            or ir.tree.children(drain_loop) != [drain_leaf]
-        ):
-            raise TransformLegalityError("ProgramShard reduction drain must be the sole operation in one tile loop")
         if facts.configured.keys() & set(ir.tree.ancestors(drain_leaf)):
             raise TransformLegalityError("reduction ProgramShard requires a replicated drain path")
-        accumulator_region = drain.operand_bindings["src"]
+        drain_operand = _drain_operand(drain)
+        if drain_operand is None:
+            raise AssertionError("matched copy drain has no input operand")
+        accumulator_region = drain.operand_bindings[drain_operand]
         local_region = drain.operand_bindings["dst"]
         if accumulator_region.tensor != tensor or len(local_region.ranges) != 2:
             raise TransformLegalityError("ProgramShard requires a two-dimensional tensor-copy drain")
@@ -343,8 +386,13 @@ class ProgramShard(Transform[ProgramShardOption]):
             drains = [
                 leaf
                 for leaf in consumers
-                if ir.tree.isa(leaf).op_cls is NKITensorCopy
-                and ir.tree.isa(leaf).operand_bindings["src"].tensor == tensor
+                if (slot := _drain_operand(ir.tree.isa(leaf))) is not None
+                and ir.tree.isa(leaf).operand_bindings[slot].tensor == tensor
+                and (
+                    ir.tree.isa(leaf).op_cls is NKITensorCopy
+                    or facts.buffers[ir.tree.isa(leaf).operand_bindings["dst"].tensor].physical_dtype()
+                    == facts.buffers[tensor].physical_dtype()
+                )
             ]
             if len(drains) != 1 or set(consumers) != set(drains):
                 continue
@@ -359,21 +407,23 @@ class ProgramShard(Transform[ProgramShardOption]):
 
     def _ownership_match(
         self, ir: KernelIR, option: ProgramShardOption, axis_blocks: frozenset[int], facts: _ShardFacts
-    ) -> _OwnedCombineMatch | _OwnedExchangeMatch | None:
+    ) -> _OwnedOperationMatch | _OwnedExchangeMatch | None:
         """Resolve one atomic propagation of an existing store ownership decision."""
-        match: _OwnedCombineMatch | _OwnedExchangeMatch | None = None
+        match: _OwnedOperationMatch | _OwnedExchangeMatch | None = None
         if set(facts.configured.values()) == {option.programs}:
             match = self._owned_combine_match(ir, option, axis_blocks, facts)
+            if match is None:
+                match = self._owned_copy_match(ir, option, axis_blocks, facts)
             if match is None:
                 match = self._owned_exchange_match(ir, option, axis_blocks, facts)
         return match
 
     def _owned_combine_match(
         self, ir: KernelIR, option: ProgramShardOption, axis_blocks: frozenset[int], facts: _ShardFacts
-    ) -> _OwnedCombineMatch | None:
+    ) -> _OwnedOperationMatch | None:
         """Match one additive producer whose direct store already owns this axis."""
         leaves = tuple(leaf for leaf in ir.dependency.graph.nodes if facts.owners[leaf] in axis_blocks)
-        match: _OwnedCombineMatch | None = None
+        match: _OwnedOperationMatch | None = None
         if len(leaves) == 1:
             combine_leaf = leaves[0]
             combine = ir.tree.isa(combine_leaf)
@@ -394,8 +444,38 @@ class ProgramShard(Transform[ProgramShardOption]):
                 and len(owned_stores) == 1
                 and set(ir.dependency.direct_consumers(combine_leaf)) == set(owned_stores)
             ):
-                match = _OwnedCombineMatch(combine_leaf)
+                match = _OwnedOperationMatch(combine_leaf)
         return match
+
+    def _owned_copy_match(
+        self, ir: KernelIR, option: ProgramShardOption, axis_blocks: frozenset[int], facts: _ShardFacts
+    ) -> _OwnedOperationMatch | None:
+        """Match one unpartitioned copy used only by an already owned exchange."""
+        matches = []
+        for leaf_nid in ir.dependency.graph.nodes:
+            leaf = ir.tree.isa(leaf_nid)
+            contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
+            if facts.owners[leaf_nid] not in axis_blocks or not isinstance(contract, CopyContract):
+                continue
+            consumers = ir.dependency.direct_consumers(leaf_nid)
+            if "program_ownership" in leaf.kwargs or len(consumers) != 1:
+                continue
+            consumer = ir.tree.isa(consumers[0])
+            peer = consumer.op_cls.algebraic_contract(consumer.kwargs)
+            if (
+                isinstance(peer, PeerExchangeContract)
+                and consumer.kwargs.get("program_ownership") == (option.axis, option.programs)
+                and _regions_align_on_axis(
+                    ir,
+                    leaf_nid,
+                    leaf.operand_bindings.get(contract.output_operand),
+                    consumers[0],
+                    consumer.operand_bindings.get(peer.input_operand),
+                    option.axis,
+                )
+            ):
+                matches.append(_OwnedOperationMatch(leaf_nid))
+        return matches[0] if len(matches) == 1 else None
 
     def _owned_exchange_match(
         self, ir: KernelIR, option: ProgramShardOption, axis_blocks: frozenset[int], facts: _ShardFacts
@@ -438,9 +518,18 @@ class ProgramShard(Transform[ProgramShardOption]):
                 and exchange_output is not None
                 and "program_ownership" not in drain.kwargs
                 and "program_ownership" not in exchange.kwargs
-                and exchange_leaf in ir.dependency.direct_consumers(drain_leaf)
+                and set(ir.dependency.direct_consumers(drain_leaf)) == {exchange_leaf}
                 and len(owned_combines) == 1
                 and set(consumers) == set(owned_combines)
+                and ir.tree.loop(option.loop_nid).extent % option.programs == 0
+                and all(
+                    value == Var(name=ir.tree.loop(option.loop_nid).loop_var)
+                    for leaf in (drain_leaf, exchange_leaf)
+                    for variable, value in zip(
+                        ir.tree.block(facts.owners[leaf]).iter_vars, ir.tree.block(facts.owners[leaf]).iter_values
+                    )
+                    if variable.axis == option.axis
+                )
             ):
                 match = _OwnedExchangeMatch(drain_leaf, exchange_leaf, drain_contract.input_operand)
         return match
@@ -455,9 +544,15 @@ class ProgramShard(Transform[ProgramShardOption]):
             )
 
     def _apply_owned_exchange(self, ir: KernelIR, option: ProgramShardOption, match: _OwnedExchangeMatch) -> None:
-        """Route peer-owned partials while pruning the matching drain/exchange loop."""
+        """Route peer-owned partials and partition only the exchange instruction."""
         loop_var = ir.tree.loop(option.loop_nid).loop_var
-        peer_offset = Var(name="(nl.num_programs(0) - 1) * (1 - 2 * nl.program_id(0))")
+        peer_offset = Mul(
+            left=Add(left=Var(name="nl.num_programs(0)"), right=Const(value=-1)),
+            right=Add(
+                left=Const(value=1),
+                right=Mul(left=Const(value=-2), right=Mod(left=Var(name=loop_var), right=Const(value=option.programs))),
+            ),
+        )
         peer_iteration = Add(left=Var(name=loop_var), right=peer_offset)
         drain = ir.tree.isa(match.drain_leaf)
         old_source = drain.operand_bindings[match.reader_operand]
@@ -477,7 +572,7 @@ class ProgramShard(Transform[ProgramShardOption]):
             raise AssertionError("owned exchange source is absent from its block")
         reads = tuple(peer_source if region == old_source else region for region in drain_block.reads)
         ir.tree.graph.nodes[drain_block_nid]["data"] = replace(drain_block, reads=reads)
-        self._set_operation_ownership(ir, option, (match.drain_leaf, match.exchange_leaf))
+        self._set_operation_ownership(ir, option, (match.exchange_leaf,))
 
     def _is_additive_accumulator(self, ir: KernelIR, leaf_nid: int, axis: str, facts: _ShardFacts) -> bool:
         """Return whether one leaf additively reduces ``axis`` into PSUM."""
@@ -672,73 +767,113 @@ class ProgramShard(Transform[ProgramShardOption]):
         ir.tree.graph.nodes[ir.tree.root]["data"] = replace(root, annotations=annotations)
 
     def _insert_partial_combine(self, ir: KernelIR, option: ProgramShardOption, source_match: _ReductionMatch) -> None:
-        """Exchange and add peer partials into a complete replicated result."""
+        """Stage one narrowing drain or insert one inactive peer completion at the drain."""
         match = self._reduction_match(ir, option, source_match.axis_blocks, _shard_facts(ir))
         drain_block = ir.tree.block(match.drain_block)
-        drain_loop_nid = ir.tree.parent(match.drain_leaf)
-        if drain_loop_nid is None:
+        parent = ir.tree.parent(match.drain_leaf)
+        if parent is None:
             raise AssertionError("ProgramShard drain leaf has no parent")
-        sequence_parent = ir.tree.parent(drain_loop_nid)
-        if sequence_parent is None:
-            raise AssertionError("ProgramShard drain loop has no parent")
-        drain_loop = ir.tree.loop(drain_loop_nid)
         local_buffer = ir.buffer(match.local_region.tensor)
         accumulator_dtype = ir.buffer(match.accumulator_region.tensor).physical_dtype()
-        partial_region = match.local_region
-        extra_buffers: tuple[Buffer, ...] = ()
-        if local_buffer.physical_dtype() != accumulator_dtype:
-            partial = replace(
+        scope = OperationScope(replace(drain_block, annotations={}), ())
+        builder = OperationBuilder(ir.tree, None, ir.all_buffers(), NameSupply(set(ir.all_buffers())))
+        if option.stage_drain:
+            extra = replace(
                 local_buffer,
                 name=fresh_name(ir, f"{match.local_region.tensor}_partial"),
                 dtype=accumulator_dtype,
                 storage_dtype=None,
             )
-            partial_region = replace(match.local_region, tensor=partial.name)
+            partial_region = replace(match.local_region, tensor=extra.name)
             drain_leaf = ir.tree.isa(match.drain_leaf)
             drain_bindings = dict(drain_leaf.operand_bindings)
             drain_bindings["dst"] = partial_region
             ir.tree.graph.nodes[match.drain_leaf]["data"] = replace(drain_leaf, operand_bindings=drain_bindings)
-            drain_block = replace(drain_block, writes=(partial_region,))
-            extra_buffers = (partial,)
-        partial_buffer = local_buffer if not extra_buffers else extra_buffers[0]
-        peer = replace(partial_buffer, name=fresh_name(ir, f"{match.local_region.tensor}_peer"))
-        peer_region = replace(partial_region, tensor=peer.name)
-        send_block = ir.tree.add_node(
-            replace(drain_block, reads=(partial_region,), writes=(peer_region,), alloc_buffers=(), annotations={})
-        )
-        send_loop = ir.tree.add_node(drain_loop, parent=send_block)
-        send_leaf = ir.tree.add_node(
-            ISANode(
-                op_cls=NKISendRecv,
-                operand_bindings={"src": partial_region, "dst": peer_region},
-                kwargs={"send_to_rank": "program_peer", "recv_from_rank": "program_peer", "pipe_id": 0},
-            ),
-            parent=send_loop,
-        )
-        add_block = ir.tree.add_node(
-            replace(
-                drain_block,
-                reads=(match.accumulator_region, peer_region),
-                writes=(match.local_region,),
-                alloc_buffers=(),
-                annotations={},
+            drain_block = replace(drain_block, writes=(*drain_block.writes, partial_region))
+            inserted = [
+                builder.append(
+                    NKITensorCopy, {"src": partial_region, "dst": match.local_region}, dict(drain_leaf.kwargs), scope
+                )
+            ]
+        else:
+            extra = replace(local_buffer, name=fresh_name(ir, f"{match.local_region.tensor}_peer"))
+            peer_region = replace(match.local_region, tensor=extra.name)
+            send = builder.append(
+                NKISendRecv,
+                {"src": match.local_region, "dst": peer_region},
+                {
+                    "send_to_rank": "program_peer",
+                    "recv_from_rank": "program_peer",
+                    "pipe_id": 0,
+                    "participating_programs": 1,
+                },
+                scope,
             )
-        )
-        add_loop = ir.tree.add_node(drain_loop, parent=add_block)
-        ir.tree.add_node(
-            ISANode(
-                op_cls=NKITensorTensor,
-                operand_bindings={"data1": match.accumulator_region, "data2": peer_region, "dst": match.local_region},
-                kwargs={"op": "add"},
-            ),
-            parent=add_loop,
-        )
+            add = builder.append(
+                NKITensorTensor,
+                {"data1": match.local_region, "data2": peer_region, "dst": match.local_region},
+                {"op": "add"},
+                scope,
+            )
+            inserted = [send, add]
         ir.tree.graph.nodes[match.drain_block]["data"] = replace(
-            drain_block, alloc_buffers=(*drain_block.alloc_buffers, *extra_buffers, peer)
+            drain_block, alloc_buffers=(*drain_block.alloc_buffers, extra)
         )
-        _replace_in_parent_children(ir.tree, sequence_parent, [drain_loop_nid], [drain_loop_nid, send_block, add_block])
-        if ir.tree.parent(send_leaf) != send_loop:
-            raise AssertionError("ProgramShard exchange insertion failed")
+        _replace_in_parent_children(ir.tree, parent, [match.drain_leaf], [match.drain_leaf, *inserted])
+
+
+def _drain_operand(leaf: ISANode) -> str | None:
+    """Return the input of a plain copy or copy activation drain."""
+    contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
+    if leaf.op_cls is NKITensorCopy:
+        return "src"
+    if (
+        leaf.op_cls.NAME == "activation"
+        and isinstance(contract, PointwiseContract)
+        and contract.operator == "copy"
+        and contract.scale == 1.0
+        and contract.bias == 0.0
+        and len(contract.input_operands) == 1
+        and leaf.op_cls.OPERAND_AXES[contract.input_operands[0]] == leaf.op_cls.OPERAND_AXES[contract.output_operand]
+        and set(leaf.operand_bindings) == {contract.input_operands[0], contract.output_operand}
+    ):
+        return contract.input_operands[0]
+    return None
+
+
+def _peer_completion(ir: KernelIR, match: _ReductionMatch) -> int | None:
+    """Find the peer exchange whose sum completes the selected local partial."""
+    consumers = set(ir.dependency.direct_consumers(match.drain_leaf))
+    exchanges = [
+        nid
+        for nid in consumers
+        if ir.tree.isa(nid).op_cls is NKISendRecv
+        and ir.tree.isa(nid).operand_bindings.get("src") == match.local_region
+        and ir.tree.isa(nid).kwargs.get("send_to_rank") == "program_peer"
+        and ir.tree.isa(nid).kwargs.get("recv_from_rank") == "program_peer"
+    ]
+    if len(exchanges) != 1:
+        return None
+    exchange = exchanges[0]
+    peer = ir.tree.isa(exchange).operand_bindings["dst"]
+    combines = [
+        nid
+        for nid in consumers & set(ir.dependency.direct_consumers(exchange))
+        if ir.tree.isa(nid).op_cls is NKITensorTensor
+        and ir.tree.isa(nid).kwargs.get("op") == "add"
+        and ir.tree.isa(nid).operand_bindings.get("data1") == match.local_region
+        and ir.tree.isa(nid).operand_bindings.get("data2") == peer
+    ]
+    if len(combines) != 1:
+        return None
+    combine = combines[0]
+    if set(ir.dependency.direct_consumers(exchange)) != {combine}:
+        return None
+    if ir.tree.isa(combine).operand_bindings.get("dst") != match.local_region and consumers != {exchange, combine}:
+        return None
+    if any(nid not in {exchange, combine} and not ir.dependency.must_precede(combine, nid) for nid in consumers):
+        return None
+    return exchange
 
 
 def _owned_store_consumes(
@@ -828,9 +963,25 @@ def _regions_align_on_axis(
 def _shard_facts(ir: KernelIR) -> _ShardFacts:
     """Index immutable ownership, loop, buffer, and pipeline facts once."""
     block_nids = tuple(ir.tree.blocks())
-    owners = {leaf_nid: owning_block(ir, leaf_nid) for leaf_nid in ir.dependency.graph.nodes}
-    axes = {(block_nid, iter_var.axis) for block_nid in block_nids for iter_var in ir.tree.block(block_nid).iter_vars}
-    axis_loops = {(block_nid, axis): axis_loop_for_block(ir, block_nid, axis) for block_nid, axis in axes}
+    owners = ir.dependency._owner_block
+    leaf_by_block = ir.dependency._leaf_of_block
+    ancestors = ir.dependency._topology()[1]
+    axis_loops: dict[tuple[int, str], int | None] = {}
+    for block_nid in block_nids:
+        block = ir.tree.block(block_nid)
+        leaf = leaf_by_block.get(block_nid)
+        loops = (
+            ()
+            if leaf is None
+            else tuple(
+                (nid, node.loop_var) for nid in ancestors[leaf] if isinstance(node := ir.tree.data(nid), ForNode)
+            )
+        )
+        for variable, value in zip(block.iter_vars, block.iter_values, strict=True):
+            axes = to_affine(value)
+            axis_loops[block_nid, variable.axis] = next((nid for nid, name in loops if name in axes), None)
+    axes = {(block_nid, variable.axis) for block_nid in block_nids for variable in ir.tree.block(block_nid).iter_vars}
+    axis_loops = {key: axis_loops[key] for key in axes}
     grouped: dict[tuple[int, str], list[int]] = {}
     for (block_nid, axis), loop_nid in axis_loops.items():
         if loop_nid is not None:

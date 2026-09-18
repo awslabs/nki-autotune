@@ -7,7 +7,9 @@ from dataclasses import dataclass, replace
 from nkigym.ir import BlockNode, Buffer, BufferRegion, Const, FloorDiv, ISANode, KernelIR, Mul
 from nkigym.ir.arith.analyzer import Analyzer
 from nkigym.ir.buffer_placement import layout_satisfies_output_alignment
+from nkigym.ir.program_sharding import configured_program_shards
 from nkigym.ops.dma_transpose import NKIDMATranspose
+from nkigym.ops.float32_cast import NKIFloat32Cast
 from nkigym.ops.matmul import NKIMatmul
 from nkigym.ops.memset import NKIMemset
 from nkigym.ops.tensor_copy import NKITensorCopy
@@ -21,7 +23,7 @@ from nkigym.transforms.helper.canonical_rewrite import (
     replace_buffer,
     single_leaf,
 )
-from nkigym.transforms.helper.transpose_pattern import TransposeChain, match_transpose_chain
+from nkigym.transforms.helper.transpose_pattern import match_transpose_chain
 from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
 
@@ -120,6 +122,11 @@ def _match(
             transpose = _match_output_transpose(ir, option.transpose_nid, next_block)
             simple = all(_is_simple_block(ir, block) for block in (memset_block, matmul_block, matmul_drain_block))
             if transpose is not None and simple:
+                affected = (memset_block, matmul_block, matmul_drain_block, *transpose.blocks)
+                if any(
+                    loop in ir.tree.descendants(block) for loop in configured_program_shards(ir) for block in affected
+                ):
+                    return None
                 result = _validate_segment(
                     ir,
                     memset_block=memset_block,
@@ -194,7 +201,7 @@ def _transpose_region(region: BufferRegion, tensor: str) -> BufferRegion:
 def _scheduled_rewrite(
     ir: KernelIR,
     block_nid: int,
-    op_cls: type[NKIMemset] | type[NKIMatmul] | type[NKITensorCopy],
+    op_cls: type[NKIMemset] | type[NKIMatmul] | type[NKITensorCopy] | type[NKIFloat32Cast],
     bindings: dict[str, BufferRegion],
     axis_map: dict[str, str],
     kwargs: dict[str, object],
@@ -249,6 +256,7 @@ def _preserved_rewrites(
     memset = ir.tree.isa(memset_leaf)
     matmul = ir.tree.isa(matmul_leaf)
     drain = ir.tree.isa(drain_leaf)
+    source_slot = "data" if drain.op_cls is NKIFloat32Cast else "src"
     axes = ir.tree.block(matmul_block).axis_map
     old_m, old_n = axes["M"], axes["N"]
     rewrites = (
@@ -275,9 +283,9 @@ def _preserved_rewrites(
         _scheduled_rewrite(
             ir,
             drain_block,
-            NKITensorCopy,
+            NKIFloat32Cast if drain.op_cls is NKIFloat32Cast else NKITensorCopy,
             {
-                "src": _transpose_region(drain.operand_bindings["src"], target_psum),
+                source_slot: _transpose_region(drain.operand_bindings[source_slot], target_psum),
                 "dst": _transpose_region(drain.operand_bindings["dst"], target_output),
             },
             {"P": old_n, "F": old_m},
@@ -330,13 +338,18 @@ def _validate_segment(
         memset = ir.tree.isa(memset_leaf)
         matmul = ir.tree.isa(matmul_leaf)
         drain = ir.tree.isa(drain_leaf)
-        operations = memset.op_cls is NKIMemset and matmul.op_cls is NKIMatmul and drain.op_cls is NKITensorCopy
+        source_slot = "data" if drain.op_cls is NKIFloat32Cast else "src"
+        operations = (
+            memset.op_cls is NKIMemset
+            and matmul.op_cls is NKIMatmul
+            and drain.op_cls in {NKITensorCopy, NKIFloat32Cast}
+        )
         if operations:
             old_psum = matmul.operand_bindings["dst"].tensor
             old_output = drain.operand_bindings["dst"].tensor
             connected = (
                 memset.operand_bindings["dst"].tensor == old_psum
-                and drain.operand_bindings["src"].tensor == old_psum
+                and drain.operand_bindings[source_slot].tensor == old_psum
                 and transpose.source == old_output
             )
             buffers = ir.all_buffers()
@@ -380,6 +393,13 @@ def _validate_segment(
                 dtype = len({buffer.dtype for buffer in dtype_buffers}) == 1 and (
                     transpose_psum is None or transpose_psum.dtype == stationary.dtype
                 )
+                if drain.op_cls is NKIFloat32Cast:
+                    dtype = (
+                        stationary.dtype == moving.dtype == old_psum_buffer.dtype
+                        and old_output_buffer.dtype == transpose_output.dtype == "float32"
+                        and old_output_buffer.physical_dtype() == transpose_output.physical_dtype() == "float32"
+                        and (transpose_psum is None or transpose_psum.dtype == "float32")
+                    )
                 physical_dtype = (
                     old_psum_buffer.storage_dtype == NKIMatmul.OUTPUT_STORAGE_DTYPE
                     and stationary.physical_dtype() == stationary.dtype

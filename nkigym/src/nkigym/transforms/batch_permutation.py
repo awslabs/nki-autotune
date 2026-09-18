@@ -106,7 +106,7 @@ def _match_loop(
                 axes = _match_geometry(ir, block_nid, node, leaf, contract, buffers, programs)
                 expands_existing = bool(leaf.access_patterns)
                 if axes is not None and (
-                    not expands_existing or _valid_existing_batch(leaf, contract, axes, buffers, programs)
+                    not expands_existing or _valid_existing_batch(leaf, contract, axes, buffers, programs, node)
                 ):
                     result = _BatchMatch(
                         block_nid=block_nid,
@@ -183,9 +183,14 @@ def _valid_batch_contract(contract: PermutationContract, batching: BatchedPermut
 
 
 def _valid_existing_batch(
-    leaf: ISANode, contract: PermutationContract, axes: tuple[int, int], buffers: dict[str, Buffer], programs: int
+    leaf: ISANode,
+    contract: PermutationContract,
+    axes: tuple[int, int],
+    buffers: dict[str, Buffer],
+    programs: int,
+    loop: ForNode,
 ) -> bool:
-    """Return whether a direct-HBM permutation view can absorb one sharded loop."""
+    """Require contiguous view expansion within the permutation's ISA limits."""
     batching = contract.batching
     if batching is None or programs <= 1 or leaf.kwargs.get("axes") != batching.permutation:
         return False
@@ -195,13 +200,34 @@ def _valid_existing_batch(
     output = leaf.operand_bindings[contract.output_operand]
     if buffers[source.tensor].location != "shared_hbm" or buffers[output.tensor].location != "sbuf":
         return False
+    local_extent = loop.extent // programs
     source_position = batching.input_axes[axes[0]]
     output_position = _output_axis_positions(contract, batching)[axes[1]]
-    source_dimension = leaf.access_patterns[contract.input_operand].pattern[source_position]
-    output_dimension = leaf.access_patterns[contract.output_operand].pattern[output_position]
-    source_width = source.ranges[axes[0]][1]
-    output_width = output.ranges[axes[1]][1]
-    return source_dimension[1] == source_width and output_dimension[1] == output_width
+    analyzer = Analyzer()
+    for operand, position, region, axis in (
+        (contract.input_operand, source_position, source, axes[0]),
+        (contract.output_operand, output_position, output, axes[1]),
+    ):
+        view = leaf.access_patterns[operand]
+        stride, width = view.pattern[position]
+        coefficient = affine_coefficient(_local_batch_expr(view.offset, loop.loop_var, local_extent), loop.loop_var)
+        if (
+            width != region.ranges[axis][1]
+            or coefficient is None
+            or not analyzer.can_prove_equal(Const(value=coefficient), Mul(left=stride, right=width))
+        ):
+            return False
+    output_widths = _constant_widths(output)
+    assert output_widths is not None
+    if output_position == 0 and output_widths[axes[1]] * local_extent > buffers[output.tensor].partition_extent():
+        return False
+    limits = getattr(leaf.op_cls, "HBM_SOURCE_MAX_TILE_SIZE", {})
+    for abstract_axis, maximum in limits.items():
+        dimension = leaf.op_cls.operand_dimension(contract.input_operand, abstract_axis)
+        width = leaf.access_patterns[contract.input_operand].pattern[batching.input_axes[dimension]][1]
+        if not isinstance(width, Const) or width.value * (local_extent if dimension == axes[0] else 1) > maximum:
+            return False
+    return True
 
 
 def _supported_buffer(buffer: Buffer) -> bool:
@@ -337,7 +363,7 @@ def _expand_existing_batch(ir: KernelIR, match: _BatchMatch) -> None:
     source = leaf.operand_bindings[match.contract.input_operand]
     output = leaf.operand_bindings[match.contract.output_operand]
     widened_source = _widen_region(source, loop, match.source_axis, local_extent, global_origin)
-    widened_output = _widen_region(output, loop, match.output_axis, local_extent, Const(value=0))
+    widened_output = _widen_region(output, loop, match.output_axis, local_extent, global_origin)
     batching = match.batching
     source_position = batching.input_axes[match.source_axis]
     output_position = _output_axis_positions(match.contract, batching)[match.output_axis]
@@ -346,7 +372,7 @@ def _expand_existing_batch(ir: KernelIR, match: _BatchMatch) -> None:
         access_patterns[match.contract.input_operand], source_position, local_extent, loop.loop_var, global_origin
     )
     access_patterns[match.contract.output_operand] = _widen_access_pattern(
-        access_patterns[match.contract.output_operand], output_position, local_extent, loop.loop_var, Const(value=0)
+        access_patterns[match.contract.output_operand], output_position, local_extent, loop.loop_var, global_origin
     )
     bindings = dict(leaf.operand_bindings)
     bindings[match.contract.input_operand] = widened_source

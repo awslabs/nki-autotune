@@ -14,11 +14,11 @@ from nkigym.codegen.torch_abi import (
     cross_entropy_backward,
     grouped_context_input,
     head_grouped,
-    moe_gate_up_input,
     nonzero_compact,
     normalize_topk_output,
     pad_array,
     routed_input,
+    sorted_prefix,
     sparse_topk_affinity,
     standard_rope_coeff,
     standard_rope_data,
@@ -29,8 +29,26 @@ from nkigym.codegen.torch_arrays import as_numpy as _as_numpy
 from nkigym.codegen.torch_arrays import flatten_output_array as _flatten_output_array
 from nkigym.codegen.torch_arrays import logical_output_shape
 from nkigym.codegen.torch_layout import Layouts
-from nkigym.ops.grouped_store import adapt_topk_input, rotational_topk_generated_inputs
-from nkigym.profile.types import InputSpecs
+from nkigym.ops.grouped_store import adapt_topk_input
+from nkigym.ops.hbm_column_gather import generated_kernel_inputs
+from nkigym.profile.types import InputSpecs, _physical_numpy_dtype
+
+ArrayResult = np.ndarray | tuple[np.ndarray, ...]
+
+
+def _cast_output(array: np.ndarray, name: str) -> np.ndarray:
+    """Cast one output through its physical ABI dtype."""
+    value = np.asarray(array).astype(_physical_numpy_dtype(name), copy=False)
+    return value.astype(np.float32, copy=False) if "float" in name else value
+
+
+def _cast_output_dtypes(result: ArrayResult, output_dtypes: tuple[str, ...]) -> ArrayResult:
+    """Cast adapted outputs to the dtypes allocated by the generated kernel."""
+    arrays = result if isinstance(result, tuple) else (result,)
+    if len(arrays) != len(output_dtypes):
+        raise ValueError(f"generated ABI has {len(output_dtypes)} output dtypes for {len(arrays)} arrays")
+    casted = tuple(_cast_output(array, name) for array, name in zip(arrays, output_dtypes, strict=True))
+    return casted[0] if len(casted) == 1 else casted
 
 
 def reference_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | None:
@@ -53,11 +71,10 @@ def reference_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | N
         logits = call(operator.matmul, (data, inputs["w"]), shape)
         if "w_bias" in inputs:
             logits = call(operator.add, (logits, inputs["w_bias"]), shape)
-        k = int(bound["k"])
-        selected = graph.call_function(torch.topk, (logits,), {"k": k, "dim": -1, "largest": True, "sorted": True})
+        k, activation = int(bound["k"]), str(getattr(bound["act_fn"], "name", bound["act_fn"])).lower()
+        selected = graph.call_function(sorted_prefix, (logits,), {"k": k, "dim": -1, "largest": True, "sorted": True})
         values = call(operator.getitem, (selected, 0), (shape[0], k))
         indices = call(operator.getitem, (selected, 1), (shape[0], k))
-        activation = str(getattr(bound["act_fn"], "name", bound["act_fn"])).lower()
         affinity = call(
             sparse_topk_affinity, (logits, values, indices, activation, bool(bound.get("norm_topk_prob", False))), shape
         )
@@ -145,8 +162,9 @@ def adapt_inputs(
             elif transform[0] == "cross_entropy_targets":
                 groups, vocab = cast(tuple[int, int], transform[1:])
                 array = array.reshape(groups, shape[0]).T + np.arange(groups, dtype=array.dtype)[None, :] * vocab
+                array += np.arange(shape[0], dtype=array.dtype)[:, None] * groups * vocab
             elif transform[0] in {"moe_gate_up", "moe_down"}:
-                array = moe_gate_up_input(array, shape)
+                array = array.reshape(shape)
             elif transform[0] in {"wide_topk", "rotational_topk"}:
                 array = adapt_topk_input(array, transform, shape)
             elif str(transform[0]).startswith("block_diagonal"):
@@ -209,7 +227,7 @@ def adapt_inputs(
         elif kernel_specs[name][0] != input_specs[name][0]:
             array = array.reshape(-1) if len(kernel_specs[name][0]) == 1 else array.reshape(-1, array.shape[-1])
         adapted[name] = pad_array(array, kernel_specs[name][0], edge_axes.get(name, frozenset()))
-    return adapted | rotational_topk_generated_inputs(kernel_specs, adapted)
+    return generated_kernel_inputs(kernel_specs, adapted)
 
 
 def adapt_output(
@@ -220,7 +238,6 @@ def adapt_output(
     sort_topk_output: bool | None,
     channels_last_output: bool,
     output_layout: str | None,
-    topk_source: np.ndarray | None = None,
 ) -> np.ndarray | tuple[np.ndarray, ...]:
     """Flatten structured Torch outputs into generated ABI arrays."""
     leaves: list[np.ndarray] = []
@@ -277,7 +294,7 @@ def adapt_output(
         result = tuple(array[index : index + 1] for index in range(3))
     append(result)
     if sort_topk_output is not None and len(leaves) == 2 and leaves[0].shape == leaves[1].shape:
-        leaves[:2] = normalize_topk_output(leaves[0], leaves[1], sort_topk_output, topk_source)
+        leaves[:2] = normalize_topk_output(leaves[0], leaves[1], sort_topk_output)
     if len(leaves) != len(output_groups):
         raise ValueError(f"Torch output has {len(leaves)} tensors, expected {len(output_groups)} logical outputs")
     expanded: list[np.ndarray] = []
@@ -306,6 +323,7 @@ def kernel_adapters(
     edge_axes: dict[str, frozenset[int]],
     flatten: bool,
     output_shapes: tuple[tuple[int, ...], ...],
+    output_dtypes: tuple[str, ...],
     output_groups: tuple[int, ...],
     sort_topk_output: bool | None,
     channels_last_output: bool,
@@ -313,26 +331,19 @@ def kernel_adapters(
 ) -> tuple[
     Callable[[dict[str, object]], dict[str, np.ndarray]], Callable[[object], np.ndarray | tuple[np.ndarray, ...]]
 ]:
-    """Create paired input and output adapters with source-aware top-k normalization."""
-    state: dict[str, np.ndarray] = {}
+    """Create independent input and output layout adapters."""
 
     def inputs(values: dict[str, object]) -> dict[str, np.ndarray]:
-        """Adapt inputs and retain the first logical source tensor."""
-        adapted = adapt_inputs(values, input_specs, kernel_specs, layouts, edge_axes)
-        state["source"] = _as_numpy(next(iter(values.values())))
-        return adapted
+        """Adapt tensor layouts and dtypes for kernel inputs."""
+        return adapt_inputs(values, input_specs, kernel_specs, layouts, edge_axes)
 
     def output(result: object) -> np.ndarray | tuple[np.ndarray, ...]:
-        """Adapt outputs using the source retained by the paired input adapter."""
-        return adapt_output(
-            result,
-            flatten,
-            output_shapes,
-            output_groups,
-            sort_topk_output,
-            channels_last_output,
-            output_layout,
-            state.get("source"),
+        """Adapt the supplied reference outputs without recomputing them."""
+        return _cast_output_dtypes(
+            adapt_output(
+                result, flatten, output_shapes, output_groups, sort_topk_output, channels_last_output, output_layout
+            ),
+            output_dtypes,
         )
 
     return (inputs, output)

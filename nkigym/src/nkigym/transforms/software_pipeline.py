@@ -1,9 +1,4 @@
-"""``SoftwarePipeline`` transform — assign a loop's child blocks to pipeline
-stages, deriving per-buffer version counts (Tier B: stage only, identity order).
-
-Faithful port of TVM ``InjectSoftwarePipeline``. ``apply`` derives versions and
-writes an annotation; the prologue/skewed-body/epilogue + ``% versions`` rotation
-are manifested by the renderer."""
+"""Prepare one rotating buffer or assign one explicit pipeline stage boundary."""
 
 from __future__ import annotations
 
@@ -30,90 +25,113 @@ from nkigym.transforms.base import (
 from nkigym.transforms.buffer_region_normalization import access_patterns_fit_buffer
 
 _UNIT_LEAVES: WeakKeyDictionary[KernelTree, dict[int, tuple[int, ...]]] = WeakKeyDictionary()
+_BUFFER_OWNERS: WeakKeyDictionary[KernelTree, dict[str, int]] = WeakKeyDictionary()
 
 
 @dataclass(frozen=True)
 class SoftwarePipelineOption(TransformOption):
-    """Pipeline ``loop_nid``'s child blocks across stages.
+    """Change one loop's buffer preparation or pipeline schedule.
 
     Attributes:
         loop_nid: the ForNode whose child blocks are staged.
         stages: stage index per child block, in child order. Full assignment
             (one entry per child) with one stage boundary. An all-zero
-            assignment removes an active pipeline.
+            assignment removes scheduling while retaining prepared buffers.
+        tensor: one buffer to prepare or restore, with an empty stage assignment.
+        versions: physical version count for the selected buffer.
     """
 
     loop_nid: int
-    stages: tuple[int, ...]
+    stages: tuple[int, ...] = ()
+    tensor: str | None = None
+    versions: int | None = None
 
 
 class SoftwarePipeline(Transform[SoftwarePipelineOption]):
-    """Stage-driven accumulator multi-buffer (Tier B)."""
+    """Separate buffer preparation from stage scheduling in intrinsic child order."""
 
     def analyze(self, ir: KernelIR) -> list[SoftwarePipelineOption]:
-        """Enumerate one-boundary stage changes."""
+        """Enumerate individual buffer changes and ready stage assignments."""
         options: list[SoftwarePipelineOption] = []
         buffers = ir.all_buffers()
         pipelines = self._pipeline_annotations(ir)
         for nid in ir.tree.preorder():
             if not isinstance(ir.tree.data(nid), ForNode):
                 continue
-            children = list(ir.tree.children(nid))
-            if len(children) < 2:
-                continue
-            current = pipelines.get(nid)
-            if current is None and "software_pipeline" in ir.tree.block(self._parent_block(ir, nid)).annotations:
-                continue
-            current_stages = () if current is None else cast(tuple[int, ...], current[1]["stages"])
-            replaceable = (
-                frozenset() if current is None else frozenset(cast(tuple[str, ...], current[1]["versioned_buffers"]))
-            )
-            if any(
-                buffers[name].versions > 1 and name not in replaceable for name in self._touched_tensors(ir, children)
-            ):
-                continue
-            dependencies = self._dependency_pairs(ir, children)
-            stage_labelings = (
-                self._stage_labelings(len(children)) if current is None else self._neighbor_labelings(current_stages)
-            )
-            for stages in stage_labelings:
-                opt = SoftwarePipelineOption(loop_nid=nid, stages=stages)
-                if not any(stages) or self._is_legal(ir, opt, children, buffers, dependencies, replaceable):
-                    options.append(opt)
+            children = ir.tree.children(nid)
+            if len(children) >= 2:
+                options.extend(self._loop_options(ir, nid, children, buffers, pipelines))
         return options
 
+    def _loop_options(
+        self,
+        ir: KernelIR,
+        loop_nid: int,
+        children: list[int],
+        buffers: dict[str, Buffer],
+        pipelines: dict[int, tuple[int, dict[str, object]]],
+    ) -> list[SoftwarePipelineOption]:
+        """Return atomic choices for one structurally unchanged loop."""
+        current = pipelines.get(loop_nid)
+        parent = self._parent_block(ir, loop_nid)
+        if current is None and "software_pipeline" in ir.tree.block(parent).annotations:
+            return []
+        prepared = () if current is None else cast(tuple[str, ...], current[1]["versioned_buffers"])
+        if any(buffers[name].versions > 1 and name not in prepared for name in self._touched_tensors(ir, children)):
+            return []
+        if current is not None and any(cast(tuple[int, ...], current[1]["stages"])):
+            return [SoftwarePipelineOption(loop_nid, (0,) * len(children))]
+        options = [SoftwarePipelineOption(loop_nid, tensor=name, versions=1) for name in prepared]
+        if ir.tree.loop(loop_nid).extent // configured_program_shards(ir).get(loop_nid, 1) <= 1:
+            return options
+        dependencies = self._dependency_pairs(ir, children)
+        for stages in self._stage_labelings(len(children)):
+            schedule = SoftwarePipelineOption(loop_nid, stages)
+            if not self._is_legal(ir, schedule, children, buffers, dependencies):
+                continue
+            required = self._version_counts(ir, schedule, children)
+            missing = {name: count for name, count in required.items() if buffers[name].versions < count}
+            if missing:
+                options.extend(
+                    SoftwarePipelineOption(loop_nid, tensor=name, versions=count)
+                    for name, count in sorted(missing.items())
+                )
+            else:
+                options.append(schedule)
+        return list(dict.fromkeys(options))
+
     def apply(self, ir: KernelIR, option: SoftwarePipelineOption) -> KernelIR:
-        """Re-check legality, deep-copy, and update or remove the pipeline."""
+        """Change one buffer's versions or one schedule, preserving the other."""
         children = self._selected_children(ir, option)
         self._check_legality(ir, option, children)
         new_ir = copy_for_rewrite(ir)
         current = self._pipeline_annotation(new_ir, option.loop_nid)
-        if not any(option.stages):
-            assert current is not None
-            block_nid, _annotation = current
-            block = new_ir.tree.block(block_nid)
-            annotations = dict(block.annotations)
-            del annotations["software_pipeline"]
-            new_ir.tree.graph.nodes[block_nid]["data"] = replace(block, annotations=annotations)
-            for name in cast(tuple[str, ...], current[1]["versioned_buffers"]):
-                self._set_versions(new_ir, name, 1)
+        prepared = set() if current is None else set(cast(tuple[str, ...], current[1]["versioned_buffers"]))
+        if option.tensor is not None:
+            assert option.versions is not None
+            self._set_versions(new_ir, option.tensor, option.versions)
+            if option.versions > 1:
+                prepared.add(option.tensor)
+            else:
+                prepared.remove(option.tensor)
+            stages = (0,) * len(children)
         else:
-            new_children = list(new_ir.tree.children(option.loop_nid))
-            previous = () if current is None else cast(tuple[str, ...], current[1]["versioned_buffers"])
-            versioned_buffers = self._apply_versions(new_ir, option, new_children, previous)
-            parent = self._parent_block(new_ir, option.loop_nid)
-            source_order = tuple(range(len(new_children)))
-            block = new_ir.tree.block(parent)
-            annotations = dict(block.annotations)
+            stages = option.stages
+        parent = self._parent_block(new_ir, option.loop_nid)
+        block = new_ir.tree.block(parent)
+        annotations = dict(block.annotations)
+        if any(stages) or prepared:
             annotations["software_pipeline"] = {
                 "loop_nid": option.loop_nid,
                 "loop": new_ir.tree.loop(option.loop_nid),
-                "children": tuple(new_children),
-                "stages": option.stages,
-                "order": source_order,
-                "versioned_buffers": versioned_buffers,
+                "children": tuple(children),
+                "stages": stages,
+                "order": tuple(range(len(children))),
+                "versioned_buffers": tuple(sorted(prepared)),
             }
-            new_ir.tree.graph.nodes[parent]["data"] = replace(block, annotations=annotations)
+        else:
+            del annotations["software_pipeline"]
+        new_ir.tree.graph.nodes[parent]["data"] = replace(block, annotations=annotations)
         invalidate_software_pipeline_overlap(new_ir.tree)
         new_ir.dependency = rebind_unchanged_dependency(ir.dependency, new_ir.tree)
         return new_ir
@@ -134,23 +152,6 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
     def _stage_labelings(self, n: int) -> list[tuple[int, ...]]:
         """Return every assignment containing one contiguous stage boundary."""
         return [(0,) * boundary + (1,) * (n - boundary) for boundary in range(n - 1, 0, -1)]
-
-    def _neighbor_labelings(self, current: tuple[int, ...]) -> list[tuple[int, ...]]:
-        """Return assignments obtained by adding or removing one boundary."""
-        results: list[tuple[int, ...]] = []
-        highest = max(current)
-        for stage in range(highest + 1):
-            positions = [index for index, value in enumerate(current) if value == stage]
-            for boundary in positions[:-1]:
-                results.append(
-                    tuple(
-                        value if value < stage or value == stage and index <= boundary else value + 1
-                        for index, value in enumerate(current)
-                    )
-                )
-        for boundary in range(highest):
-            results.append(tuple(value if value <= boundary else value - 1 for value in current))
-        return results
 
     def _unit_leaves(self, ir: KernelIR, unit_nid: int) -> tuple[int, ...]:
         """ISA-leaf nids inside a stageable unit (a direct loop child) — works
@@ -191,7 +192,6 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
         children: list[int],
         buffers: dict[str, Buffer],
         dependencies: tuple[tuple[int, int], ...],
-        replaceable: frozenset[str],
     ) -> bool:
         """Check TVM's two graph rules in intrinsic source order."""
         result = True
@@ -223,10 +223,17 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
             if self._has_cross_iteration_read_before_write_hazard(ir, option, children):
                 result = False
             version_counts = self._version_counts(ir, option, children)
+            version_counts = {name: max(count, buffers[name].versions) for name, count in version_counts.items()}
+            owners = self._buffer_owners(ir)
+            enclosing = ir.tree.ancestors(option.loop_nid)
+            if any(count > 1 and owners[name] not in enclosing for name, count in version_counts.items()):
+                result = False
             if any(
-                versions > 1 and _tensor_carried_across(ir.tree, option.loop_nid, name)
+                versions > 1 and _tensor_carried_across(ir.dependency, option.loop_nid, name)
                 for name, versions in version_counts.items()
             ):
+                result = False
+            if self._versions_split_rmw(ir, children, version_counts):
                 result = False
             if not self._versioned_buffer_touches_are_local(ir, children, version_counts):
                 result = False
@@ -246,6 +253,26 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
                 result = False
             if not self._version_accesses_are_aligned(ir, option, children, version_counts):
                 result = False
+        return result
+
+    def _buffer_owners(self, ir: KernelIR) -> dict[str, int]:
+        """Cache allocation scopes shared by every stage-boundary candidate."""
+        owners = _BUFFER_OWNERS.get(ir.tree)
+        if owners is None:
+            owners = {buffer.name: nid for nid in ir.tree.blocks() for buffer in ir.tree.block(nid).alloc_buffers}
+            _BUFFER_OWNERS[ir.tree] = owners
+        return owners
+
+    def _versions_split_rmw(self, ir: KernelIR, children: list[int], version_counts: dict[str, int]) -> bool:
+        """Return whether version rotation would split one hardware accumulator."""
+        result = False
+        for child in children:
+            for leaf in self._unit_leaves(ir, child):
+                node = ir.tree.isa(leaf)
+                for slot in node.op_cls.rmw_operands(node.kwargs):
+                    region = node.operand_bindings.get(slot)
+                    if region is not None and version_counts.get(region.tensor, 1) > 1:
+                        result = True
         return result
 
     def _has_cross_iteration_read_before_write_hazard(
@@ -370,38 +397,10 @@ class SoftwarePipeline(Transform[SoftwarePipelineOption]):
         )
 
     def _check_legality(self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]) -> None:
-        """Raise TransformLegalityError if illegal."""
-        current = self._pipeline_annotation(ir, option.loop_nid)
-        removing = not any(option.stages)
-        parent_annotation = ir.tree.block(self._parent_block(ir, option.loop_nid)).annotations.get("software_pipeline")
-        if not removing and current is None and parent_annotation is not None:
-            raise TransformLegalityError("remove the active sibling software pipeline before selecting this loop")
-        if removing and (current is None or len(option.stages) != len(children)):
-            raise TransformLegalityError("all-zero stages remove an active pipeline with the same child count")
-        current_stages = () if current is None else cast(tuple[int, ...], current[1]["stages"])
-        if current is None and not removing and option.stages not in self._stage_labelings(len(children)):
-            raise TransformLegalityError("SoftwarePipeline may introduce exactly one stage boundary")
-        if current is not None and option.stages not in self._neighbor_labelings(current_stages):
-            raise TransformLegalityError("SoftwarePipeline may change exactly one active stage boundary")
-        if not removing and not self._is_legal(
-            ir,
-            option,
-            children,
-            ir.all_buffers(),
-            self._dependency_pairs(ir, children),
-            frozenset() if current is None else frozenset(cast(tuple[str, ...], current[1]["versioned_buffers"])),
-        ):
+        """Recheck one explicit buffer or schedule choice without combining them."""
+        options = self._loop_options(ir, option.loop_nid, children, ir.all_buffers(), self._pipeline_annotations(ir))
+        if option not in options or option.tensor is not None and type(option.versions) is not int:
             raise TransformLegalityError(f"illegal software-pipeline option {option}")
-
-    def _apply_versions(
-        self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int], previous: tuple[str, ...]
-    ) -> tuple[str, ...]:
-        """Set and return buffers requiring more than one pipeline version."""
-        version_counts = self._version_counts(ir, option, children)
-        versioned_buffers = tuple(sorted(name for name, versions in version_counts.items() if versions > 1))
-        for name in set(previous) | set(version_counts):
-            self._set_versions(ir, name, version_counts.get(name, 1))
-        return versioned_buffers
 
     def _version_counts(self, ir: KernelIR, option: SoftwarePipelineOption, children: list[int]) -> dict[str, int]:
         """Return the pipeline version count required for each defined-and-used buffer."""

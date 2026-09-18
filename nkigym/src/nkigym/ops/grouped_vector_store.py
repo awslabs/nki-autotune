@@ -7,6 +7,7 @@ import numpy as np
 
 from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import CopyContract, NKIOp, _operand_role
+from nkigym.ops.grouped_vector_broadcast import emit_grouped_compensated_sum
 
 
 class NKIGroupedVectorStore(NKIOp):
@@ -46,31 +47,33 @@ class NKIGroupedVectorStore(NKIOp):
 
 
 def emit_grouped_cross_entropy(
-    logits: TorchValue, targets: TorchValue, stem: str, body: list[str], imports: set[str]
+    logits: TorchValue, flat_logits: TorchValue, targets: TorchValue, stem: str, body: list[str], imports: set[str]
 ) -> tuple[TorchValue, TorchValue]:
     """Emit grouped exact cross entropy and its shared log-sum-exp."""
     partitions, packed_vocab = logits.shape
     if len(targets.shape) != 2 or targets.shape[0] != partitions:
         raise ValueError("grouped cross entropy requires matching packed row targets")
     groups = targets.shape[1]
-    vocab, chunks = packed_vocab // groups, max(1, (packed_vocab // groups + 32767) // 32768)
+    vocab = packed_vocab // groups
+    minimum_chunks = max(1, (vocab + 8191) // 8192)
+    chunks = next(count for count in range(minimum_chunks, vocab + 1) if vocab % count == 0)
     if packed_vocab % groups or vocab % chunks:
         raise ValueError("grouped cross entropy requires uniformly packed vocabulary chunks")
     width, base = vocab // chunks, f"sbuf_{stem}"
     config = f"groups={groups}, partitions={partitions}"
     chunked = f"{config}, chunks={chunks}, width={width}"
     imports.update(
-        "NKIFloat32Load NKIGroupedChunkLoad NKIGroupedMapReduce NKIGroupedRangeSelectReduceRow "
-        "NKIGroupedVectorActivation NKIGroupedVectorBinary NKIGroupedVectorStore".split()
+        "NKIGroupedChunkLoad NKIGroupedMapReduce NKIGroupedVectorActivation NKIGroupedVectorBinary "
+        "NKIGroupedVectorStore NKIHBMColumnGather NKILoad".split()
     )
     maximum = f"{base}_max_parts"
-    total = f"{base}_sum_parts"
-    target = f"{base}_target_parts"
     body.extend(
         (
-            f"{base}_targets = NKIFloat32Load()(src={targets.name})",
-            f"{base}_logits = NKIGroupedChunkLoad({chunked})(src={logits.name})",
-            f'{base}_max_parts = NKIGroupedMapReduce({chunked}, op="copy", reduce_op="max")' f"(data={base}_logits)",
+            f"{base}_targets = NKILoad()(src={targets.name})",
+            f"{base}_target = NKIHBMColumnGather({config})(src={flat_logits.name}, indices={base}_targets)",
+            f"{base}_max_logits = NKIGroupedChunkLoad({chunked})(src={logits.name})",
+            f'{base}_max_values, {base}_max_parts = NKIGroupedMapReduce({chunked}, op="copy", reduce_op="max")'
+            f"(data={base}_max_logits)",
         )
     )
     if chunks > 1:
@@ -79,29 +82,29 @@ def emit_grouped_cross_entropy(
         body.append(f'{maximum} = NKIGroupedTileReduce({config}, chunks={chunks}, op="max")(data={base}_max_parts)')
     body.extend(
         (
+            f"{base}_logits = NKIGroupedChunkLoad({chunked})(src={logits.name})",
             f'{base}_negative_maximum = NKIGroupedVectorActivation({config}, op="copy", scale=-1.0)'
             f"(data={maximum})",
-            f'{base}_sum_parts = NKIGroupedMapReduce({chunked}, op="exp", reduce_op="add")'
+            f'{base}_exp, {base}_sum_parts = NKIGroupedMapReduce({chunked}, op="exp", reduce_op="add")'
             f"(data={base}_logits, bias={base}_negative_maximum)",
         )
     )
+    total = f"{base}_sum_parts"
     if chunks > 1:
+        total = emit_grouped_compensated_sum(
+            base, logits.name, f"{base}_negative_maximum", chunked, width, body, imports
+        )
+        body.append(f'{base}_total = NKIGroupedTileReduce({config}, chunks={chunks}, op="add")(data={total})')
         total = f"{base}_total"
-        body.append(f'{total} = NKIGroupedTileReduce({config}, chunks={chunks}, op="add")(data={base}_sum_parts)')
     body.extend(
         (
             f'{base}_logged = NKIGroupedVectorActivation({config}, op="log")(data={total})',
             f'{base}_lse = NKIGroupedVectorBinary({config}, op="add")' f"(data1={base}_logged, data2={maximum})",
-            f'{base}_target_parts = NKIGroupedRangeSelectReduceRow({chunked}, comparison="exact")'
-            f"(on_true_tile={base}_logits, bound0={base}_targets, bound1={base}_targets)",
         )
     )
-    if chunks > 1:
-        target = f"{base}_target"
-        body.append(f'{target} = NKIGroupedTileReduce({config}, chunks={chunks}, op="max")(data={base}_target_parts)')
     body.extend(
         (
-            f'{base}_loss = NKIGroupedVectorBinary({config}, op="subtract")' f"(data1={base}_lse, data2={target})",
+            f'{base}_loss = NKIGroupedVectorBinary({config}, op="subtract")' f"(data1={base}_lse, data2={base}_target)",
             f"hbm_{stem}_loss = NKIGroupedVectorStore({config})(src={base}_loss)",
             f"hbm_{stem}_lse = NKIGroupedVectorStore({config})(src={base}_lse)",
         )

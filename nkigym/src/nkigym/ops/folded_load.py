@@ -9,12 +9,7 @@ from nkigym.ops.base import CopyContract, NKIOp, _operand_role
 
 
 class NKIFoldedLoad(NKIOp):
-    """Load independent two-dimensional tiles from one packed HBM tensor.
-
-    Canonical lowering keeps logical tiles separate. Fuse may widen the
-    contiguous tile axis because all grouped tile coordinates share one
-    physical DMA free dimension.
-    """
+    """Load independent two-dimensional tiles from one packed HBM tensor."""
 
     NAME: ClassVar[str] = "dma_copy"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"src": ("P", "G", "T", "F"), "dst": ("P", "G", "T", "F")}
@@ -53,13 +48,15 @@ class NKIFoldedLoad(NKIOp):
 
 def grouped_context_input(array: np.ndarray, shape: tuple[int, ...], transform: tuple[object, ...]) -> np.ndarray:
     """Pack one batched context-attention input by group and query tile."""
-    kind = str(transform[1])
-    raw_dimensions = transform[2:]
+    kind, raw_dimensions = str(transform[1]), transform[2:]
     if len(raw_dimensions) != 7 or not all(isinstance(value, int) for value in raw_dimensions):
         raise ValueError(f"grouped context-attention layout requires seven integer dimensions, got {raw_dimensions}")
-    dimensions = tuple(value for value in raw_dimensions if isinstance(value, int))
-    groups, queries, tiles, _reduction, partitions, width, _output_width = dimensions
-    if kind in {"q", "k"}:
+    groups, queries, tiles, _reduction, partitions, width, _output_width = tuple(
+        value for value in raw_dimensions if isinstance(value, int)
+    )
+    if kind == "q_t":
+        result = array.transpose(2, 0, 1)
+    elif kind in {"q", "k"}:
         result = array.transpose(1, 0, 2)
     elif kind == "v":
         result = array.reshape(groups, tiles, width // 128, 128, -1).transpose(3, 0, 1, 2, 4)

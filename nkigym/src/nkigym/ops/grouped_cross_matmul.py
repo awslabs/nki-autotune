@@ -70,12 +70,11 @@ def lower_grouped_context_attention(
     if tuple(value.shape for value in inputs) != (
         (r, g * qn * p),
         (r, g * t * w),
-        (128, t * 4 * g * h),
+        (128, t * (w // 128) * g * h),
         (p, g * qn),
         (p, g * qn),
     ):
         raise ValueError("grouped context-attention input shapes are inconsistent")
-    q_value, k_value, v_value, lower, upper = inputs
     base, config = f"sbuf_{node.name}", f"groups={g}, queries={qn}, tiles={t}, partitions={p}"
     imports.update(
         "NKIFoldedLoad NKIFoldedStore NKIGroupedActivationReduce NKIGroupedCrossMatmul NKIGroupedDMATranspose "
@@ -83,7 +82,9 @@ def lower_grouped_context_attention(
         "NKIGroupedReductionMatmul NKIGroupedVectorScale".split()
     )
     loaded = []
-    for value, tiles, suffix in zip(inputs, (qn, t, t * 4, qn, qn), ("q", "k", "v", "lower", "upper"), strict=True):
+    for value, tiles, suffix in zip(
+        inputs, (qn, t, t * (w // 128), qn, qn), ("q", "k", "v", "lower", "upper"), strict=True
+    ):
         if not value.is_hbm:
             raise ValueError("grouped context-attention inputs must remain in HBM until folded loading")
         target = TorchValue(f"{base}_{suffix}", value.shape)
@@ -104,8 +105,8 @@ def lower_grouped_context_attention(
             f'op="add")(data={base}_sum_parts)',
             f"{base}_reciprocal = NKIGroupedReciprocal(groups={g}, queries={qn}, partitions={p})"
             f"(data={base}_total)",
-            f"{base}_stationary = NKIGroupedDMATranspose({config}, subtiles=4)(src={base}_exp)",
-            f"{base}_output_ps = NKIGroupedReductionMatmul({config}, subtiles=4, output_width={h})"
+            f"{base}_stationary = NKIGroupedDMATranspose({config}, subtiles={w // 128})(src={base}_exp)",
+            f"{base}_output_ps = NKIGroupedReductionMatmul({config}, subtiles={w // 128}, output_width={h})"
             f"(stationary={base}_stationary, moving={v_value.name})",
             f"{base}_output = NKIGroupedVectorScale(groups={g}, queries={qn}, partitions={p}, width={h})"
             f"(data={base}_output_ps, operand0={base}_reciprocal)",
