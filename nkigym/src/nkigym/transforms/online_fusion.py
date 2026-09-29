@@ -771,16 +771,18 @@ def _complete_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pr
     ]
     _insert_detached_roots(ir.tree, prefix.carrier, init_roots, before=True)
     _insert_children_before(ir.tree, prefix.loop, prefix.roll_forward, suffix)
-    removed_leaves = selected | frozenset(graph.initializers.get(final_stage.state_tensor, ()))
+    removed_leaves = frozenset(graph.initializers.get(final_stage.state_tensor, ()))
+    contract = graph.contracts[final_stage.reducer_leaf]
+    if isinstance(contract, ReductionContract) and contract.mapped_output_operand is not None:
+        _rewrite_reducer_as_map(ir, final_stage, contract)
+    else:
+        removed_leaves |= {final_stage.reducer_leaf}
     old = {owning_block(ir.tree, leaf) for leaf in removed_leaves if leaf in ir.tree.graph}
-    roots = ir.tree.children(ir.tree.root)
     for block in old:
         if block not in ir.tree.graph:
             continue
-        if block in roots:
-            ir.tree.graph.remove_edge(ir.tree.root, block)
         ir.tree.graph.remove_nodes_from({block, *ir.tree.descendants(block)})
-    _seed_buffers(ir, buffers, _match_tensors(match, graph))
+    _seed_buffers(ir, buffers, frozenset())
     finalize_rewrite(ir)
 
 

@@ -386,7 +386,7 @@ def _commute_permutation(ir: KernelIR, move: _PermutationMove) -> None:
         NKIDMATranspose,
         {"src": move.passthrough, "dst": transposed_name},
         dict(block.axis_map),
-        {},
+        dict(permutation_leaf.kwargs),
         loop_names=loop_names,
     )
     broadcast_spec = canonical_spec(

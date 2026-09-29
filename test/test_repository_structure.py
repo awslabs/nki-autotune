@@ -25,7 +25,11 @@ benchmark/                         frozen targets and accuracy criteria
 
 kernel_library/
 |-- __init__.py
-`-- _best_nkigym.py                  recorded best NKIGym transform ladders
+|-- _best_nkigym.py                  recorded best NKIGym transform ladders
+`-- nakb_comparison.py              comparison measurement format and recording
+
+.agents/skills/compare-nakb/scripts/
+`-- plot_nakb_comparison.py          comparison figure command
 
 Only the files shown above are allowed under ops and transforms. Every transform
 Python file must have fewer than 1,000 code lines, and all helper Python files
@@ -35,7 +39,7 @@ typed, synchronous analyze and apply methods. Formatter-control comments are
 forbidden because they permit multiple statements to be hidden on one line.
 The frozen benchmark contains only its initializer and direct workload modules.
 Its contents are pinned by a checksum below. Kernel_library contains only its
-initializer and best-NKIGym artifact module. No Python source files are allowed
+initializer, best-NKIGym artifact module, and comparison tools. No Python source files are allowed
 outside the documented nkigym implementation directories.
 
 Required package initializers: benchmark, kernel_library, nkigym, codegen, ir,
@@ -45,7 +49,7 @@ Allowed repository imports:
 
 benchmark      -> benchmark
 nkigym         -> nkigym
-kernel_library -> kernel_library, nkigym
+kernel_library -> benchmark, kernel_library, nkigym
 test           -> benchmark, kernel_library, nkigym
 
 The top-level developer package must not exist.
@@ -78,7 +82,7 @@ OP_FILE_LINE_LIMIT = 100
 OP_BASE_FILE_LINE_LIMIT = 500
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_IMPORT_ROOTS = {"benchmark", "developer", "kernel_library", "nkigym"}
-FORMATTER_TARGETS = ("benchmark", "nkigym/src", "kernel_library", "test")
+FORMATTER_TARGETS = ("benchmark", "nkigym/src", "kernel_library", "test", ".agents/skills/compare-nakb/scripts")
 FROZEN_BENCHMARK_SHA256 = "0502c1b62cb6e148ba4ec58a38dbaee1607904107fc62911b4a1270f93fb62e3"
 NKIGYM_IMPLEMENTATION_DIRECTORIES = frozenset({"codegen", "ir", "ops", "profile", "synthesis", "transforms"})
 REQUIRED_PACKAGE_INITIALIZERS = frozenset(
@@ -382,14 +386,15 @@ def _benchmark_structure_violations() -> list[str]:
 
 
 def _kernel_library_structure_violations() -> list[str]:
-    """Reserve the kernel library for best NKIGym artifact records."""
+    """Reserve the kernel library for best NKIGym records and comparison tools."""
     kernel_library_directory = REPOSITORY_ROOT / "kernel_library"
+    allowed_files = {Path("__init__.py"), Path("_best_nkigym.py"), Path("nakb_comparison.py")}
     violations: list[str] = []
     for relative_path in _repository_files(kernel_library_directory):
-        if relative_path not in {Path("__init__.py"), Path("_best_nkigym.py")}:
+        if relative_path not in allowed_files:
             violations.append(
                 f"kernel_library/{relative_path.as_posix()} is not allowed; keep only __init__.py "
-                "and _best_nkigym.py"
+                "and the documented kernel record and comparison modules"
             )
     return violations
 
@@ -439,7 +444,10 @@ def _dependency_violations() -> list[str]:
     violations = [
         *_boundary_violations(REPOSITORY_ROOT / "benchmark", {"benchmark"}),
         *_boundary_violations(REPOSITORY_ROOT / "nkigym/src/nkigym", {"nkigym"}),
-        *_boundary_violations(REPOSITORY_ROOT / "kernel_library", {"kernel_library", "nkigym"}),
+        *_boundary_violations(REPOSITORY_ROOT / "kernel_library", {"benchmark", "kernel_library", "nkigym"}),
+        *_boundary_violations(
+            REPOSITORY_ROOT / ".agents/skills/compare-nakb/scripts", {"benchmark", "kernel_library", "nkigym"}
+        ),
         *_boundary_violations(REPOSITORY_ROOT / "test", {"benchmark", "kernel_library", "nkigym"}),
     ]
     if (REPOSITORY_ROOT / "developer").exists():

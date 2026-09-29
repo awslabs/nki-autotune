@@ -82,14 +82,16 @@ def _array_root(node: ast.expr) -> str | None:
     return node.id if isinstance(node, ast.Name) else None
 
 
-def _affine_form(node: ast.AST) -> dict[str | None, int] | None:
-    """Return one generated affine expression as variable coefficients."""
+def _affine_form(node: ast.AST, variables: set[str] | None = None) -> dict[str | None, int] | None:
+    """Extract affine coefficients, optionally ignoring invariant base expressions."""
+    if variables is not None and not variables & _node_names(node):
+        return {}
     if isinstance(node, ast.Name):
         return {node.id: 1}
     if isinstance(node, ast.Constant) and isinstance(node.value, int):
         return {None: int(node.value)}
     if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub)):
-        left, right = _affine_form(node.left), _affine_form(node.right)
+        left, right = _affine_form(node.left, variables), _affine_form(node.right, variables)
         if left is None or right is None:
             return None
         sign = 1 if isinstance(node.op, ast.Add) else -1
@@ -100,7 +102,7 @@ def _affine_form(node: ast.AST) -> dict[str | None, int] | None:
         constant = node.left if isinstance(node.left, ast.Constant) else node.right
         expression = node.right if constant is node.left else node.left
         if isinstance(constant, ast.Constant) and isinstance(constant.value, int):
-            form = _affine_form(expression)
+            form = _affine_form(expression, variables)
             return None if form is None else {name: int(constant.value) * value for name, value in form.items()}
     return None
 
@@ -129,7 +131,7 @@ def _coalesced_operand(node: ast.expr, loops: tuple[tuple[str, int], ...]) -> tu
                 return None
         case _:
             return None
-    form = _affine_form(lower)
+    form = _affine_form(lower, names)
     coefficients = [None if form is None else form.get(name, 0) for name, _ in loops]
     if any(value is None or value <= 0 or value % width for value in coefficients):
         return None
@@ -163,8 +165,8 @@ def _coalescible_call(node: ast.stmt) -> tuple[str, ...] | None:
     match node:
         case ast.Expr(ast.Call(ast.Attribute(ast.Name(id="nisa"), attr=operation)) as call):
             operands = {"memset": ("dst",), "range_select": ("on_true_tile", "dst")}.get(operation)
-            if operation in {"dma_copy", "tensor_copy"}:
-                operands = ("src", "dst")
+            if operation in {"dma_copy", "tensor_copy", "tensor_tensor"}:
+                operands = ("data1", "data2", "dst") if operation == "tensor_tensor" else ("src", "dst")
             if operation == "activation" and {k.arg for k in call.keywords} == {"data", "dst", "op"}:
                 operands = ("data", "dst")
             return operands
@@ -182,11 +184,12 @@ def _coalesced_call(node: ast.For) -> ast.stmt | None:
         return None
     result = copy.deepcopy(statement)
     bindings = {keyword.arg: keyword for keyword in cast(ast.Call, cast(ast.Expr, result).value).keywords}
-    left, right = (bindings[name].value for name in (operand_names[0], operand_names[-1]))
-    roots = (_array_root(left), _array_root(right))
-    if None in roots or roots[0] == roots[1] and ast.dump(left) != ast.dump(right):
+    values = [bindings[name].value for name in operand_names]
+    roots = [_array_root(value) for value in values]
+    aliases = {ast.dump(value) for value, root in zip(values, roots) if root == roots[-1]}
+    if None in roots or len(aliases) != 1:
         return None
-    names = {name for name, _ in loops} & _sliced_names(left) & _sliced_names(right)
+    names = {name for name, _ in loops}.intersection(*(_sliced_names(value) for value in values))
     loops = [(name, extent) for name, extent in loops if name in names]
     fixed = bindings.keys() - set(operand_names) - {"range_start"}
     if any(names & _node_names(bindings[name].value) for name in fixed):
@@ -194,9 +197,9 @@ def _coalesced_call(node: ast.For) -> ast.stmt | None:
     if "range_start" in bindings:
         source = bindings[operand_names[0]].value
         slices = [item for item in ast.walk(source) if isinstance(item, ast.Slice) and names & _node_names(item)]
-        if len(slices) != 1 or _affine_form(cast(ast.expr, slices[0].lower)) != _affine_form(
-            bindings["range_start"].value
-        ):
+        if len(slices) != 1 or slices[0].lower is None:
+            return None
+        if ast.dump(slices[0].lower) != ast.dump(bindings["range_start"].value):
             return None
     operands = {name: _coalesced_operand(bindings[name].value, tuple(loops)) for name in operand_names}
     layouts = {None if value is None else value[1] for value in operands.values()}

@@ -24,6 +24,7 @@ from nkigym.ir.operand_layout import (
     build_operand_region,
     canonical_tile_size,
     canonical_trip_count,
+    seed_partition_tile_limits,
 )
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, IterVar, KernelTree
 from nkigym.ops.base import AxisRole
@@ -40,6 +41,7 @@ def build_canonical_blocknode_tree(analysis: "_AnalysisResult") -> KernelTree:
     from nkigym.ir.buffer_placement import collect_buffers, place_buffers
 
     tree = KernelTree()
+    seed_partition_tile_limits(analysis)
     groups: list[list[int]] = []
     for rec in analysis.ops:
         group = []

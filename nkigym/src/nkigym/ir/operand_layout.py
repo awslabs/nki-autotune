@@ -30,17 +30,37 @@ def canonical_tile_size(rec: _OpRecord, abstract: str, analysis: _AnalysisResult
     """Return the widest legal divisor for one canonical operation axis."""
     extent = analysis.dim_sizes[rec.axis_map[abstract]]
     upper = extent if (maximum := rec.op_cls.MAX_TILE_SIZE.get(abstract)) is None else min(extent, maximum)
+    if abstract in _partition_axes(rec, analysis):
+        upper = min(upper, analysis.partition_tile_limits.get(rec.axis_map[abstract], upper))
     minimum = min(rec.op_cls.MIN_TILE_SIZE.get(abstract, 1), extent, upper)
     step = 128 if rec.op_cls.NAME == "nc_matmul" and abstract == "N" and upper >= 128 else 1
     tile = next(filter(lambda value: extent % value == 0, range(upper - upper % step, minimum - 1, -step)), None)
     if tile is None:
-        raise CanonicalTileError(
-            f"{rec.op_cls.__name__}.{abstract} extent {extent} has no canonical tile between {minimum} and {upper}",
-            rec.axis_map[abstract],
-            extent,
-            minimum,
+        message = (
+            f"{rec.op_cls.__name__}.{abstract} extent {extent} has no canonical tile between {minimum} and {upper}"
         )
+        raise CanonicalTileError(message, rec.axis_map[abstract], extent, minimum)
     return tile
+
+
+def _partition_axes(rec: _OpRecord, analysis: _AnalysisResult) -> set[str]:
+    """Return axes that directly address an on-chip partition dimension."""
+    return {
+        groups[0][0]
+        for slot, name in rec.operand_names.items()
+        if analysis.tensors[name].location != "shared_hbm"
+        and (groups := _groups(rec, slot, analysis))
+        and len(groups[0]) == 1
+    }
+
+
+def seed_partition_tile_limits(analysis: _AnalysisResult) -> None:
+    """Keep canonical partition widths compatible across connected operations."""
+    widths: dict[str, list[int]] = {}
+    for rec in analysis.ops:
+        for axis in _partition_axes(rec, analysis):
+            widths.setdefault(rec.axis_map[axis], []).append(canonical_tile_size(rec, axis, analysis))
+    analysis.partition_tile_limits = {dimension: reduce(gcd, tiles) for dimension, tiles in widths.items()}
 
 
 def canonical_trip_count(rec: _OpRecord, abstract: str, analysis: _AnalysisResult) -> int:
@@ -56,36 +76,16 @@ def _sum(terms: list[Expr]) -> Expr:
 
 def _groups(rec: _OpRecord, slot: str, analysis: _AnalysisResult) -> tuple[tuple[str, ...], ...]:
     """Return physical axis groups present in one configured operation."""
-    groups = tuple(
-        group for group in rec.op_cls.operand_axis_groups(slot) if all(axis in rec.axis_map for axis in group)
-    )
+    groups = tuple(group for group in rec.op_cls.operand_axis_groups(slot) if set(group) <= rec.axis_map.keys())
     return groups[: len(analysis.tensors[rec.operand_names[slot]].shape)]
 
 
-def _axis_extent(rec: _OpRecord, axis: str, analysis: _AnalysisResult) -> int:
-    """Return one abstract axis extent."""
-    return analysis.dim_sizes[rec.axis_map[axis]]
-
-
-def _axis_offset(
-    rec: _OpRecord,
-    axis: str,
-    stride: int,
-    divisor: int,
-    loop_vars: dict[str, str],
-    analysis: _AnalysisResult,
-    tile_size: TileSize,
-    trip_count: TripCount,
-) -> Expr | None:
-    """Return one loop-carried flattened offset term."""
-    if trip_count(rec, axis, analysis) <= 1:
-        return None
-    coefficient = tile_size(rec, axis, analysis) * stride
+def _axis_offset(coefficient: int, divisor: int, loop_var: str, label: str) -> Expr:
+    """Normalize one active loop offset and require an exact tile boundary."""
     if coefficient % divisor:
-        raise ValueError(f"{rec.op_cls.__name__}.{axis} offset {coefficient} is not divisible by {divisor}")
-    normalized = coefficient // divisor
-    variable = Var(name=loop_vars[axis])
-    return variable if normalized == 1 else Mul(left=variable, right=Const(value=normalized))
+        raise ValueError(f"{label} offset {coefficient} is not divisible by {divisor}")
+    variable = Var(name=loop_var)
+    return variable if coefficient == divisor else Mul(left=variable, right=Const(value=coefficient // divisor))
 
 
 def _physical_range(
@@ -100,7 +100,7 @@ def _physical_range(
 ) -> tuple[Expr, Expr]:
     """Return one conservative physical range for an axis group."""
     tensor = analysis.tensors[rec.operand_names[slot]]
-    extents = tuple(_axis_extent(rec, axis, analysis) for axis in group)
+    extents = tuple(analysis.dim_sizes[rec.axis_map[axis]] for axis in group)
     tiles = tuple(tile_size(rec, axis, analysis) for axis in group)
     strides = tuple(prod(extents[index + 1 :]) for index in range(len(group)))
     span = 1 + sum((tile - 1) * stride for tile, stride in zip(tiles, strides, strict=True))
@@ -112,11 +112,10 @@ def _physical_range(
         divisor = gcd(partition_extent(tensor.shape[0]), span)
         if divisor < 1 or tensor.shape[0] % divisor:
             raise ValueError(f"{rec.op_cls.__name__}.{slot} partition span {span} is not tile-aligned")
-    terms = [
-        term
-        for axis, stride in zip(group, strides, strict=True)
-        if (term := _axis_offset(rec, axis, stride, divisor, loop_vars, analysis, tile_size, trip_count)) is not None
-    ]
+    terms: list[Expr] = []
+    for axis, stride, tile in zip(group, strides, tiles, strict=True):
+        if trip_count(rec, axis, analysis) > 1:
+            terms.append(_axis_offset(tile * stride, divisor, loop_vars[axis], f"{rec.op_cls.__name__}.{axis}"))
     return _sum(terms), Const(value=span)
 
 
@@ -151,7 +150,7 @@ def _storage_strides(
     """Return view strides and divisors for loops crossing partition tiles."""
     tensor = analysis.tensors[rec.operand_names[slot]]
     groups = _groups(rec, slot, analysis)
-    extents = {axis: _axis_extent(rec, axis, analysis) for group in groups for axis in group}
+    extents = {axis: analysis.dim_sizes[rec.axis_map[axis]] for group in groups for axis in group}
     if tensor.location == "shared_hbm":
         axes = tuple(axis for group in groups for axis in group)
         return _row_major_strides(axes, extents, 1), {}
@@ -187,7 +186,7 @@ def _view_dimension(
     tile_size: TileSize,
 ) -> tuple[Expr, Expr]:
     """Return one explicit tensor-view stride and extent."""
-    active = tuple(axis for axis in group if _axis_extent(rec, axis, analysis) > 1)
+    active = tuple(axis for axis in group if analysis.dim_sizes[rec.axis_map[axis]] > 1)
     present = tuple(axis for axis in active if axis in strides)
     if present and len(present) != len(active):
         raise ValueError(f"{rec.op_cls.__name__}.{slot} view mixes stored and broadcast axes")
@@ -195,7 +194,7 @@ def _view_dimension(
     if not present:
         return Const(value=int(extent == 1)), Const(value=extent)
     for left, right in zip(active, active[1:]):
-        if strides[left] != strides[right] * _axis_extent(rec, right, analysis):
+        if strides[left] != strides[right] * analysis.dim_sizes[rec.axis_map[right]]:
             raise ValueError(f"{rec.op_cls.__name__}.{slot} view axes {group} are not contiguous")
     return Const(value=strides[present[-1]]), Const(value=extent)
 
@@ -210,16 +209,12 @@ def build_access_patterns(
         if view is None or slot not in rec.operand_names:
             continue
         strides, divisors = _storage_strides(rec, slot, analysis, tile_size)
-        offset_terms = [
-            term
-            for axis, stride in strides.items()
-            if (
-                term := _axis_offset(
-                    rec, axis, stride, divisors.get(axis, 1), loop_vars, analysis, tile_size, trip_count
-                )
-            )
-            is not None
-        ]
+        offset_terms = []
+        for axis, stride in strides.items():
+            if trip_count(rec, axis, analysis) > 1:
+                coefficient = tile_size(rec, axis, analysis) * stride
+                label = f"{rec.op_cls.__name__}.{axis}"
+                offset_terms.append(_axis_offset(coefficient, divisors.get(axis, 1), loop_vars[axis], label))
         patterns[slot] = AccessPattern(
             pattern=tuple(_view_dimension(rec, slot, group, strides, analysis, tile_size) for group in view),
             offset=_sum(offset_terms),

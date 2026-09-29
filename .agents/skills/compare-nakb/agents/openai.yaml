@@ -1,0 +1,3 @@
+interface:
+  display_name: "Compare NAKB"
+  short_description: "Compare saved NAKB results and export latency figures"

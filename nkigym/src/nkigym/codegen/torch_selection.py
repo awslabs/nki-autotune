@@ -393,12 +393,11 @@ def select_rows(
         outputs = initial[1:]
     emit.imports.add("NKIHBMScalarRowStore")
     with emit.repeat(rows):
-        register = emit.emit("NKIRegisterLoad", f"src={emit.cast('NKIUInt32Cast', row)}", "index=0")
+        row_index = emit.cast("NKIUInt32Cast", row)
+        register = emit.emit("NKIRegisterLoad", f"src={row_index}", "index=0")
         valid = one
         if initial is not None:
-            valid = emit.emit(
-                "NKIHBMScalarRowSlice", f"src={initial[0]}, indices={register}, index=0", "rows=1, width=1"
-            )
+            valid = emit.emit("NKINCGather", f"data={initial[0]}, indices={row_index}")
         with emit.guard(emit.inverse(valid)) if initial is not None else nullcontext():
             selected = emit.select_row(emit_fp32_row(emit, source, register), k, sorted_output, initial is None)
             for destination, value in zip(outputs, selected, strict=True):

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from nkigym.ir import Expr, KernelIR, Var, substitute, to_affine
+from nkigym.ir import Add, Const, Expr, FloorDiv, KernelIR, Mod, Mul, Var, substitute, to_affine
 from nkigym.ir.arith.analyzer import Analyzer
-from nkigym.ir.arith.expr import expr_variables
+from nkigym.ir.arith.expr import affine_terms, expr_variables
 from nkigym.ir.program_sharding import PROGRAM_SHARDS_ANNOTATION, configured_program_shards
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import BilinearReductionContract, InitializerContract, ReductionContract
@@ -42,6 +42,57 @@ class _InitializerMatch:
     initializer_execution_nid: int
     output_operand: str
     reduction_axis: str
+
+
+def _write_region(ir: KernelIR, node: ISANode, operand: str) -> BufferRegion | None:
+    """Recover a rectangular PSUM view instead of its conservative allocation bounds."""
+    region = node.operand_bindings.get(operand)
+    pattern = node.access_patterns.get(operand)
+    if region is not None and pattern is not None:
+        buffer = ir.buffer(region.tensor)
+        pitch = buffer.per_tile_physical_shape()[-1]
+        if (
+            buffer.location != "psum"
+            or buffer.versions != 1
+            or buffer.logical_tile_count() != 1
+            or len(pattern.pattern) != 2
+            or pattern.pattern[0][0] != Const(value=pitch)
+            or pattern.pattern[1][0] != Const(value=1)
+        ):
+            return None
+        region = BufferRegion(
+            tensor=region.tensor,
+            ranges=(
+                (FloorDiv(left=pattern.offset, right=Const(value=pitch)), pattern.pattern[0][1]),
+                (Mod(left=pattern.offset, right=Const(value=pitch)), pattern.pattern[1][1]),
+            ),
+        )
+    return region
+
+
+def _overwrite_is_bank_aligned(ir: KernelIR, node: ISANode, operand: str) -> bool:
+    """Reject resets within a bank while preserving distinct logical tile slots."""
+    if node.op_cls.NAME != "nc_matmul":
+        return True
+    region = _write_region(ir, node, operand)
+    if region is None or ir.buffer(region.tensor).location != "psum":
+        return False
+    return _bank_aligned_free_offset(region.ranges[1][0])
+
+
+def _bank_aligned_free_offset(offset: Expr) -> bool:
+    """Prove alignment within one logical PSUM tile, in float32 elements."""
+    analyzer = Analyzer()
+    remainder = analyzer.simplify(Mod(left=offset, right=Const(value=512)))
+    return remainder == Const(value=0) or all(
+        coefficient % 512 == 0 for coefficient in affine_terms(analyzer.simplify(offset)).values()
+    )
+
+
+def _explicit_matmul_overwrite(node: ISANode) -> bool:
+    """Identify an explicit reset rather than compiler-inferred accumulation."""
+    accumulation = node.kwargs.get("accumulate")
+    return node.op_cls.NAME == "nc_matmul" and (accumulation is False or isinstance(accumulation, tuple))
 
 
 class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]):
@@ -131,8 +182,8 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
         if not isinstance(initializer_contract, InitializerContract) or reduction_fields is None:
             return result
         output_operand, reduction_axis, identity = reduction_fields
-        initializer_region = initializer.operand_bindings.get(initializer_contract.output_operand)
-        reduction_region = reduction.operand_bindings.get(output_operand)
+        initializer_region = _write_region(ir, initializer, initializer_contract.output_operand)
+        reduction_region = _write_region(ir, reduction, output_operand)
         if (
             initializer_region is None
             or reduction_region is None
@@ -140,6 +191,7 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             or not self._regions_equal(initializer_region, reduction_region)
             or initializer_contract.value != identity
             or not reduction.op_cls.first_write_overwrites(output_operand, reduction.kwargs)
+            or not _overwrite_is_bank_aligned(ir, reduction, output_operand)
         ):
             return result
         initializer_execution_nid = self._initializer_execution(ir, initializer_block_nid, initializer_leaf_nid)
@@ -160,7 +212,7 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
         state_matches = (
             (configured if explicit else "accumulate" not in reduction.kwargs)
             and rmw
-            and reduction_region in reduction_block.reads
+            and reduction.operand_bindings[output_operand] in reduction_block.reads
         )
         if not state_matches:
             return result

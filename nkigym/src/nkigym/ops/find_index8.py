@@ -19,6 +19,7 @@ class NKIFindIndex8(NKIOp):
     NAME: ClassVar[str] = "nc_find_index8"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "vals": ("P", "K"), "dst": ("P", "K")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data", "vals"})
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {slot: frozenset({"sbuf"}) for slot in INPUT_OPERANDS}
     FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {"K": 8}
     NON_TILABLE_AXES: ClassVar[frozenset[str]] = frozenset({"F"})
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.SEQUENTIAL}
@@ -35,15 +36,13 @@ class NKIFindIndex8(NKIOp):
                 raise TypeError(f"NKIFindIndex8({slot}=<role={role}>) expects sbuf")
 
     def _run(self, **kwargs: Any) -> np.ndarray:
-        """Assign unused matches in query order, leaving exhausted queries unmatched."""
+        """Assign unused matches in query order, retaining sentinels for unmatched queries."""
         data, values = np.asarray(kwargs["data"]), np.asarray(kwargs["vals"])
         result = np.full(values.shape, np.iinfo(np.uint32).max, dtype=np.uint32)
         for row in range(data.shape[0]):
             used = np.zeros(data.shape[1], dtype=np.bool_)
             for column in range(values.shape[1]):
                 matches = np.flatnonzero(data[row] == values[row, column])
-                if not matches.size:
-                    raise ValueError("NKIFindIndex8 value is absent from its data row")
                 available = matches[~used[matches]]
                 if available.size:
                     result[row, column] = available[0]
@@ -54,7 +53,7 @@ class NKIFindIndex8(NKIOp):
 def emit_small_prefix(
     emit: ControlEmitter, source: str, width: int, count: int, partitions: int, per_partition: bool
 ) -> tuple[str, str, str]:
-    """Select a sanitized prefix and accept only finite, strictly ordered source rows."""
+    """Select a raw prefix and accept only finite, strictly ordered source rows."""
     finite = emit.emit(
         "NKIUInt16ScalarSequence",
         f"data={source}, operand0=0.0, operand1=0.0",
@@ -62,7 +61,7 @@ def emit_small_prefix(
     )
     totals = emit.emit("NKITensorReduce", f"data={finite}", "op='add', axis=1")
     valid = emit.scalar("equal", totals, float(width))
-    working = emit.emit("NKISelectReduce", f"on_true={source}, predicate={finite}", "on_false=0.0")
+    working = emit.copy(source)
     values = emit.emit("NKIMax8", f"src={working}")
     indices = emit.emit("NKIFindIndex8", f"data={working}, vals={values}")
     selected = emit.slice(values, 0, count)

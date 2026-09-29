@@ -36,13 +36,14 @@ pytest --cpu-hosts gym-cpu-1 gym-cpu-2
 The option accepts one or more hosts, and each CPU simulation batch uses all
 configured hosts. Tests that do not use remote simulation can run without it.
 
-The complete ladder benchmark replays the current best public-transform ladder
-for each registered NAKB workload:
+The single ladder test replays the current best public-transform ladder for each
+registered NAKB workload, validates correctness, measures latency, and updates the
+saved comparison statistics:
 
 ```bash
 PYTHONPATH="$PWD:$PWD/nkigym/src" python -m pytest -s \
   test/test_nkigym_ladder.py \
-  --cpu-hosts gym-cpu-1 gym-cpu-2 gym-cpu-3 gym-cpu-4 \
+  --cpu-hosts gym-trn2-1 \
   --trn2-hosts gym-trn2-1
 ```
 
@@ -61,12 +62,83 @@ Lower is better. Every workload must be correct, and `mean_relative_latency`
 must not exceed the fixed target of `0.9`, equivalent to at least 10% average
 latency reduction over NAKB. Individual regressions count as negative
 improvements and remain in the mean. For example, 10% and 20% latency reductions
-average to 15%. The benchmark prints each workload's latencies, the mean relative
-latency, and the mean percentage latency reduction.
+average to 15%. The benchmark prints these statistics and saves them after each
+validated configuration to `artifacts/nakb_latency_comparison/measurements.json`.
+Each invocation starts a new record; it also keeps a separate JSON file at
+`artifacts/nakb_latency_comparison/runs/<run_id>.json`.
 
 Hardware correctness uses a fresh random 63-bit input seed on every benchmark
 run. The seed is printed. Set
 `NKIGYM_NAKB_VALIDATION_SEED` to a recorded value only when reproducing a run.
+
+### Saved measurements and comparison figures
+
+The JSON format is defined in `kernel_library/nakb_comparison.py` and uses
+`schema_version: 1`. Records contain:
+
+| Fields | Meaning |
+| --- | --- |
+| `run_id`, `updated_utc`, `status`, `error` | Run identity, save time, and outcome (`running`, `passed`, `failed`, `imported`, or `updated` for published results). |
+| `seed`, `cpu_hosts`, `trn2_hosts`, `description` | Validation seed and measurement provenance. |
+| `complete_single_run`, `diagnostic_only` | Whether all configurations came from one run; incomplete or mixed runs are diagnostic. |
+| `configuration_count`, `expected_configuration_count` | Recorded and registered configuration counts. |
+| `mean_relative_latency`, `mean_latency_reduction_percent` | Equal-weight mean ratio and `100 × (1 − mean ratio)`; `null` before any result. |
+| `faster_count`, `slower_count`, `equal_count` | Counts relative to each configuration's NAKB baseline. |
+| `workloads` | Configuration IDs mapped to `workload`, `nakb_latency_ms`, `nkigym_latency_ms`, `relative_latency`, `seed`, and profiler-result `source`. |
+| Per-row `source_sha256`, `kernel_sha256`, `measured_utc`, `trn2_host` | Backend/ladder identity, generated-kernel identity, measurement time, and hardware host. Legacy rows without source hashes have unverified freshness. |
+
+Rows are recorded only after intermediate simulation and final Trn2 correctness
+checks pass. Failures preserve completed rows and the error. A run that fails
+only the latency target still has complete measurements. The fixed file always
+describes the latest attempt; previous runs remain available under `runs/`.
+
+After installing an accepted ladder, publish its existing confirmation result:
+
+```bash
+~/venvs/kernel-env/bin/python -m kernel_library.nakb_comparison \
+  --publish path/to/validation.json
+```
+
+The command reads a saved validation JSON with `correct: true`, `workload`,
+`latency_ms`, `nakb_latency_ms`, `relative_latency`, and `seed`, or an existing
+snapshot containing `workloads` rows. Pass multiple files to publish a batch.
+It verifies the recorded numbers, updates those configurations, preserves other
+saved timings, and archives the resulting mixed-run diagnostic. It never
+replays, compiles, simulates, or profiles a kernel. Confirm that the published
+results belong to the installed ladders. Source hashes are preserved when
+already present; importing old results does not certify their freshness.
+
+Run `python -m kernel_library.nakb_comparison` without arguments for the shared
+run ID, saved mean, coverage, and provenance status. Session summaries and plots
+use this same record. Do not keep a separate aggregate in an experiment cache.
+Published results do not replace the full ladder test or its performance target.
+
+Generate the comparison PDF directly from saved measurements:
+
+```bash
+~/venvs/kernel-env/bin/python .agents/skills/compare-nakb/scripts/plot_nakb_comparison.py
+```
+
+The installer includes matplotlib locally. For an existing environment, install
+it once with `~/venvs/kernel-env/bin/python -m pip install --only-binary=:all: matplotlib`.
+Use `--measurements PATH` to select an archived run and `--output-prefix PATH`
+to change the destination. Historical and unversioned results are plotted with
+their provenance label; no remeasurement is required. Defaults produce the
+vector PDF `kernel_library/nakb_latency_comparison.pdf` and a JSON file
+identifying the input hash and matplotlib version. Text and bars remain vector
+graphics with embedded TrueType fonts; any rasterized content uses 600 DPI.
+
+The script validates full registry coverage, exact frozen baselines, positive
+finite latencies, per-configuration ratios, and aggregate statistics. It labels
+mixed runs and records the snapshot time and hash, and rejects incomplete data.
+It does not inspect current kernels or run experiments. The figure places the
+equal-weight aggregate above paired latency bars ordered by descending
+percentage latency reduction (`100 * (1 - NKIGym latency / NAKB latency)`),
+with the largest improvements first and the largest regressions last.
+Configuration IDs break ties. Bars use microsecond labels and a shared
+logarithmic scale; panel headings show the range of latency reductions.
+
+### Hardware profiling
 
 CPU checks use the official
 [`nki.simulate`](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.simulate.html)

@@ -80,6 +80,8 @@ Desktop.ini
 !/2026-05-07-forest-ir-visual-walkthrough-design/**/*.png
 # Artifacts
 artifacts/
+/kernel_library/nakb_latency_comparison.pdf
+/kernel_library/nakb_latency_comparison.json
 private
 *.neff
 *.ntff

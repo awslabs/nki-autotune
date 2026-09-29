@@ -29,6 +29,7 @@ class NKIGroupedLoad(NKIOp):
         "dst": (("R", "S"), ("F",)),
     }
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"src": frozenset({"shared_hbm"})}
     FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {"G": "groups", "R": "rows", "S": "stages"}
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"G": 1, "R": 1, "S": 1, "F": 1}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"G": 1, "R": None, "S": None, "F": None}
@@ -86,18 +87,20 @@ def configure_topk_layout(
         if len(shape) != 2 or not isinstance(count, int) or not 256 <= count <= shape[1] <= 32768:
             continue
         rows, width = shape
+        groups = 2 if rows > 1 and rows % 2 == 0 else 1
+        group_rows = rows // groups
         partitions = min(128, max(32, 32768 // count))
         stages = next(
             (
                 value
                 for value in (32, 16, 8, 4, 2)
-                if rows * value <= partitions and width % value == count % (value * 8) == 0
+                if group_rows * value <= partitions and width % value == count % (value * 8) == 0
             ),
             0,
         )
         if not stages:
             continue
-        config = (1, rows, stages, width // stages, count // stages)
+        config = (groups, group_rows, stages, width // stages, count // stages)
         with graph.graph.inserting_before(node):
             packed = graph.graph.call_function(operator.getitem, (source, ("rotational_topk", *config)))
         packed.meta["example_value"] = SimpleNamespace(shape=(rows, stages * (width // stages + count)))

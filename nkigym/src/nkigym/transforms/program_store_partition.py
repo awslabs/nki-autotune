@@ -22,7 +22,7 @@ class ProgramStorePartitionOption(TransformOption):
 
 
 class ProgramStorePartition(Transform[ProgramStorePartitionOption]):
-    """Partition one replicated post-reduction HBM store across programs."""
+    """Partition one replicated terminal HBM output store across programs."""
 
     def analyze(self, ir: KernelIR) -> list[ProgramStorePartitionOption]:
         """Return every legal output-axis ownership choice for a replicated store."""
@@ -86,7 +86,7 @@ def _check_legality(ir: KernelIR, option: ProgramStorePartitionOption) -> None:
 
 
 def _is_replicated_store(ir: KernelIR, leaf_nid: int) -> bool:
-    """Return whether one store consumes an identical peer-reduced value on every program."""
+    """Require a terminal shared output containing identical peer-reduced values."""
     shards = configured_program_shards(ir)
     if leaf_nid not in ir.tree.graph:
         return False
@@ -101,6 +101,11 @@ def _is_replicated_store(ir: KernelIR, leaf_nid: int) -> bool:
         or destination is None
         or source is None
         or ir.buffer(destination.tensor).location != "shared_hbm"
+        or destination.tensor not in ir.return_names
+        or any(
+            destination.tensor in ir.dependency.info(reader).reads
+            for reader in ir.dependency.touches_by_tensor.get(destination.tensor, ())
+        )
         or ir.buffer(source.tensor).location != "sbuf"
         or set(shards.values()) != {2}
     ):

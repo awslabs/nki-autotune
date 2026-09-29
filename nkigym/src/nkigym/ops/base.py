@@ -275,7 +275,7 @@ class PartitionTileBatchingContract:
     """Hardware support for one call spanning contiguous partition tiles.
 
     ``operands`` lists every tensor slot whose one-tile region expands to the
-    corresponding complete physical allocation when its loop is batched.
+    contiguous tile range covered by its loop, retaining the allocation pitch.
     Other operands must be read-only and invariant over the absorbed loop.
     """
 

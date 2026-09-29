@@ -64,7 +64,8 @@ class NKIGroupedFreeGather(NKIOp):
 def folded_max_layout(rows: int, width: int) -> tuple[int, int]:
     """Choose exact chunks whose groups fit the physical partition limit."""
     capacity = 256 if rows > 1 and rows % 2 == 0 else 128
-    parts = next((size for size in range(capacity // rows, 1, -1) if width % size == 0), 1)
+    limit = min(capacity // rows, max(1, width // 128))
+    parts = next((size for size in range(limit, 1, -1) if width % size == 0), 1)
     return (2 if rows * parts > 128 else 1), parts
 
 

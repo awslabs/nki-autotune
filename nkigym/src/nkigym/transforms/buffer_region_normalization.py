@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from math import prod
+from math import isqrt, prod
 from weakref import WeakKeyDictionary
 
 from nkigym.ir import KernelIR
@@ -21,6 +21,7 @@ from nkigym.ir.program_sharding import configured_program_shards, owning_block
 from nkigym.ir.tree import PARTITION_DIM, AccessPattern, BlockNode, Buffer, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.ops.base import BilinearReductionContract, CopyContract, InitializerContract
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
+from nkigym.transforms.eliminate_identity_initializer import _bank_aligned_free_offset, _explicit_matmul_overwrite
 
 _RegionFingerprint = tuple[str, int, int, tuple[tuple[Expr, Expr], ...]]
 _Normalization = tuple[int, int]
@@ -123,6 +124,7 @@ def _axis_fold_options(ir: KernelIR) -> tuple[BufferAxisFoldOption, ...]:
             and buffer.list_len == buffer.versions == 1
         }
         regions: dict[str, list[BufferRegion]] = {name: [] for name in buffers}
+        indexed_regions: dict[str, list[tuple[int, BufferRegion]]] = {name: [] for name in buffers}
         layout_writers: set[str] = set()
         invalid_writers: set[str] = set()
         patterned: set[str] = set()
@@ -133,12 +135,14 @@ def _axis_fold_options(ir: KernelIR) -> tuple[BufferAxisFoldOption, ...]:
                 for region in (*node.reads, *node.writes):
                     if region.tensor in regions:
                         regions[region.tensor].append(region)
+                        indexed_regions[region.tensor].append((nid, region))
             elif isinstance(node, ISANode):
                 contract = node.op_cls.algebraic_contract(node.kwargs)
                 for slot, region in node.operand_bindings.items():
                     if region.tensor not in regions:
                         continue
                     regions[region.tensor].append(region)
+                    indexed_regions[region.tensor].append((nid, region))
                     if slot not in node.op_cls.INPUT_OPERANDS:
                         output = getattr(contract, "output_operand", None)
                         copy_writer = slot == output and isinstance(contract, CopyContract)
@@ -164,20 +168,93 @@ def _axis_fold_options(ir: KernelIR) -> tuple[BufferAxisFoldOption, ...]:
         options = []
         for name in sorted(buffers):
             buffer = buffers[name]
-            free_tile = _foldable_free_tile(
-                ir,
-                buffer,
-                tuple(regions[name]),
+            supported = (
                 name in layout_writers
                 and name not in invalid_writers
                 and name not in patterned
-                and name not in semantic_offsets,
+                and name not in semantic_offsets
             )
+            free_tile = _foldable_free_tile(ir, buffer, tuple(regions[name]), supported)
             if free_tile is not None:
                 options.append(BufferAxisFoldOption(tensor=name, free_tile=free_tile))
+            if supported:
+                options.extend(
+                    BufferAxisFoldOption(tensor=name, free_tile=width)
+                    for width in _partial_fold_widths(ir, buffer, indexed_regions[name])
+                    if width != free_tile
+                )
         cached = tuple(options)
         _AXIS_FOLDS[ir.tree] = cached
     return cached
+
+
+def _partial_fold_widths(ir: KernelIR, buffer: Buffer, regions: list[tuple[int, BufferRegion]]) -> list[int]:
+    """Offer larger coordinate tiles only when every access remains inside one."""
+    if not regions or any(
+        len(region.ranges) != 2
+        or region.ranges[0][1] != Const(value=buffer.partition_extent())
+        or not isinstance(region.ranges[1][1], Const)
+        for _nid, region in regions
+    ):
+        return []
+    largest = max(span.value for _nid, region in regions if isinstance(span := region.ranges[1][1], Const))
+    if largest >= buffer.shape[1] or largest < 1:
+        return []
+    divisors = set()
+    for divisor in range(1, isqrt(buffer.shape[1]) + 1):
+        if buffer.shape[1] % divisor == 0:
+            divisors.update((divisor, buffer.shape[1] // divisor))
+    result = []
+    for width in sorted(divisors):
+        if not largest <= width < buffer.shape[1]:
+            continue
+        candidate = replace(
+            buffer, shape=(buffer.shape[0] * buffer.shape[1] // width, width), partition_size=buffer.partition_extent()
+        )
+        if layout_satisfies_output_alignment(ir.tree, candidate) and all(
+            _partial_fold_coordinates(ir, nid, region, width, buffer.shape[1] // width) is not None
+            for nid, region in regions
+        ):
+            result.append(width)
+    return result
+
+
+def _partial_fold_coordinates(
+    ir: KernelIR, nid: int, region: BufferRegion, width: int, tiles: int
+) -> tuple[Expr, Expr] | None:
+    """Prove an affine quotient and a bounded, nonwrapping within-tile offset."""
+    leaf = nid if isinstance(ir.tree.data(nid), ISANode) else ir.dependency._leaf_of_block.get(nid)
+    if leaf is None:
+        return None
+    try:
+        terms = to_affine(region.ranges[1][0])
+    except NonAffineError:
+        return None
+    quotient = from_affine({name: coefficient // width for name, coefficient in terms.items()})
+    remainder = from_affine({name: coefficient % width for name, coefficient in terms.items()})
+    analyzer = Analyzer()
+    for ancestor in ir.tree.ancestors(leaf):
+        node = ir.tree.data(ancestor)
+        if isinstance(node, ForNode):
+            analyzer.bind(node.loop_var, 0, node.extent)
+    qlo, qhi = analyzer.const_int_bound(quotient)
+    rlo, rhi = analyzer.const_int_bound(remainder)
+    span = region.ranges[1][1]
+    valid = (
+        isinstance(span, Const)
+        and span.value > 0
+        and qlo is not None
+        and qhi is not None
+        and rlo is not None
+        and rhi is not None
+        and 0 <= qlo <= qhi < tiles
+        and 0 <= rlo <= rhi
+        and rhi + span.value <= width
+    )
+    operation = ir.tree.isa(leaf)
+    if _explicit_matmul_overwrite(operation) and operation.operand_bindings["dst"] == region:
+        valid = valid and _bank_aligned_free_offset(remainder)
+    return (quotient, remainder) if valid else None
 
 
 def _foldable_free_tile(ir: KernelIR, buffer: Buffer, regions: tuple[BufferRegion, ...], copy_only: bool) -> int | None:
@@ -224,16 +301,24 @@ def _fold_free_axis(ir: KernelIR, option: BufferAxisFoldOption) -> None:
         buffer, shape=(buffer.shape[0] * factor, option.free_tile), partition_size=buffer.partition_extent()
     )
 
-    def rewrite(region: BufferRegion) -> BufferRegion:
+    def rewrite(region: BufferRegion, nid: int) -> BufferRegion:
         """Rewrite one selected region into the folded coordinate frame."""
         result = region
         if region.tensor == option.tensor:
             free_lower, free_width = region.ranges[1]
-            quotient = from_affine(
-                {variable: coefficient // option.free_tile for variable, coefficient in to_affine(free_lower).items()}
-            )
+            terms = to_affine(free_lower)
+            if all(coefficient % option.free_tile == 0 for coefficient in terms.values()):
+                quotient = from_affine(
+                    {variable: coefficient // option.free_tile for variable, coefficient in terms.items()}
+                )
+                remainder = Const(value=0)
+            else:
+                coordinates = _partial_fold_coordinates(ir, nid, region, option.free_tile, factor)
+                if coordinates is None:
+                    raise TransformLegalityError("partial free-axis fold lost its coordinate proof")
+                quotient, remainder = coordinates
             tile_lower = Add(left=Mul(left=region.ranges[0][0], right=Const(value=factor)), right=quotient)
-            result = replace(region, ranges=((tile_lower, region.ranges[0][1]), (Const(value=0), free_width)))
+            result = replace(region, ranges=((tile_lower, region.ranges[0][1]), (remainder, free_width)))
         return result
 
     for nid in ir.tree.preorder():
@@ -242,12 +327,12 @@ def _fold_free_axis(ir: KernelIR, option: BufferAxisFoldOption) -> None:
             allocations = tuple(replacement if item.name == option.tensor else item for item in node.alloc_buffers)
             ir.tree.graph.nodes[nid]["data"] = replace(
                 node,
-                reads=tuple(rewrite(region) for region in node.reads),
-                writes=tuple(rewrite(region) for region in node.writes),
+                reads=tuple(rewrite(region, nid) for region in node.reads),
+                writes=tuple(rewrite(region, nid) for region in node.writes),
                 alloc_buffers=allocations,
             )
         elif isinstance(node, ISANode):
-            bindings = {slot: rewrite(region) for slot, region in node.operand_bindings.items()}
+            bindings = {slot: rewrite(region, nid) for slot, region in node.operand_bindings.items()}
             ir.tree.graph.nodes[nid]["data"] = replace(node, operand_bindings=bindings)
 
 
