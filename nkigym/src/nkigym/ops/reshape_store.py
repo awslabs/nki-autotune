@@ -1,10 +1,10 @@
 """Store contiguous SBUF row segments as separate HBM rows."""
 
+from contextlib import nullcontext
 from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import NKIOp, _operand_role
 from nkigym.ops.index_iota import native_prefix
 from nkigym.ops.register_load import ControlEmitter
@@ -52,38 +52,62 @@ class NKIReshapeStore(NKIOp):
         return source.reshape(source.shape[0] * rows, source.shape[1] // rows).copy()
 
 
-def emit_partitioned_prefix(emit: ControlEmitter, source: str, width: int, count: int) -> tuple[str, str, str] | None:
+def emit_partitioned_prefix(
+    emit: ControlEmitter, source: str, width: int, count: int, rows: int = 1, source_hbm: bool = False
+) -> tuple[str, str, str] | None:
     """Select bounded local prefixes and prove they contain the complete global prefix."""
+    if source_hbm and (rows < 2 or width < 2048 or count < 8):
+        return None
     first = max(2, (width + 511) // 512)
-    parts = next((size for size in range(first, min(128, width) + 1) if width % size == 0), 1)
+    first = min(first, 128 // rows) if rows > 1 else first
+    parts = next((size for size in range(first, min(128 // rows, width) + 1) if width % size == 0), 1)
     chunk = width // parts
-    local_count = max(8, ((4 * count + 8 * parts - 1) // (8 * parts)) * 8)
+    local_count = (count // 8 + 1) * 8 if rows > 1 else max(8, ((4 * count + 8 * parts - 1) // (8 * parts)) * 8)
     if local_count + 8 > chunk:
         local_count = max(8, ((3 * count + 16 * parts - 1) // (16 * parts)) * 8)
-    if count < 16 or parts == 1 or local_count + 8 > chunk or not count + 8 <= parts * local_count <= 16384:
+    eligible = count >= (16 if rows == 1 else 8) and parts > 1 and local_count + 8 <= chunk
+    if not eligible or not count + 8 <= parts * local_count <= 16384:
         return None
     zero = emit.iota(1)
     one = emit.scalar("add", zero, 1.0)
-    seed = emit.emit("NKIIota", "", f"partitions=1, width={count}, pattern=[[0, {count}]], channel_multiplier=0")
+    seed = emit.emit("NKIIota", "", f"partitions={rows}, width={count}, pattern=[[0, {count}]], channel_multiplier=0")
     result_values = emit.copy(seed)
     result_indices = emit.cast("NKIUInt32Cast", seed)
-    result_valid = emit.copy(zero)
-    with emit.guard(one):
-        reshaped = emit.emit("NKIReshapeStore", f"src={source}", f"rows={parts}")
-        loaded = emit.emit("NKILoad", f"src={reshaped}")
-        local_values, local_indices, valid = native_prefix(emit, loaded, chunk, local_count, parts)
-        offsets = emit.emit("NKIIota", "", f"partitions={parts}, width=1, pattern=[[0, 1]], channel_multiplier={chunk}")
+    result_valid = emit.copy(zero) if rows == 1 else emit.slice(seed, 0, 1)
+    with emit.guard(one) if rows == 1 else nullcontext():
+        reshaped = source if source_hbm else emit.emit("NKIReshapeStore", f"src={source}", f"rows={parts}")
+        load_op = "NKIGroupedLoad" if source_hbm else "NKILoad"
+        load_config = f"groups=1, rows={rows}, stages={parts}" if source_hbm else ""
+        loaded = emit.emit(load_op, f"src={reshaped}", load_config)
+        loaded = emit.cast("NKIFloat32Cast", loaded) if source_hbm else loaded
+        local_values, local_indices, valid = native_prefix(emit, loaded, chunk, local_count, parts * rows, rows > 1)
+        offset_config = f"partitions={parts * rows}, width=1, pattern=[[0, 1]], channel_multiplier={chunk}"
+        offsets = emit.emit("NKIIota", "", offset_config)
         absolute = emit.scalar("add", emit.cast("NKIFloat32Cast", local_indices), offsets)
-        absolute = emit.cast("NKIUInt32Cast", absolute)
+        absolute = emit.cast("NKIUInt32Cast", absolute) if rows == 1 else absolute
         flattened = []
         for value in (local_values, absolute):
-            stored = emit.emit("NKIFlattenStore", f"src={value}", f"width={parts * local_count}")
+            store_op = "NKIFlattenStore" if rows == 1 else "NKIGroupedStore"
+            store_config = f"width={parts * local_count}" if rows == 1 else f"groups=1, rows={rows}, stages={parts}"
+            stored = emit.emit(store_op, f"src={value}", store_config)
             flattened.append(emit.emit("NKILoad", f"src={stored}"))
-        values, ranks, merged_valid = native_prefix(emit, flattened[0], parts * local_count, count)
+        values, ranks, merged_valid = native_prefix(emit, flattened[0], parts * local_count, count, rows, rows > 1)
         indices = emit.emit("NKINCGather", f"data={flattened[1]}, indices={ranks}")
+        if rows > 1:
+            base_config = f"partitions={rows}, width=1, pattern=[[0, 1]], channel_multiplier={width}"
+            bases = emit.emit("NKIIota", "", base_config)
+            indices = emit.cast("NKIUInt32Cast", emit.scalar("subtract", emit.cast("NKIFloat32Cast", indices), bases))
         boundary = emit.emit("NKITensorSlice", f"src={local_values}", f"start={local_count - 1}, width=1")
         boundary = emit.emit("NKIDMATranspose", f"src={boundary}")
-        cutoff = emit.emit("NKITensorReduce", f"data={boundary}", "op='max', axis=1")
+        config = f"partitions=1, groups={rows}, chunks={parts}"
+        reduce_op = "NKITensorReduce" if rows == 1 else "NKIGroupedTileReduce"
+        reduce_config = "op='max', axis=1" if rows == 1 else f"{config}, op='max'"
+        cutoff = emit.emit(reduce_op, f"data={boundary}", reduce_config)
+        if rows > 1:
+            cutoff = emit.emit("NKIDMATranspose", f"src={cutoff}")
+            valid = emit.emit("NKIDMATranspose", f"src={valid}")
+            valid = emit.emit("NKIGroupedTileReduce", f"data={valid}", f"{config}, op='add'")
+            valid = emit.scalar("equal", emit.emit("NKIDMATranspose", f"src={valid}"), float(parts))
         last = emit.emit("NKITensorSlice", f"src={values}", f"start={count - 1}, width=1")
         separated = emit.scalar("greater", last, cutoff)
         accepted = emit.binary("multiply", emit.binary("multiply", valid, merged_valid), separated)
@@ -93,17 +117,3 @@ def emit_partitioned_prefix(emit: ControlEmitter, source: str, width: int, count
 
 
 __all__ = ["NKIReshapeStore"]
-
-
-def reshape_view(value: TorchValue, shape: tuple[int, ...]) -> TorchValue:
-    """Return a no-copy rank-two singleton reshape."""
-    if len(shape) != 2 or int(np.prod(value.shape)) != int(np.prod(shape)):
-        raise ValueError(f"Torch reshape {value.shape} -> {shape} is unsupported")
-    if len(value.shape) == 1 and shape == (1, value.shape[0]):
-        return TorchValue(value.name, shape, transposed=True, is_hbm=value.is_hbm, storage_dtype=value.storage_dtype)
-    physical_shape = tuple(reversed(value.shape)) if value.transposed else value.shape
-    if physical_shape == shape:
-        return TorchValue(value.name, shape, is_hbm=value.is_hbm, storage_dtype=value.storage_dtype)
-    if physical_shape == tuple(reversed(shape)):
-        return TorchValue(value.name, shape, transposed=True, is_hbm=value.is_hbm, storage_dtype=value.storage_dtype)
-    raise ValueError(f"Torch reshape {value.shape} -> {shape} changes non-singleton layout")

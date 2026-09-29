@@ -275,13 +275,20 @@ class Fuse(Transform[FuseOption]):
             raise TransformLegalityError("Fuse operation batching target does not exist")
         loop = ir.tree.data(loop_nid)
         leaf = ir.tree.data(leaf_nid)
+        block_child = loop_nid
         block_nid = ir.tree.parent(loop_nid)
+        while (
+            block_nid is not None
+            and isinstance(ir.tree.data(block_nid), ForNode)
+            and ir.tree.children(block_nid) == [block_child]
+        ):
+            block_child, block_nid = block_nid, ir.tree.parent(block_nid)
         if (
             not isinstance(loop, ForNode)
             or not isinstance(leaf, ISANode)
             or block_nid is None
             or not isinstance(ir.tree.data(block_nid), BlockNode)
-            or ir.tree.children(block_nid) != [loop_nid]
+            or ir.tree.children(block_nid) != [block_child]
             or ir.tree.children(loop_nid) != [leaf_nid]
         ):
             raise TransformLegalityError("Fuse operation batching requires one complete loop-operation block")
@@ -344,22 +351,41 @@ class Fuse(Transform[FuseOption]):
         }
         if len(partitions) != 1:
             raise TransformLegalityError("Fuse operation batching requires matching on-chip partition extents")
+        for slot in contract.operands:
+            region = leaf.operand_bindings[slot]
+            if region.tensor in written and any(
+                other.tensor == region.tensor and other.ranges != region.ranges
+                for other in leaf.operand_bindings.values()
+            ):
+                raise TransformLegalityError("Fuse operation batching cannot change loop-carried aliases")
         partition = next(iter(partitions))
         analyzer = Analyzer()
+        for ancestor in ir.tree.ancestors(loop_nid):
+            node = ir.tree.data(ancestor)
+            if isinstance(node, ForNode):
+                analyzer.bind(node.loop_var, 0, node.extent)
         for slot in contract.operands:
             region = leaf.operand_bindings[slot]
             buffer = buffer_map[region.tensor]
+            first = _batch_iteration_region(region, loop, 0)
+            lower, upper = analyzer.const_int_bound(first.ranges[0][0])
             valid = bool(
                 buffer.location in {"sbuf", "psum"}
                 and len(buffer.shape) == 2
                 and buffer.list_len == 1
                 and buffer.versions == 1
-                and loop.extent == buffer.logical_tile_count()
+                and lower is not None
+                and upper is not None
+                and 0 <= lower
+                and upper + loop.extent <= buffer.logical_tile_count()
                 and len(region.ranges) == 2
                 and region.ranges[0][1] == Const(value=partition)
                 and region.ranges[1][1] == Const(value=buffer.shape[1])
                 and analyzer.can_prove_equal(region.ranges[1][0], Const(value=0))
-                and analyzer.can_prove_equal(region.ranges[0][0], Var(name=loop.loop_var))
+                and Analyzer().can_prove_equal(
+                    Analyzer().simplify(region.ranges[0][0]),
+                    Add(left=first.ranges[0][0], right=Var(name=loop.loop_var)),
+                )
             )
             if buffer.location == "shared_hbm" and leaf.op_cls.NAME == "dma_copy":
                 valid = _hbm_batch_region_matches(buffer, region, loop, partition)
@@ -384,27 +410,20 @@ class Fuse(Transform[FuseOption]):
         return True
 
     def _do_operation_batch(self, ir: KernelIR, option: FuseOption) -> None:
-        """Replace one declared partition-tile loop with one full-view ISA call."""
+        """Replace one declared partition-tile loop with one batched ISA view."""
         match = self._operation_batch_match(ir, option)
         loop = ir.tree.loop(match.loop_nid)
         leaf = ir.tree.isa(match.leaf_nid)
         buffers = ir.all_buffers()
         bindings = dict(leaf.operand_bindings)
         bindings.update(
-            {
-                slot: (
-                    _batch_iteration_region(leaf.operand_bindings[slot], loop, 0)
-                    if buffers[leaf.operand_bindings[slot].tensor].location == "shared_hbm"
-                    else _tile_regions(buffers[leaf.operand_bindings[slot].tensor])[0]
-                )
-                for slot in match.contract.operands
-            }
+            {slot: _batch_iteration_region(leaf.operand_bindings[slot], loop, 0) for slot in match.contract.operands}
         )
         patterns = {
             slot: (
                 _hbm_batch_pattern(buffers[region.tensor], region, loop)
                 if buffers[region.tensor].location == "shared_hbm"
-                else _full_buffer_pattern(buffers[region.tensor])
+                else _onchip_batch_pattern(buffers[region.tensor], region, loop)
             )
             for slot, region in leaf.operand_bindings.items()
             if slot in match.contract.operands
@@ -412,18 +431,14 @@ class Fuse(Transform[FuseOption]):
         tensors = {leaf.operand_bindings[slot].tensor for slot in match.contract.operands}
 
         def expand(regions: tuple[BufferRegion, ...]) -> tuple[BufferRegion, ...]:
-            """Replace each one-tile footprint with its complete logical family."""
+            """Preserve the exact footprint of each removed loop iteration."""
             return tuple(
                 tile
                 for region in regions
                 for tile in (
                     (region,)
                     if region.tensor not in tensors
-                    else (
-                        tuple(_batch_iteration_region(region, loop, index) for index in range(loop.extent))
-                        if buffers[region.tensor].location == "shared_hbm"
-                        else _tile_regions(buffers[region.tensor])
-                    )
+                    else tuple(_batch_iteration_region(region, loop, index) for index in range(loop.extent))
                 )
             )
 
@@ -443,7 +458,10 @@ class Fuse(Transform[FuseOption]):
         ir.tree.graph.nodes[match.leaf_nid]["data"] = replace(
             leaf, operand_bindings=bindings, access_patterns=patterns, kwargs=kwargs
         )
-        _replace_in_parent_children(ir.tree, match.block_nid, [match.loop_nid], [match.leaf_nid])
+        parent_nid = ir.tree.parent(match.loop_nid)
+        if parent_nid is None:
+            raise AssertionError("batched operation loop lost its execution parent")
+        _replace_in_parent_children(ir.tree, parent_nid, [match.loop_nid], [match.leaf_nid])
         ir.tree.graph.remove_node(match.loop_nid)
 
     def _do_outer_trip(self, ir: KernelIR, option: FuseOption) -> None:
@@ -769,28 +787,17 @@ def _binding_and_access_offsets(node: BlockNode | ForNode | ISANode) -> list[Exp
     return expressions
 
 
-def _tile_regions(buffer: Buffer) -> tuple[BufferRegion, ...]:
-    """Return every logical partition tile of one packed on-chip buffer."""
-    partition, free = buffer.partition_extent(), buffer.shape[1]
-    return tuple(
-        BufferRegion(
-            tensor=buffer.name,
-            ranges=((Const(value=tile), Const(value=partition)), (Const(value=0), Const(value=free))),
-        )
-        for tile in range(buffer.logical_tile_count())
-    )
-
-
-def _full_buffer_pattern(buffer: Buffer) -> AccessPattern:
-    """Return the complete physical ndarray view of one packed on-chip buffer."""
+def _onchip_batch_pattern(buffer: Buffer, region: BufferRegion, loop: ForNode) -> AccessPattern:
+    """Select consecutive tiles while retaining the allocation's physical pitch."""
     partition, tiles, free = buffer.per_tile_physical_shape()
+    first = _batch_iteration_region(region, loop, 0)
     return AccessPattern(
         pattern=(
             (Const(value=tiles * free), Const(value=partition)),
-            (Const(value=free), Const(value=tiles)),
+            (Const(value=free), Const(value=loop.extent)),
             (Const(value=1), Const(value=buffer.shape[1])),
         ),
-        offset=Const(value=0),
+        offset=Analyzer().simplify(Mul(left=first.ranges[0][0], right=Const(value=free))),
     )
 
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from nkigym.ir import AccessPattern, Add, Const, Expr, KernelIR, Mod, Mul, Var, substitute
 from nkigym.ir.arith.analyzer import Analyzer
 from nkigym.ir.arith.expr import affine_coefficient, expr_variables
+from nkigym.ir.buffer_placement import _STORAGE_DTYPE_BYTES
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.program_sharding import PROGRAM_SHARDS_ANNOTATION, configured_program_shards
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode
@@ -159,8 +160,14 @@ def _match_geometry(
     local_extent = loop.extent // programs
     source_axis = _contiguous_batch_axis(source, source_buffer, loop.loop_var, source_widths, local_extent)
     output_axis = _contiguous_batch_axis(output, output_buffer, loop.loop_var, output_widths, local_extent)
-    expected_output_axis = contract.permutation.index(source_axis) if source_axis is not None else None
-    if source_axis is None or output_axis is None or output_axis != expected_output_axis:
+    if source_axis is None or output_axis is None:
+        return result
+    alignment = leaf.op_cls.OUTPUT_TILE_ALIGNMENT_BYTES.get(contract.output_operand, 1)
+    if alignment > 1 and (
+        _batch_stride(output, output_buffer, loop.loop_var, local_extent)
+        * _STORAGE_DTYPE_BYTES[output_buffer.physical_dtype()]
+        % alignment
+    ):
         return result
     if not _parallel_loop(ir.tree.block(block_nid), loop.loop_var):
         return result
@@ -192,7 +199,12 @@ def _valid_existing_batch(
 ) -> bool:
     """Require contiguous view expansion within the permutation's ISA limits."""
     batching = contract.batching
-    if batching is None or programs <= 1 or leaf.kwargs.get("axes") != batching.permutation:
+    if (
+        batching is None
+        or programs <= 1
+        or leaf.kwargs.get("axes") != batching.permutation
+        or axes[1] != contract.permutation.index(axes[0])
+    ):
         return False
     if set(leaf.access_patterns) != {contract.input_operand, contract.output_operand}:
         return False

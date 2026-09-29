@@ -26,15 +26,14 @@ def emit_rotational_selection(
     specs[rotation] = ((rows * stages, rows * stages), "float32")
     state = prepare_rotational_topk(source, config, rotation, stem, body, imports)
     selected, positions = emit_rotational_topk_stages(*state, config, stem, body, imports)
-    imports.update(("NKIGroupedInt32Cast", "NKIGroupedStore", "NKILoad"))
+    imports.update(("NKIGroupedInt32Cast", "NKIGroupedStore"))
     integer = f"sbuf_{stem}_global_indices"
     body.append(f"{integer} = NKIGroupedInt32Cast(groups={groups}, partitions={rows * stages})(data={positions.name})")
     outputs = []
     for suffix, value, dtype in (("values", selected.name, "float32"), ("indices", integer, "int32")):
-        stored, loaded = f"hbm_{stem}_{suffix}", f"sbuf_{stem}_flat_{suffix}"
+        stored = f"hbm_{stem}_{suffix}"
         body.append(f"{stored} = NKIGroupedStore(groups={groups}, rows={rows}, stages={stages})(src={value})")
-        body.append(f"{loaded} = NKILoad()(src={stored})")
-        outputs.append(TorchValue(loaded, (groups * rows, count), storage_dtype=dtype))
+        outputs.append(TorchValue(stored, (groups * rows, count), is_hbm=True, storage_dtype=dtype))
     return outputs[0], outputs[1]
 
 

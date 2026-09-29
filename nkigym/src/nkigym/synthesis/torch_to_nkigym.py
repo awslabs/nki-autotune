@@ -55,7 +55,6 @@ from nkigym.ops.matmul import emit_product
 from nkigym.ops.max8 import emit_native_topk
 from nkigym.ops.partition_slice_load import prepare_packed_binary
 from nkigym.ops.reciprocal import emit_activation_or_reciprocal
-from nkigym.ops.reshape_store import reshape_view as _reshape_view
 from nkigym.ops.row_load import pack_pointwise_graph
 from nkigym.ops.tensor_copy_predicated import emit_sparse_values
 from nkigym.ops.tensor_reduce import emit_reference_sum
@@ -63,6 +62,7 @@ from nkigym.ops.tensor_scalar import _tensor_scalar_operands, _vector_broadcast
 from nkigym.ops.tensor_slice import emit_clip, static_prefix_width, validate_argsort_options
 from nkigym.ops.tensor_tensor import emit_packed_variance
 from nkigym.ops.tiled_grouped_matmul import lower_grouped_attention
+from nkigym.ops.transpose_store import reshape_view as _reshape_view
 from nkigym.ops.vector_dma_transpose import emit_packed_reduction
 from nkigym.profile import InputSpecs
 from nkigym.profile.abi import adapt_inputs, adapt_output, kernel_adapters, reference_graph

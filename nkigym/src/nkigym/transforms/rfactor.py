@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import gcd, prod
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith.expr import Add, Const, Expr, Mul, NonAffineError, Var, expr_variables, to_affine
+from nkigym.ir.arith.analyzer import Analyzer
+from nkigym.ir.arith.expr import Add, Const, Expr, Mod, Mul, NonAffineError, Var, expr_variables, to_affine
 from nkigym.ir.program_sharding import configured_program_shards
-from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar, KernelTree
-from nkigym.ops.base import AxisRole, NKIOp, ReductionContract
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode, IterVar
+from nkigym.ops.base import (
+    AxisRole,
+    BilinearReductionContract,
+    InitializerContract,
+    ReduceCombinator,
+    ReductionContract,
+)
 from nkigym.ops.memset import NKIMemset
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.tensor_reduce import NKITensorReduce
@@ -27,12 +35,14 @@ from nkigym.transforms.helper.canonical_rewrite import (
     finalize_rewrite,
     fresh_name,
     owning_block,
+    replace_buffer,
     replace_input_binding,
     single_leaf,
 )
 from nkigym.transforms.helper.operation_builder import NameSupply, OperationBuilder, OperationScope
 from nkigym.transforms.helper.tile_region import retile_region
 from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
+from nkigym.transforms.program_shard import _drain_operand
 from nkigym.transforms.split import _covers_exactly, _current_tensorize_width, _factorizations, _min_tile_floor
 
 _RMW_COMBINERS = frozenset({"add", "multiply"})
@@ -483,510 +493,427 @@ def _privatize_serial_reduction(ir: KernelIR, match: _SerialReduction) -> None:
 
 
 @dataclass(frozen=True)
-class _RMWAnalysis:
-    """Tree-order and buffer facts shared by RMW recipe candidates."""
+class _MatrixFactor:
+    """One closed matrix reduction with a complete materialized factor domain."""
 
-    buffers: dict[str, Buffer]
-    order: dict[int, int]
+    product: int
+    block: int
+    initializer: int
+    drain: int
+    drain_operand: str
+    axis: str
+    loops: tuple[int, ...]
+    buffer: Buffer
+    owner: int
+    combinator: ReduceCombinator
+
+
+def _dense_reduction_index(ir: KernelIR, loops: tuple[int, ...]) -> Expr:
+    """Return the mixed-radix iteration index of the given ordered loops."""
+    index: Expr = Const(value=0)
+    for nid in loops:
+        loop = ir.tree.loop(nid)
+        index = Add(left=Mul(left=index, right=Const(value=loop.extent)), right=Var(name=loop.loop_var))
+    return Analyzer().simplify(index)
+
+
+def _matrix_reduction_domain(ir: KernelIR, leaf: int) -> tuple[str, tuple[int, ...]] | None:
+    """Require one complete, densely enumerated materialized contraction."""
+    node = ir.tree.isa(leaf)
+    contract = node.op_cls.algebraic_contract(node.kwargs)
+    if (
+        not isinstance(contract, BilinearReductionContract)
+        or contract.output_operand != "dst"
+        or node.op_cls.RFACTOR_RECIPE != "rmw"
+        or node.op_cls.OUTPUT_LOCATION != "psum"
+        or node.op_cls.rmw_operands(node.kwargs) != frozenset({"dst"})
+        or sum(role is AxisRole.ACCUMULATION for role in node.op_cls.AXIS_ROLES.values()) != 1
+        or contract.combinator.combiner not in _RMW_COMBINERS
+    ):
+        return None
+    block = ir.tree.block(owning_block(ir.tree, leaf))
+    axis = block.axis_map.get(contract.reduction_axis)
+    if axis is None or sum(value == axis for value in block.axis_map.values()) != 1:
+        return None
+    variable, value = next((iv, value) for iv, value in zip(block.iter_vars, block.iter_values) if iv.axis == axis)
+    ancestors = tuple(nid for nid in ir.tree.ancestors(leaf) if isinstance(ir.tree.data(nid), ForNode))
+    names = [ir.tree.loop(nid).loop_var for nid in ancestors]
+    loops = tuple(nid for nid in ancestors if ir.tree.loop(nid).loop_var in expr_variables(value))
+    tile = _current_tensorize_width(node, block, axis)
+    if (
+        variable.role is not AxisRole.ACCUMULATION
+        or variable.dom[0] != 0
+        or not loops
+        or len(names) != len(set(names))
+        or tile is None
+        or tile < 1
+        or variable.dom[1] != tile * prod(ir.tree.loop(nid).extent for nid in loops)
+        or not Analyzer().can_prove_equal(value, _dense_reduction_index(ir, loops))
+    ):
+        return None
+    return axis, loops
+
+
+def _complete_psum_view(ir: KernelIR, leaf: int, region: BufferRegion, buffer: Buffer) -> bool:
+    """Prove one full-partition, unpadded logical view fits its current buffer."""
+    if len(region.ranges) != 2:
+        return False
+    free_width = region.ranges[1][1]
+    if (
+        region.ranges[0][1] != Const(value=buffer.partition_extent())
+        or not isinstance(free_width, Const)
+        or free_width.value < 1
+    ):
+        return False
+    analyzer = Analyzer()
+    names = []
+    for nid in ir.tree.ancestors(leaf):
+        node = ir.tree.data(nid)
+        if isinstance(node, ForNode):
+            names.append(node.loop_var)
+            analyzer.bind(node.loop_var, 0, node.extent)
+    if len(names) != len(set(names)):
+        return False
+    for axis, (lower, _width) in enumerate(region.ranges):
+        lo, hi = analyzer.const_int_bound(lower)
+        limit = buffer.logical_tile_count() if axis == 0 else buffer.shape[1]
+        span = 1 if axis == 0 else free_width.value
+        if lo is None or hi is None or lo < 0 or hi + span > limit:
+            return False
+    return True
+
+
+def _matrix_factor_match(
+    ir: KernelIR, leaf: int, buffers: dict[str, Buffer], order: dict[int, int], overlap: frozenset[int]
+) -> _MatrixFactor | None:
+    """Require the exact reset/product/drain dataflow before privatization."""
+    domain = _matrix_reduction_domain(ir, leaf)
+    if domain is None:
+        return None
+    axis, loops = domain
+    node = ir.tree.isa(leaf)
+    contract = node.op_cls.algebraic_contract(node.kwargs)
+    assert isinstance(contract, BilinearReductionContract)
+    output = node.operand_bindings["dst"]
+    buffer = buffers[output.tensor]
+    touches = tuple(ir.dependency.touches_by_tensor[buffer.name])
+    if (
+        buffer.location != "psum"
+        or buffer.physical_dtype() != "float32"
+        or len(buffer.shape) != 2
+        or buffer.list_len != 1
+        or buffer.versions != 1
+        or buffer.name in ir.param_buffers
+        or buffer.name in ir.return_names
+        or len(touches) != 3
+        or expr_variables(output.ranges[0][0]) & {ir.tree.loop(nid).loop_var for nid in loops}
+        or expr_variables(output.ranges[1][0]) & {ir.tree.loop(nid).loop_var for nid in loops}
+    ):
+        return None
+    initializers, drains = [], []
+    for nid in touches:
+        operation = ir.tree.isa(nid)
+        relation = operation.op_cls.algebraic_contract(operation.kwargs)
+        if isinstance(relation, InitializerContract) and relation.output_operand == "dst":
+            if relation.value == contract.combinator.identity:
+                initializers.append(nid)
+        operand = _drain_operand(operation)
+        if operand is not None and operation.operand_bindings[operand].tensor == buffer.name:
+            drains.append((nid, operand))
+        for slot, region in operation.operand_bindings.items():
+            if region.tensor == buffer.name and (
+                slot in operation.access_patterns or not _complete_psum_view(ir, nid, region, buffer)
+            ):
+                return None
+    if len(initializers) != 1 or len(drains) != 1:
+        return None
+    initializer, (drain, operand) = initializers[0], drains[0]
+    drain_owner = owning_block(ir.tree, drain)
+    drain_ancestors = ir.tree.ancestors(drain)
+    drain_loops = tuple(
+        nid
+        for nid in drain_ancestors[drain_ancestors.index(drain_owner) + 1 :]
+        if isinstance(ir.tree.data(nid), ForNode)
+    )
+    owners = [
+        nid for nid in ir.tree.blocks() if any(item.name == buffer.name for item in ir.tree.block(nid).alloc_buffers)
+    ]
+    if (
+        len({initializer, leaf, drain}) != 3
+        or not order[initializer] < order[loops[0]] < order[leaf] < order[drain]
+        or order[drain_owner] <= order[leaf]
+        or loops[0] in ir.tree.ancestors(drain)
+        or len(owners) != 1
+        or any(owners[0] not in ir.tree.ancestors(nid) for nid in touches)
+        or buffers[ir.tree.isa(drain).operand_bindings["dst"].tensor].location != "sbuf"
+        or ir.tree.isa(drain).access_patterns
+        or not _independent_output_iterations(ir, drain_loops, ir.tree.isa(drain).operand_bindings[operand], buffer)
+        or any(
+            ir.tree.block(nid).annotations
+            for touch in touches
+            for nid in ir.tree.ancestors(touch)
+            if isinstance(ir.tree.data(nid), BlockNode) and nid != ir.tree.root
+        )
+        or configured_program_shards(ir).keys() & {loops[0], *ir.tree.descendants(loops[0])}
+        or intersects_software_pipeline(ir, (loops[0], initializer, drain), overlap)
+    ):
+        return None
+    return _MatrixFactor(
+        leaf,
+        owning_block(ir.tree, leaf),
+        initializer,
+        drain,
+        operand,
+        axis,
+        loops,
+        buffer,
+        owners[0],
+        contract.combinator,
+    )
+
+
+def _private_factor_bank_fit(ir: KernelIR, match: _MatrixFactor, loop: int) -> bool:
+    """Prove every private matrix write remains inside one512-element PSUM bank."""
+    region = ir.tree.isa(match.product).operand_bindings["dst"]
+    width = region.ranges[1][1]
+    if not isinstance(width, Const):
+        return False
+    slot = Add(
+        left=Mul(left=Var(name=ir.tree.loop(loop).loop_var), right=Const(value=match.buffer.logical_tile_count())),
+        right=region.ranges[0][0],
+    )
+    offset = Add(
+        left=Mul(left=slot, right=Const(value=match.buffer.per_tile_physical_shape()[2])), right=region.ranges[1][0]
+    )
+    analyzer = Analyzer()
+    for ancestor in ir.tree.ancestors(match.product):
+        node = ir.tree.data(ancestor)
+        if isinstance(node, ForNode):
+            analyzer.bind(node.loop_var, 0, node.extent)
+    remainder = analyzer.simplify(Mod(left=offset, right=Const(value=512)))
+    _lower, upper = analyzer.const_int_bound(remainder)
+    if upper is not None and upper + width.value <= 512:
+        return True
+    try:
+        terms = to_affine(offset)
+    except NonAffineError:
+        return False
+    unit = gcd(512, *(abs(coefficient) for name, coefficient in terms.items() if name is not None))
+    return 512 - unit + terms.get(None, 0) % unit + width.value <= 512
+
+
+def _matrix_factor_options(ir: KernelIR, overlap: frozenset[int]) -> dict[int, _MatrixFactor]:
+    """Index unambiguous matrix factors in one traversal of reduction leaves."""
+    scope_leaves: dict[int, list[int]] = {}
+    order = {nid: index for index, nid in enumerate(ir.tree.preorder())}
+    buffers = ir.all_buffers()
+    for nid in order:
+        node = ir.tree.data(nid)
+        if isinstance(node, ISANode) and node.op_cls.RFACTOR_RECIPE is not None:
+            for ancestor in ir.tree.ancestors(nid):
+                if isinstance(ir.tree.data(ancestor), ForNode):
+                    scope_leaves.setdefault(ancestor, []).append(nid)
+    matches: dict[int, _MatrixFactor | None] = {}
+    result = {}
+    for loop, leaves in scope_leaves.items():
+        if len(leaves) != 1:
+            continue
+        leaf = leaves[0]
+        if leaf not in matches:
+            matches[leaf] = _matrix_factor_match(ir, leaf, buffers, order, overlap)
+        match = matches[leaf]
+        if match is not None and loop in match.loops and _private_factor_bank_fit(ir, match, loop):
+            result[loop] = match
+    return result
+
+
+def _factor_region(region: BufferRegion, index: Expr, tiles: int) -> BufferRegion:
+    """Address the same output view in one factor's private partition tiles."""
+    lower, width = region.ranges[0]
+    analyzer = Analyzer()
+    leading = analyzer.simplify(Add(left=Mul(left=index, right=Const(value=tiles)), right=lower))
+    return replace(
+        region, ranges=((leading, width), *((analyzer.simplify(lower), span) for lower, span in region.ranges[1:]))
+    )
+
+
+def _factor_scope(block: BlockNode, axis: str, index: Expr, extent: int, role: AxisRole) -> BlockNode:
+    """Add one factor coordinate without changing the surrounding output scope."""
+    key = "RF"
+    while key in block.axis_map:
+        key += "_"
+    return replace(
+        block,
+        iter_vars=(*block.iter_vars, IterVar(axis=axis, dom=(0, extent), role=role)),
+        iter_values=(*block.iter_values, index),
+        axis_map={**block.axis_map, key: axis},
+        alloc_buffers=(),
+    )
+
+
+def _factor_product(ir: KernelIR, match: _MatrixFactor, loop: int) -> str:
+    """Separate the selected parallel coordinate from the residual contraction."""
+    block = ir.tree.block(match.block)
+    residual_axis = _fresh_axis(ir)
+    extent = ir.tree.loop(loop).extent
+    residual = _dense_reduction_index(ir, tuple(nid for nid in match.loops if nid != loop))
+    variables, values = [], []
+    for variable, value in zip(block.iter_vars, block.iter_values, strict=True):
+        variables.append(
+            replace(variable, axis=residual_axis, dom=(0, variable.dom[1] // extent))
+            if variable.axis == match.axis
+            else variable
+        )
+        values.append(residual if variable.axis == match.axis else value)
+    block = replace(
+        block,
+        iter_vars=tuple(variables),
+        iter_values=tuple(values),
+        axis_map={key: residual_axis if value == match.axis else value for key, value in block.axis_map.items()},
+    )
+    ir.tree.graph.nodes[match.block]["data"] = block
+    factor_axis = _fresh_axis(ir)
+    index = Var(name=ir.tree.loop(loop).loop_var)
+    updated = _factor_scope(block, factor_axis, index, extent, AxisRole.PARALLEL)
+    updated = replace(updated, alloc_buffers=block.alloc_buffers)
+
+    def rewrite(region: BufferRegion) -> BufferRegion:
+        """Redirect only the selected accumulator's complete views."""
+        return (
+            _factor_region(region, index, match.buffer.logical_tile_count())
+            if region.tensor == match.buffer.name
+            else region
+        )
+
+    node = ir.tree.isa(match.product)
+    ir.tree.graph.nodes[match.product]["data"] = replace(
+        node, operand_bindings={slot: rewrite(region) for slot, region in node.operand_bindings.items()}
+    )
+    ir.tree.graph.nodes[match.block]["data"] = replace(
+        updated, reads=tuple(map(rewrite, updated.reads)), writes=tuple(map(rewrite, updated.writes))
+    )
+    return factor_axis
+
+
+def _factor_initializer(ir: KernelIR, match: _MatrixFactor, factor_axis: str, extent: int) -> None:
+    """Retarget the existing reset to every private factor at the same site."""
+    index = Var(name=f"i_{factor_axis}_0")
+    node = ir.tree.isa(match.initializer)
+    owner = owning_block(ir.tree, match.initializer)
+    block = ir.tree.block(owner)
+    region = _factor_region(node.operand_bindings["dst"], index, match.buffer.logical_tile_count())
+    ir.tree.graph.nodes[match.initializer]["data"] = replace(
+        node, operand_bindings={**node.operand_bindings, "dst": region}
+    )
+    updated = _factor_scope(block, factor_axis, index, extent, AxisRole.PARALLEL)
+    ir.tree.graph.nodes[owner]["data"] = replace(updated, writes=(region,), alloc_buffers=block.alloc_buffers)
+    parent = ir.tree.parent(match.initializer)
+    if parent is None:
+        raise AssertionError("matrix initializer has no execution parent")
+    factor_loop = ir.tree.add_node(ForNode(loop_var=index.name, extent=extent))
+    _replace_in_parent_children(ir.tree, parent, [match.initializer], [factor_loop])
+    ir.tree.graph.add_edge(factor_loop, match.initializer)
+
+
+def _fold_matrix_factors(ir: KernelIR, match: _MatrixFactor, factor_axis: str, extent: int, state: Buffer) -> None:
+    """Fold private PSUM values directly before the original observable drain."""
+    drain = ir.tree.isa(match.drain)
+    source = drain.operand_bindings[match.drain_operand]
+    state_region = replace(source, tensor=state.name)
+    owner = owning_block(ir.tree, match.drain)
+    original_scope = _owned_operation_scope(ir, match.drain)
+    scope = replace(original_scope.block, reads=(), writes=(), alloc_buffers=())
+    builder = OperationBuilder(ir.tree, None, ir.all_buffers(), NameSupply(set(ir.all_buffers())))
+    reset = builder.append(
+        NKIMemset,
+        {"dst": state_region},
+        {"value": match.combinator.identity},
+        OperationScope(scope, original_scope.loops),
+    )
+    index = Var(name=f"i_{factor_axis}_0")
+    factor_loop = ir.tree.add_node(ForNode(loop_var=index.name, extent=extent))
+    builder.parent = factor_loop
+    fold_scope = _factor_scope(scope, factor_axis, index, extent, AxisRole.ACCUMULATION)
+    builder.append(
+        NKITensorTensor,
+        {
+            "data1": _factor_region(source, index, match.buffer.logical_tile_count()),
+            "data2": state_region,
+            "dst": state_region,
+        },
+        {"op": match.combinator.combiner},
+        OperationScope(fold_scope, original_scope.loops),
+    )
+    parent = ir.tree.parent(owner)
+    if parent is None:
+        raise AssertionError("matrix drain has no execution parent")
+    replace_input_binding(ir, match.drain, match.drain_operand, state.name)
+    _replace_in_parent_children(ir.tree, parent, [owner], [reset, factor_loop, owner])
+
+
+def _emit_matrix_factor(ir: KernelIR, match: _MatrixFactor, loop: int) -> None:
+    """Privatize one existing contraction factor without changing input order."""
+    extent = ir.tree.loop(loop).extent
+    replace_buffer(
+        ir,
+        replace(
+            match.buffer,
+            shape=(match.buffer.shape[0] * extent, match.buffer.shape[1]),
+            partition_size=match.buffer.partition_extent(),
+        ),
+    )
+    state = replace(
+        match.buffer,
+        name=fresh_name(ir, f"{match.buffer.name}_accumulator"),
+        dtype="float32",
+        storage_dtype="float32",
+        location="sbuf",
+    )
+    owner = ir.tree.block(match.owner)
+    ir.tree.graph.nodes[match.owner]["data"] = replace(owner, alloc_buffers=(*owner.alloc_buffers, state))
+    factor_axis = _factor_product(ir, match, loop)
+    _factor_initializer(ir, match, factor_axis, extent)
+    _fold_matrix_factors(ir, match, factor_axis, extent, state)
+    finalize_rewrite(ir)
 
 
 class RFactor(Transform[RFactorOption]):
-    """Expose reduction tiles or privatize one already-materialized reduction factor."""
+    """Expose native reduction tiles or privatize one materialized factor."""
 
     def analyze(self, ir: KernelIR) -> list[RFactorOption]:
-        """Enumerate every fully legal ACCUMULATION loop of an rfactorable op."""
+        """Offer one independent factor decision for each proven reduction."""
         options: list[RFactorOption] = []
-        overlap_nodes = software_pipeline_overlap_nodes(ir)
-        analysis = _RMWAnalysis(buffers=ir.all_buffers(), order={nid: i for i, nid in enumerate(ir.tree.preorder())})
+        overlap = software_pipeline_overlap_nodes(ir)
+        buffers = ir.all_buffers()
+        matrices = _matrix_factor_options(ir, overlap)
         for nid in ir.tree.preorder():
             if not isinstance(ir.tree.data(nid), ForNode):
                 continue
-            if _serial_reduction(ir, nid, analysis.buffers) is not None and not intersects_software_pipeline(
-                ir, (nid,), overlap_nodes
-            ):
+            serial = _serial_reduction(ir, nid, buffers)
+            if serial is not None and not intersects_software_pipeline(ir, (nid,), overlap):
                 options.append(RFactorOption(target_loop_nid=nid))
-            elif self._rfactorable(ir, nid, analysis) and not intersects_software_pipeline(
-                ir, self._rmw_rewrite_nodes(ir, nid), overlap_nodes
-            ):
-                options.append(RFactorOption(target_loop_nid=nid, factor_axis=0))
-        for leaf_nid, target_axis, factors in _SlotRFactor().analyze(ir):
-            if not intersects_software_pipeline(ir, (leaf_nid,), overlap_nodes):
-                options.append(
-                    RFactorOption(target_loop_nid=leaf_nid, factor_axis=0, factors=factors, target_axis=target_axis)
-                )
+            elif nid in matrices:
+                options.append(RFactorOption(target_loop_nid=nid))
+        for leaf, axis, factors in _SlotRFactor().analyze(ir):
+            if not intersects_software_pipeline(ir, (leaf,), overlap):
+                options.append(RFactorOption(target_loop_nid=leaf, factors=factors, target_axis=axis))
         return options
 
     def apply(self, ir: KernelIR, option: RFactorOption) -> KernelIR:
-        """Re-check legality, deep-copy, emit the two-stage accumulation, return."""
-        self._check_legality(ir, option)
-        new_ir = copy_for_rewrite(ir)
+        """Recheck, copy, and factor exactly the selected reduction dimension."""
+        if option not in self.analyze(ir):
+            raise TransformLegalityError(f"illegal RFactor option: {option}")
+        result = copy_for_rewrite(ir)
         if option.factors is not None and option.target_axis is not None:
-            _SlotRFactor().emit(new_ir, option.target_loop_nid, option.target_axis, option.factors)
-        elif (serial := _serial_reduction(new_ir, option.target_loop_nid)) is not None:
-            _privatize_serial_reduction(new_ir, serial)
+            _SlotRFactor().emit(result, option.target_loop_nid, option.target_axis, option.factors)
+        elif (serial := _serial_reduction(result, option.target_loop_nid)) is not None:
+            _privatize_serial_reduction(result, serial)
         else:
-            self._emit_rmw(new_ir, option)
-        return new_ir
-
-    def _rfactorable(self, ir: KernelIR, loop_nid: int, analysis: _RMWAnalysis | None = None) -> bool:
-        """Return whether ``loop_nid`` supports the RMW recipe."""
-        if analysis is None:
-            analysis = _RMWAnalysis(
-                buffers=ir.all_buffers(), order={nid: i for i, nid in enumerate(ir.tree.preorder())}
-            )
-        leaf = self._owning_matmul_leaf(ir, loop_nid)
-        result = False
-        if leaf is not None:
-            op_cls = ir.tree.isa(leaf).op_cls
-            block_nid = self._enclosing_block_nid(ir.tree, leaf)
-            block = ir.tree.block(block_nid)
-            axis = self._loop_axis(ir, loop_nid, block)
-            axis_loops: list[int] = []
-            if axis is not None:
-                binding_vars = self._axis_binding_loopvars(block, axis)
-                axis_loops = [
-                    nid
-                    for nid in ir.tree.ancestors(leaf)
-                    if isinstance((node := ir.tree.data(nid)), ForNode) and node.loop_var in binding_vars
-                ]
-            if (
-                self._supports_rmw_op(op_cls)
-                and axis is not None
-                and _role_of(block, axis) == AxisRole.ACCUMULATION
-                and len(axis_loops) == 2
-                and axis_loops[0] == loop_nid
-                and self._init_block_is_retargetable(ir, loop_nid, leaf, analysis)
-                and self._drain_block_is_removable(ir, loop_nid, leaf, analysis)
-                and self._ki_loop_nid(ir, loop_nid) is not None
-                and self._gadget_region_fits_output(ir, loop_nid, leaf, analysis)
-            ):
-                result = True
-        if result:
-            rewritten = self._rmw_rewrite_nodes(ir, loop_nid)
-            changed = {node for root in rewritten for node in (root, *ir.tree.descendants(root))}
-            result = not bool(configured_program_shards(ir).keys() & changed)
+            match = _matrix_factor_options(result, software_pipeline_overlap_nodes(result)).get(option.target_loop_nid)
+            if match is None:
+                raise AssertionError(f"matrix RFactor option disappeared after copying: {option}")
+            _emit_matrix_factor(result, match, option.target_loop_nid)
         return result
-
-    def _supports_rmw_op(self, op_cls: type[NKIOp]) -> bool:
-        """Whether ``op_cls`` satisfies the currently implemented 2D PSUM recipe."""
-        reduction_axes = [axis for axis, role in op_cls.AXIS_ROLES.items() if role == AxisRole.ACCUMULATION]
-        output_axes = op_cls.OPERAND_AXES.get("dst", ())
-        reducer = op_cls.REDUCE_COMBINATOR
-        return (
-            op_cls.RFACTOR_RECIPE == "rmw"
-            and reducer is not None
-            and reducer.combiner in _RMW_COMBINERS
-            and op_cls.RMW_OPERANDS == frozenset({"dst"})
-            and op_cls.OUTPUT_LOCATION == "psum"
-            and len(reduction_axes) == 1
-            and len(output_axes) == 2
-            and reduction_axes[0] not in output_axes
-        )
-
-    def _init_block_is_retargetable(
-        self, ir: KernelIR, loop_nid: int, matmul_leaf: int, analysis: _RMWAnalysis
-    ) -> bool:
-        """Whether one canonical identity memset initializes PSUM outside ``ko``."""
-        matmul = ir.tree.data(matmul_leaf)
-        assert isinstance(matmul, ISANode)
-        psum_name = matmul.operand_bindings["dst"].tensor
-        reducer = matmul.op_cls.REDUCE_COMBINATOR
-        assert reducer is not None
-        inits = [
-            nid
-            for nid in ir.dependency.touches_by_tensor.get(psum_name, ())
-            if isinstance((node := ir.tree.data(nid)), ISANode)
-            and node.op_cls.NAME == "memset"
-            and node.operand_bindings["dst"].tensor == psum_name
-        ]
-        result = False
-        if len(inits) == 1:
-            init_nid = inits[0]
-            init_block = self._enclosing_block_nid(ir.tree, init_nid)
-            init = ir.tree.isa(init_nid)
-            result = (
-                single_leaf(ir.tree, init_block) == init_nid
-                and loop_nid not in ir.tree.ancestors(init_nid)
-                and analysis.order[init_nid] < analysis.order[matmul_leaf]
-                and init.kwargs.get("value") == float(reducer.identity)
-            )
-        return result
-
-    def _drain_block_is_removable(self, ir: KernelIR, loop_nid: int, matmul_leaf: int, analysis: _RMWAnalysis) -> bool:
-        """Whether the sole consumer is an outside-``ko`` identity drain."""
-        matmul = ir.tree.data(matmul_leaf)
-        assert isinstance(matmul, ISANode)
-        psum_name = matmul.operand_bindings["dst"].tensor
-        drains = [
-            nid
-            for nid in ir.dependency.touches_by_tensor.get(psum_name, ())
-            if (
-                isinstance((node := ir.tree.data(nid)), ISANode)
-                and node.op_cls.NAME == "tensor_copy"
-                and node.operand_bindings["src"].tensor == psum_name
-            )
-        ]
-        result = False
-        if len(drains) == 1:
-            drain_nid = drains[0]
-            drain_block = self._enclosing_block_nid(ir.tree, drain_nid)
-            leaves = [nid for nid in ir.tree.preorder(drain_block) if isinstance(ir.tree.data(nid), ISANode)]
-            drain = ir.tree.isa(drain_nid)
-            out_name = drain.operand_bindings["dst"].tensor
-            result = (
-                leaves == drains
-                and ir.dependency.direct_consumers(matmul_leaf) == [drain_nid]
-                and loop_nid not in ir.tree.ancestors(drain_nid)
-                and analysis.order[matmul_leaf] < analysis.order[drain_nid]
-                and drain.operand_bindings["src"].ranges == drain.operand_bindings["dst"].ranges
-                and analysis.buffers[out_name].location == "sbuf"
-            )
-        return result
-
-    def _gadget_region_fits_output(self, ir: KernelIR, loop_nid: int, matmul_leaf: int, analysis: _RMWAnalysis) -> bool:
-        """Return whether the generated region fits PSUM and SBUF."""
-        ki_nid = self._ki_loop_nid(ir, loop_nid)
-        if ki_nid is None:
-            return False
-        matmul = ir.tree.data(matmul_leaf)
-        assert isinstance(matmul, ISANode)
-        psum_name = matmul.operand_bindings["dst"].tensor
-        out_name = self._drain_out_tensor(ir, psum_name)
-        dst_region = matmul.operand_bindings["dst"]
-        free_footprint = self._free_footprint(ir, matmul_leaf)
-        loop_extents = {
-            node.loop_var: node.extent
-            for nid in ir.tree.ancestors(matmul_leaf)
-            if isinstance((node := ir.tree.data(nid)), ForNode)
-        }
-        result = False
-        if free_footprint is not None:
-            free_lo, free_extent = free_footprint
-            region = self._partition_region(out_name, dst_region.ranges[0][0], free_lo, free_extent)
-            result = all(
-                self._region_axis_fits(lo, width, axis, buf, loop_extents)
-                for buf in (analysis.buffers[psum_name], analysis.buffers[out_name])
-                for axis, (lo, width) in enumerate(region.ranges)
-            )
-        return result
-
-    def _region_axis_fits(self, lo: Expr, width: Expr, axis: int, buf: Buffer, loop_extents: dict[str, int]) -> bool:
-        """Return whether one affine gadget axis stays within ``buf.shape``."""
-        result = False
-        coeffs: dict[str | None, int] | None = None
-        width_value = width.value if isinstance(width, Const) else None
-        if width_value is not None:
-            try:
-                coeffs = to_affine(lo)
-            except (NonAffineError, TypeError):
-                coeffs = None
-        if coeffs is not None and width_value is not None:
-            lower = coeffs.get(None, 0)
-            upper = lower
-            bounded = axis < len(buf.shape)
-            for var, coeff in coeffs.items():
-                if var is None:
-                    continue
-                extent = loop_extents.get(var)
-                if extent is None:
-                    bounded = False
-                    break
-                span = coeff * (extent - 1)
-                if span < 0:
-                    lower += span
-                else:
-                    upper += span
-            if axis == 0 and buf.location in ("sbuf", "psum") and width_value == PARTITION_DIM:
-                lower *= PARTITION_DIM
-                upper *= PARTITION_DIM
-            result = bounded and lower >= 0 and upper + width_value <= buf.shape[axis]
-        return result
-
-    def _check_legality(self, ir: KernelIR, option: RFactorOption) -> None:
-        """Raise TransformLegalityError if the option is not a valid RFactor."""
-        has_factors = option.factors is not None
-        has_target_axis = option.target_axis is not None
-        if has_factors != has_target_axis:
-            raise TransformLegalityError("RFactor slot options must provide both factors and target_axis")
-        if has_factors:
-            if intersects_software_pipeline(ir, (option.target_loop_nid,)):
-                raise TransformLegalityError("RFactor cannot rewrite an active software-pipeline scope")
-            self._check_slot_legality(ir, option)
-        elif _serial_reduction(ir, option.target_loop_nid) is not None:
-            if option.factor_axis != 0 or intersects_software_pipeline(ir, (option.target_loop_nid,)):
-                raise TransformLegalityError("illegal serial-reduction privatization")
-        else:
-            self._check_rmw_legality(ir, option)
-
-    def _check_slot_legality(self, ir: KernelIR, option: RFactorOption) -> None:
-        """Raise when ``option`` is not a complete slot-style RFactor."""
-        if option.factor_axis != 0:
-            raise TransformLegalityError(f"RFactor factor_axis must be 0 for the slot recipe; got {option.factor_axis}")
-        factors = option.factors
-        target_axis = option.target_axis
-        if factors is None or target_axis is None:
-            raise AssertionError("slot RFactor legality requires factors and target_axis")
-        if not _SlotRFactor().rfactorable(ir, option.target_loop_nid, target_axis, factors):
-            raise TransformLegalityError(
-                f"RFactor target {option.target_loop_nid} is not a legal slot reduction "
-                f"for axis {target_axis!r} and factors {factors}"
-            )
-
-    def _check_rmw_legality(self, ir: KernelIR, option: RFactorOption) -> None:
-        """Raise TransformLegalityError if the option is not a valid rmw RFactor."""
-        nid = option.target_loop_nid
-        if nid not in ir.tree.graph or not isinstance(ir.tree.data(nid), ForNode):
-            raise TransformLegalityError(f"RFactor target {nid} is not a ForNode in the tree")
-        if option.factor_axis != 0:
-            raise TransformLegalityError(
-                f"RFactor factor_axis must be 0 for the fused rmw recipe; got {option.factor_axis}"
-            )
-        if not self._rfactorable(ir, nid):
-            raise TransformLegalityError(
-                f"RFactor target loop {nid} is not a legal reduction: an rmw recipe must be "
-                f"the outermost of exactly two loops binding an ACCUMULATION axis, "
-                f"have canonical outside-loop init and identity-mapped drain blocks, "
-                f"use a supported combiner, and fit a contiguous gadget footprint "
-                f"within PSUM/output capacity"
-            )
-        if intersects_software_pipeline(ir, self._rmw_rewrite_nodes(ir, nid)):
-            raise TransformLegalityError("RFactor cannot rewrite an active software-pipeline scope")
-
-    def _rmw_rewrite_nodes(self, ir: KernelIR, loop_nid: int) -> tuple[int, ...]:
-        """Return the existing tree sites changed by the RMW recipe."""
-        matmul_leaf = self._owning_matmul_leaf(ir, loop_nid)
-        if matmul_leaf is None:
-            raise TransformLegalityError(f"RFactor target loop {loop_nid} has no RMW operation")
-        psum_name = ir.tree.isa(matmul_leaf).operand_bindings["dst"].tensor
-        init_block = self._enclosing_block_nid(ir.tree, self._writer_leaf(ir.tree, psum_name, "memset"))
-        drain_block = self._enclosing_block_nid(ir.tree, self._reader_leaf(ir.tree, psum_name, "tensor_copy"))
-        return loop_nid, init_block, drain_block
-
-    def _emit_rmw(self, ir: KernelIR, option: RFactorOption) -> None:
-        """Regroup a PSUM reduction and fold each partial directly into SBUF."""
-        tree = ir.tree
-        ko = tree.loop(option.target_loop_nid)
-        matmul_leaf = self._owning_matmul_leaf(ir, option.target_loop_nid)
-        assert matmul_leaf is not None
-        matmul = tree.isa(matmul_leaf)
-        reducer = matmul.op_cls.REDUCE_COMBINATOR
-        assert reducer is not None
-        psum = matmul.operand_bindings["dst"]
-        drain_leaf = self._reader_leaf(tree, psum.tensor, "tensor_copy")
-        output = ir.buffer(tree.isa(drain_leaf).operand_bindings["dst"].tensor)
-        state = replace(
-            output,
-            name=fresh_name(ir, f"{output.name}_accumulator"),
-            dtype="float32",
-            storage_dtype="float32",
-            list_len=1,
-            versions=1,
-        )
-        append_root_buffers(ir, (state,))
-        builder = OperationBuilder(tree, None, ir.all_buffers(), NameSupply(set(ir.all_buffers())))
-        init_leaf = self._writer_leaf(tree, psum.tensor, "memset")
-        initializer = tree.isa(init_leaf)
-        init_block = owning_block(tree, init_leaf)
-        state_init = builder.append(
-            NKIMemset,
-            {"dst": replace(initializer.operand_bindings["dst"], tensor=state.name)},
-            dict(initializer.kwargs),
-            _owned_operation_scope(ir, init_leaf),
-        )
-        init_parent = tree.parent(init_block)
-        if init_parent is None:
-            raise AssertionError("RMW initializer has no parent")
-        _replace_in_parent_children(tree, init_parent, [init_block], [state_init, init_block])
-        ki = self._ki_loop_nid(ir, option.target_loop_nid)
-        if ki is None:
-            raise TransformLegalityError("RFactor target has no inner accumulation loop")
-        footprint = tuple(
-            ForNode(loop_var=name, extent=extent) for name, extent in self._footprint(ir, ki, matmul_leaf)
-        )
-        scope = self._gadget_block(ir, matmul_leaf, ko.loop_var, reads=(), writes=())
-        reset = builder.append(NKIMemset, {"dst": psum}, {"value": reducer.identity}, OperationScope(scope, footprint))
-        state_region = replace(psum, tensor=state.name)
-        update_scope = replace(
-            scope,
-            iter_vars=tuple(
-                replace(variable, role=AxisRole.ACCUMULATION) if variable.axis == scope.axis_map["K"] else variable
-                for variable in scope.iter_vars
-            ),
-        )
-        update = builder.append(
-            NKITensorTensor,
-            {"data1": psum, "data2": state_region, "dst": state_region},
-            {"op": reducer.combiner},
-            OperationScope(update_scope, footprint),
-        )
-        parent = tree.parent(ki)
-        if parent is None:
-            raise AssertionError("inner reduction loop has no parent")
-        _replace_in_parent_children(tree, parent, [ki], [reset, ki, update])
-        replace_input_binding(ir, drain_leaf, "src", state.name)
-        finalize_rewrite(ir)
-
-    def _enclosing_block_nid(self, tree: KernelTree, nid: int) -> int:
-        """Nearest enclosing BlockNode nid of ``nid`` (deepest ancestor block)."""
-        for anc in reversed(tree.ancestors(nid)):
-            if isinstance(tree.data(anc), BlockNode):
-                return anc
-        raise TransformLegalityError(f"no enclosing BlockNode for {nid}")
-
-    def _ki_loop_nid(self, ir: KernelIR, ko_loop_nid: int) -> int | None:
-        """Return the innermost accumulation loop at or below ``ko``."""
-        tree = ir.tree
-        matmul_leaf = self._owning_matmul_leaf(ir, ko_loop_nid)
-        assert matmul_leaf is not None
-        block_nid = self._enclosing_block_nid(tree, matmul_leaf)
-        block = tree.block(block_nid)
-        op_cls = self._op_cls_of_block(tree, block_nid)
-        reduction_abstract = next(a for a, role in op_cls.AXIS_ROLES.items() if role == AxisRole.ACCUMULATION)
-        k_axis = block.axis_map[reduction_abstract]
-        k_binding_vars = self._axis_binding_loopvars(block, k_axis)
-        k_loops = [
-            a
-            for a in tree.ancestors(matmul_leaf)
-            if isinstance((node := tree.data(a)), ForNode)
-            and node.loop_var in k_binding_vars
-            and block_nid in tree.ancestors(a)
-        ]
-        return k_loops[-1] if k_loops else None
-
-    def _axis_binding_loopvars(self, block: BlockNode, axis: str) -> set[str]:
-        """Loop vars appearing in the iter_value of ``axis`` (the loops that bind it)."""
-        value = next(v for iv, v in zip(block.iter_vars, block.iter_values) if iv.axis == axis)
-        return {n for n in to_affine(value) if n is not None}
-
-    def _footprint(self, ir: KernelIR, ki_loop_nid: int, matmul_leaf: int) -> list[tuple[str, int]]:
-        """Retain every output-axis loop strictly between ``ki`` and the matmul."""
-        tree = ir.tree
-        block = self._enclosing_block(ir, matmul_leaf)
-        output_vars = {
-            name
-            for abstract in tree.isa(matmul_leaf).op_cls.OPERAND_AXES["dst"]
-            for name in self._axis_binding_loopvars(block, block.axis_map[abstract])
-        }
-        between = [
-            a
-            for a in tree.ancestors(matmul_leaf)
-            if isinstance(tree.data(a), ForNode) and ki_loop_nid in tree.ancestors(a)
-        ]
-        return [(tree.loop(a).loop_var, tree.loop(a).extent) for a in between if tree.loop(a).loop_var in output_vars]
-
-    def _free_footprint(self, ir: KernelIR, matmul_leaf: int) -> tuple[Expr, int] | None:
-        """Preserve the matmul instruction's free-axis offset and width."""
-        lower, width = ir.tree.isa(matmul_leaf).operand_bindings["dst"].ranges[1]
-        return (lower, width.value) if isinstance(width, Const) and width.value > 0 else None
-
-    def _op_cls_of_block(self, tree: KernelTree, block_nid: int) -> type[NKIOp]:
-        """Return the sole rfactorable op class under ``block_nid``."""
-        leaves = [
-            nid
-            for nid in tree.descendants(block_nid)
-            if isinstance(tree.data(nid), ISANode) and owning_block(tree, nid) == block_nid
-        ]
-        rfactorable = [n for n in leaves if tree.isa(n).op_cls.RFACTOR_RECIPE is not None]
-        if len(rfactorable) != 1:
-            raise TransformLegalityError(
-                f"block {block_nid} must own exactly one rfactorable leaf; got {len(rfactorable)}"
-            )
-        return tree.isa(rfactorable[0]).op_cls
-
-    def _drain_out_tensor(self, ir: KernelIR, psum_name: str) -> str:
-        """Tensor the drain ``tensor_copy`` writes (reads ``psum_name``, writes SBUF out)."""
-        for nid in ir.dependency.touches_by_tensor.get(psum_name, ()):
-            data = ir.tree.data(nid)
-            if isinstance(data, ISANode) and data.op_cls.NAME == "tensor_copy":
-                if data.operand_bindings["src"].tensor == psum_name:
-                    return data.operand_bindings["dst"].tensor
-        raise TransformLegalityError(f"no drain tensor_copy reading {psum_name!r}")
-
-    def _partition_region(self, tensor: str, part_lo: Expr, free_lo: Expr, free_extent: int) -> BufferRegion:
-        """Build the canonical partition/free-axis region."""
-        return BufferRegion(
-            tensor=tensor, ranges=((part_lo, Const(value=PARTITION_DIM)), (free_lo, Const(value=free_extent)))
-        )
-
-    def _gadget_block(
-        self,
-        ir: KernelIR,
-        matmul_leaf: int,
-        ko_var: str,
-        reads: tuple[BufferRegion, ...],
-        writes: tuple[BufferRegion, ...],
-    ) -> BlockNode:
-        """Build a per-``ki`` gadget block."""
-        tree = ir.tree
-        block = self._enclosing_block(ir, matmul_leaf)
-        op_cls = tree.isa(matmul_leaf).op_cls
-        reduction_abstract = next(axis for axis, role in op_cls.AXIS_ROLES.items() if role == AxisRole.ACCUMULATION)
-        output_axes = op_cls.OPERAND_AXES["dst"]
-        k_axis = block.axis_map[reduction_abstract]
-        m_axis = block.axis_map[output_axes[0]]
-        free_axis = block.axis_map[output_axes[1]]
-        k_dom = next(iv.dom for iv in block.iter_vars if iv.axis == k_axis)
-        m_value = next(v for iv, v in zip(block.iter_vars, block.iter_values) if iv.axis == m_axis)
-        m_dom = next(iv.dom for iv in block.iter_vars if iv.axis == m_axis)
-        free_dom = next(iv.dom for iv in block.iter_vars if iv.axis == free_axis)
-        free_value = next(
-            value for variable, value in zip(block.iter_vars, block.iter_values) if variable.axis == free_axis
-        )
-        return BlockNode(
-            iter_vars=(
-                IterVar(axis=k_axis, dom=k_dom, role=AxisRole.PARALLEL),
-                IterVar(axis=m_axis, dom=m_dom, role=AxisRole.PARALLEL),
-                IterVar(axis=free_axis, dom=free_dom, role=AxisRole.PARALLEL),
-            ),
-            iter_values=(Var(name=ko_var), m_value, free_value),
-            reads=reads,
-            writes=writes,
-            alloc_buffers=(),
-            axis_map={"K": k_axis, "P": m_axis, "F": free_axis},
-        )
-
-    def _writer_leaf(self, tree: KernelTree, tensor: str, op_name: str) -> int:
-        """The single ISA leaf with NAME ``op_name`` that writes ``tensor`` (dst slot)."""
-        for nid in tree.preorder():
-            data = tree.data(nid)
-            if isinstance(data, ISANode) and data.op_cls.NAME == op_name:
-                if data.operand_bindings.get("dst") is not None and data.operand_bindings["dst"].tensor == tensor:
-                    return nid
-        raise TransformLegalityError(f"no {op_name} writing {tensor!r}")
-
-    def _reader_leaf(self, tree: KernelTree, tensor: str, op_name: str) -> int:
-        """The single ISA leaf with NAME ``op_name`` that reads ``tensor`` (src slot)."""
-        for nid in tree.preorder():
-            data = tree.data(nid)
-            if isinstance(data, ISANode) and data.op_cls.NAME == op_name:
-                if data.operand_bindings.get("src") is not None and data.operand_bindings["src"].tensor == tensor:
-                    return nid
-        raise TransformLegalityError(f"no {op_name} reading {tensor!r}")
-
-    def _owning_matmul_leaf(self, ir: KernelIR, loop_nid: int) -> int | None:
-        """The single ISA leaf under ``loop_nid`` whose op is rfactorable, or None."""
-        leaves = [
-            d
-            for d in ir.tree.descendants(loop_nid)
-            if isinstance((node := ir.tree.data(d)), ISANode) and node.op_cls.RFACTOR_RECIPE is not None
-        ]
-        return leaves[0] if len(leaves) == 1 else None
-
-    def _enclosing_block(self, ir: KernelIR, nid: int) -> BlockNode:
-        """Nearest enclosing BlockNode payload of ``nid``."""
-        for anc in reversed(ir.tree.ancestors(nid)):
-            data = ir.tree.data(anc)
-            if isinstance(data, BlockNode):
-                return data
-        raise TransformLegalityError(f"no enclosing BlockNode for {nid}")
-
-    def _loop_axis(self, ir: KernelIR, loop_nid: int, block: BlockNode) -> str | None:
-        """The concrete axis the loop's loop_var binds, via the block's iter_values."""
-        loop_var = ir.tree.loop(loop_nid).loop_var
-        for iv, value in zip(block.iter_vars, block.iter_values):
-            if loop_var in to_affine(value):
-                return iv.axis
-        return None
 
 
 __all__ = ["RFactor", "RFactorOption"]

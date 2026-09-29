@@ -12,6 +12,14 @@ Record best NKIGym kernels as replayable transform ladders in
 `kernel_library/_best_nkigym.py`. Keep benchmark data and acceptance criteria out
 of `kernel_library`.
 
+After installing an accepted ladder, publish its already collected validation
+result with `python -m kernel_library.nakb_comparison --publish path/to/validation.json`.
+The shared record under `artifacts/nakb_latency_comparison/` is authoritative;
+do not maintain a second aggregate in experiment caches. Preserve measurement
+provenance and label stale or unverified timings. Plotting and statistics must
+only read saved results; never rerun experiments to update a plot or report.
+Incremental publications remain diagnostic; full-suite acceptance is unchanged.
+
 ## Target Paper Abstract
 
 The following abstract states the target contribution and does not represent the current measured results.

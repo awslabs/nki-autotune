@@ -179,12 +179,16 @@ class CopyPropagation(Transform[CopyPropagationOption]):
             return result
         copied_buffer = buffers[copied.tensor]
         source_buffer = buffers[source.tensor]
+        dma_promotion = _lossless_dma_promotion(source_buffer, copied_buffer, consumer_leaf, buffers)
         hbm_identity = (
             isinstance(contract, CopyContract)
             and source_buffer.location == copied_buffer.location == "shared_hbm"
             and source_buffer.shape == copied_buffer.shape
-            and source_buffer.dtype == copied_buffer.dtype
-            and source_buffer.physical_dtype() == copied_buffer.physical_dtype()
+            and (
+                dma_promotion
+                or source_buffer.dtype == copied_buffer.dtype
+                and source_buffer.physical_dtype() == copied_buffer.physical_dtype()
+            )
         )
         if copy_leaf.access_patterns or (
             not hbm_identity
@@ -213,7 +217,7 @@ class CopyPropagation(Transform[CopyPropagationOption]):
             projected = None if hbm_identity else _project_source_region(projection_analyzer, source, copied, consumed)
             if projected is None and isinstance(contract, CopyContract):
                 projected = _project_complete_copy(
-                    ir, copy_nid, copy_leaf_nid, source, copied, consumed, projection_analyzer
+                    ir, copy_nid, copy_leaf_nid, source, copied, consumed, projection_analyzer, dma_promotion
                 )
             source = projected
         if source is None:
@@ -246,7 +250,9 @@ class CopyPropagation(Transform[CopyPropagationOption]):
         accepted_dtypes = consumer_leaf.op_cls.INPUT_STORAGE_DTYPES.get(option.consumer_operand, frozenset())
         storage_compatible = (
             source_buffer.physical_dtype() == copied_buffer.physical_dtype()
-            or source_buffer.physical_dtype() in accepted_dtypes
+            or source_buffer.physical_dtype() in {"bfloat16", "float16"}
+            and copied_buffer.physical_dtype() == "float32"
+            and (source_buffer.physical_dtype() in accepted_dtypes or dma_promotion)
         )
         if (
             source_buffer.location not in {"shared_hbm", "sbuf", "psum"}
@@ -257,7 +263,7 @@ class CopyPropagation(Transform[CopyPropagationOption]):
                 and not (
                     source_buffer.physical_dtype() in {"bfloat16", "float16"}
                     and copied_buffer.physical_dtype() == "float32"
-                    and source_buffer.physical_dtype() in accepted_dtypes
+                    and (source_buffer.physical_dtype() in accepted_dtypes or dma_promotion)
                 )
             )
             or not storage_compatible
@@ -777,6 +783,23 @@ def _projection_analyzer(ir: KernelIR) -> Analyzer:
     return analyzer
 
 
+def _lossless_dma_promotion(source: Buffer, copied: Buffer, consumer: ISANode, buffers: dict[str, Buffer]) -> bool:
+    """Allow an exact floating-point widening only into FP32 DMA destinations."""
+    outputs = [
+        region.tensor
+        for slot, region in consumer.operand_bindings.items()
+        if slot not in consumer.op_cls.INPUT_OPERANDS
+    ]
+    return (
+        consumer.op_cls.NAME == "dma_copy"
+        and source.dtype in {"bfloat16", "float16", "float32"}
+        and source.physical_dtype() in {"bfloat16", "float16"}
+        and copied.dtype == copied.physical_dtype() == "float32"
+        and bool(outputs)
+        and all(buffers[name].dtype == buffers[name].physical_dtype() == "float32" for name in outputs)
+    )
+
+
 def _project_complete_copy(
     ir: KernelIR,
     block_nid: int,
@@ -785,6 +808,7 @@ def _project_complete_copy(
     copied: BufferRegion,
     consumed: BufferRegion,
     analyzer: Analyzer,
+    dma_promotion: bool,
 ) -> BufferRegion | None:
     """Forward an exact full-tensor copy across different consumer tile boundaries."""
     source_buffer, copied_buffer = ir.buffer(source.tensor), ir.buffer(copied.tensor)
@@ -796,6 +820,7 @@ def _project_complete_copy(
         or copied_buffer.location not in {"sbuf", "shared_hbm"}
         or source_buffer.shape != copied_buffer.shape
         or source_buffer.physical_dtype() != copied_buffer.physical_dtype()
+        and not dma_promotion
     ):
         return None
     scale = Const(value=copied_buffer.partition_extent() if copied_buffer.location == "sbuf" else 1)

@@ -1,9 +1,9 @@
-"""Select the execution engine of one copy or drained transpose."""
+"""Select a copy execution engine or its DMA descriptor generator."""
 
 from dataclasses import dataclass, replace
 from typing import Literal
 
-from nkigym.ir import KernelIR
+from nkigym.ir import Const, KernelIR
 from nkigym.ir.buffer_placement import layout_satisfies_alignment
 from nkigym.ir.dependency_rebind import rebind_unchanged_dependency
 from nkigym.ir.tree import ISANode
@@ -12,6 +12,7 @@ from nkigym.ops.strided_copy import NKIStridedCopy
 from nkigym.ops.strided_tensor_copy import NKIStridedTensorCopy
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.transpose import NKITranspose
+from nkigym.ops.vector_transpose import NKIVectorTranspose
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.helper.canonical_rewrite import (
     finalize_rewrite,
@@ -22,14 +23,14 @@ from nkigym.transforms.helper.canonical_rewrite import (
 )
 from nkigym.transforms.helper.transpose_pattern import TransposeChain, match_transpose_chain
 
-CopyEngine = Literal["vector", "scalar", "dma", "tensor"]
-_ENGINES: tuple[CopyEngine, ...] = ("vector", "scalar", "dma", "tensor")
+CopyEngine = Literal["vector", "scalar", "dma", "tensor", "hwdge"]
+_ENGINES: tuple[CopyEngine, ...] = ("vector", "scalar", "dma", "tensor", "hwdge")
 _FLOAT_DTYPES = frozenset({"float16", "bfloat16", "float32"})
 
 
 @dataclass(frozen=True)
 class SetCopyEngineOption(TransformOption):
-    """Identify one copy instruction and its requested compute engine."""
+    """Identify one copy and its requested execution or descriptor engine."""
 
     isa_nid: int
     engine: CopyEngine
@@ -39,14 +40,16 @@ class SetCopyEngine(Transform[SetCopyEngineOption]):
     """Choose a compatible engine without changing copied or transposed values."""
 
     def analyze(self, ir: KernelIR) -> list[SetCopyEngineOption]:
-        """Offer compute-copy and transpose-engine changes independently."""
+        """Offer copy, transpose, and DMA descriptor-engine choices."""
         options: list[SetCopyEngineOption] = []
         for nid in ir.tree.leaves():
             for engine in _ENGINES:
                 option = SetCopyEngineOption(nid, engine)
                 if (
                     _eligible(ir, option)
+                    or _dma_descriptor_engine(ir, option) is not None
                     or _strided_copy(ir, option) is not None
+                    or _sbuf_transpose(ir, option) is not None
                     or _transpose_match(ir, option)[0] is not None
                 ):
                     options.append(option)
@@ -56,13 +59,24 @@ class SetCopyEngine(Transform[SetCopyEngineOption]):
         """Recheck and change one engine with its required storage representation."""
         transpose, reverse = _transpose_match(ir, option)
         strided = _strided_copy(ir, option)
-        if transpose is None and strided is None and not _eligible(ir, option):
+        descriptor = _dma_descriptor_engine(ir, option)
+        sbuf_transpose = _sbuf_transpose(ir, option)
+        if (
+            transpose is None
+            and strided is None
+            and descriptor is None
+            and sbuf_transpose is None
+            and not _eligible(ir, option)
+        ):
             raise TransformLegalityError(f"illegal SetCopyEngine option: {option}")
         result = copy_for_rewrite(ir)
         if transpose is None:
             node = result.tree.isa(option.isa_nid)
+            replacement = descriptor if descriptor is not None else strided if strided is not None else sbuf_transpose
             result.tree.graph.nodes[option.isa_nid]["data"] = (
-                strided if strided is not None else replace(node, kwargs={**node.kwargs, "engine": option.engine})
+                replacement
+                if replacement is not None
+                else replace(node, kwargs={**node.kwargs, "engine": option.engine})
             )
             result.dependency = rebind_unchanged_dependency(ir.dependency, result.tree)
         else:
@@ -72,6 +86,79 @@ class SetCopyEngine(Transform[SetCopyEngineOption]):
             _apply_transpose(result, match, reverse)
             finalize_rewrite(result)
         return result
+
+
+def _sbuf_transpose(ir: KernelIR, option: SetCopyEngineOption) -> ISANode | None:
+    """Choose one direct SBUF transpose encoding while retaining its tile and schedule."""
+    expected = NKIDMATranspose if option.engine == "vector" else NKIVectorTranspose if option.engine == "dma" else None
+    if expected is None or option.isa_nid not in ir.tree.graph:
+        return None
+    node = ir.tree.data(option.isa_nid)
+    if not isinstance(node, ISANode) or node.op_cls is not expected or node.access_patterns:
+        return None
+    if set(node.kwargs) - {"engine", "name", "no_reorder", "program_ownership"}:
+        return None
+    source_slot = "src" if expected is NKIDMATranspose else "data"
+    if set(node.operand_bindings) != {source_slot, "dst"}:
+        return None
+    source_region, output_region = (node.operand_bindings[slot] for slot in (source_slot, "dst"))
+    source, output = (ir.buffer(region.tensor) for region in (source_region, output_region))
+    if (
+        source.name == output.name
+        or source.location != "sbuf"
+        or output.location != "sbuf"
+        or source.dtype != output.dtype
+        or source.physical_dtype() != "float32"
+        or output.physical_dtype() != "float32"
+    ):
+        return None
+    sizes = tuple(tuple(size for _, size in region.ranges) for region in (source_region, output_region))
+    if (
+        any(len(shape) != 2 for shape in sizes)
+        or sizes[0] != sizes[1][::-1]
+        or any(not isinstance(size, Const) or not 1 <= size.value <= 32 for shape in sizes for size in shape)
+    ):
+        return None
+    if option.engine == "dma" and not layout_satisfies_alignment(output, 32):
+        return None
+    kwargs = {key: value for key, value in node.kwargs.items() if key != "engine"}
+    if option.engine == "vector":
+        kwargs["engine"] = "vector"
+    return replace(
+        node,
+        op_cls=NKIVectorTranspose if option.engine == "vector" else NKIDMATranspose,
+        operand_bindings={("data" if option.engine == "vector" else "src"): source_region, "dst": output_region},
+        kwargs=kwargs,
+    )
+
+
+def _dma_descriptor_engine(ir: KernelIR, option: SetCopyEngineOption) -> ISANode | None:
+    """Choose descriptors without pinning a sequencer; hardware requires matching dtypes."""
+    if option.isa_nid not in ir.tree.graph or option.engine not in {"dma", "hwdge"}:
+        return None
+    node = ir.tree.data(option.isa_nid)
+    if not isinstance(node, ISANode) or node.op_cls.NAME != "dma_copy" or node.op_cls.INDIRECT_DMA_MODE is not None:
+        return None
+    if node.kwargs.get("engine", "unknown") != "unknown":
+        return None
+    mode = "hwdge" if option.engine == "hwdge" else "unknown"
+    if node.kwargs.get("dge_mode", "unknown") == mode:
+        return None
+    if option.engine == "hwdge":
+        buffers = ir.all_buffers()
+        dtypes = {
+            slot: getattr(node.op_cls, "REINTERPRET_INPUT_DTYPES", {}).get(
+                slot, buffers[region.tensor].physical_dtype()
+            )
+            for slot, region in node.operand_bindings.items()
+            if slot in {"src", "dst"}
+        }
+        if len(dtypes) != 2 or dtypes.get("src") != dtypes.get("dst"):
+            return None
+    kwargs = {key: value for key, value in node.kwargs.items() if key != "dge_mode"}
+    if option.engine != "dma":
+        kwargs["dge_mode"] = mode
+    return replace(node, kwargs=kwargs)
 
 
 def _strided_copy(ir: KernelIR, option: SetCopyEngineOption) -> ISANode | None:
@@ -91,7 +178,7 @@ def _strided_copy(ir: KernelIR, option: SetCopyEngineOption) -> ISANode | None:
         or source.physical_dtype() != output.physical_dtype()
     ):
         return None
-    kwargs = {key: value for key, value in node.kwargs.items() if key != "engine"}
+    kwargs = {key: value for key, value in node.kwargs.items() if key not in {"engine", "dge_mode"}}
     if option.engine == "vector":
         kwargs["engine"] = "vector"
     return replace(node, op_cls=NKIStridedTensorCopy if option.engine == "vector" else NKIStridedCopy, kwargs=kwargs)

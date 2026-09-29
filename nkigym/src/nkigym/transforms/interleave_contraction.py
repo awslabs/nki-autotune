@@ -355,7 +355,7 @@ def _rewrite(ir: KernelIR, match: _Match) -> None:
         NKIInterleavedMatmul,
         {"stationary": left, "moving": right, "dst": match.output},
         {axis: sizes[axis] for axis in order},
-        {**old.kwargs, "tiles": match.tiles, "accumulate": True},
+        {**old.kwargs, "tiles": match.tiles},
     )
     builder.replace(match.block)
 

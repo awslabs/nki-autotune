@@ -44,7 +44,7 @@ class NKIInterleavedMatmul(NKIOp):
         """Configure a positive number of native partition contractions."""
         if tiles < 1:
             raise ValueError("interleaved matmul requires a positive tile count")
-        super().__init__(tiles=tiles, accumulate=True)
+        super().__init__(tiles=tiles)
 
     @classmethod
     def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> BilinearReductionContract:

@@ -22,6 +22,7 @@ from nkigym.transforms.base import (
     intersects_software_pipeline,
     software_pipeline_overlap_nodes,
 )
+from nkigym.transforms.eliminate_identity_initializer import _explicit_matmul_overwrite
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
 from nkigym.transforms.helper.normalize import _dim_loops, _iter_value, _rename_dense, _substitute_block_regions
 from nkigym.transforms.helper.tile_region import retile_region
@@ -82,7 +83,7 @@ class Split(Transform[SplitOption]):
                         continue
                     floor = _min_tile_floor(data, block, concrete)
                     for factors in _factorizations(current):
-                        if (floor is not None and factors[-1] < floor) or not _partition_width_valid(
+                        if (floor is not None and factors[-1] < floor) or not _tile_width_valid(
                             data, block, concrete, factors[-1], buffers
                         ):
                             continue
@@ -162,10 +163,10 @@ class Split(Transform[SplitOption]):
                     f"Split.target_axis={option.target_axis!r}: innermost tile {option.factors[-1]} "
                     f"< MIN_TILE_SIZE {floor}"
                 )
-            if not _partition_width_valid(target, block, option.target_axis, option.factors[-1], ir.all_buffers()):
+            if not _tile_width_valid(target, block, option.target_axis, option.factors[-1], ir.all_buffers()):
                 raise TransformLegalityError(
                     f"Split.target_axis={option.target_axis!r}: innermost tile {option.factors[-1]} "
-                    "does not preserve an on-chip partition-axis extent"
+                    "does not preserve on-chip partition extents or overwrite boundaries"
                 )
 
     def _do_outer_trip(self, ir: KernelIR, option: SplitOption) -> None:
@@ -670,14 +671,20 @@ def _min_tile_floor(leaf: ISANode, block: BlockNode, concrete_axis: str) -> int 
     return floor
 
 
-def _partition_width_valid(
+def _tile_width_valid(
     leaf: ISANode, block: BlockNode, concrete_axis: str, width: int, buffers: dict[str, Buffer]
 ) -> bool:
-    """Return whether one tile width preserves every on-chip partition axis."""
+    """Preserve partition extents and prevent overlapping explicit bank resets."""
     inverse = {concrete: abstract for abstract, concrete in block.axis_map.items()}
     abstract = inverse.get(concrete_axis)
     valid = True
     if abstract is not None:
+        if (
+            _explicit_matmul_overwrite(leaf)
+            and abstract in leaf.op_cls.OPERAND_AXES["dst"]
+            and leaf.op_cls.operand_dimension("dst", abstract) == 1
+        ):
+            valid = width % 512 == 0
         for slot, region in leaf.operand_bindings.items():
             present = tuple(axis for axis in leaf.op_cls.OPERAND_AXES[slot] if axis in block.axis_map)
             buffer = buffers.get(region.tensor)

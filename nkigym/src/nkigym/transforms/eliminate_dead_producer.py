@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from nkigym.ir import KernelIR
 from nkigym.ir.arith import Const
 from nkigym.ir.program_sharding import PROGRAM_SHARDS_ANNOTATION, configured_program_shards
-from nkigym.ir.tree import BlockNode, BufferRegion, ISANode
+from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import CopyContract, PermutationContract, PointwiseContract, ReductionContract, SliceContract
 from nkigym.transforms.base import (
     Transform,
@@ -65,6 +65,13 @@ class EliminateDeadProducer(Transform[EliminateDeadProducerOption]):
         shards = configured_program_shards(result)
         _replace_in_parent_children(result.tree, parent, [copied.block_nid], [])
         result.tree.graph.remove_nodes_from(removed)
+        while isinstance(result.tree.data(parent), ForNode) and not result.tree.children(parent):
+            ancestor = result.tree.parent(parent)
+            if ancestor is None:
+                raise AssertionError("an empty loop has no parent")
+            removed.add(parent)
+            result.tree.graph.remove_node(parent)
+            parent = ancestor
         if removed.intersection(shards):
             root = result.tree.block(result.tree.root)
             annotations = dict(root.annotations)
@@ -152,22 +159,28 @@ def _plain_full_write(ir: KernelIR, leaf_nid: int, region: BufferRegion) -> bool
 def _unobserved_write(
     ir: KernelIR, block_nid: int, leaf_nid: int, output: BufferRegion, positions: dict[int, int] | None
 ) -> bool:
-    """Prove a reused on-chip value is overwritten before any subsequent read.
+    """Prove a reused on-chip write is trailing or overwritten before a read.
 
     The candidate owns no allocations, so deleting its block cannot move or
     remove live storage. A later read of any part of the tensor rejects the
     match. The first later write must unconditionally cover the exact same
-    region; uncertain control flow and partial writes remain ineligible.
+    region. A trailing write is removable only when every read precedes its
+    entire enclosing loop region, excluding reads from later iterations.
     """
-    if (
-        ir.tree.block(block_nid).alloc_buffers
-        or ir.buffer(output.tensor).location not in {"sbuf", "psum"}
-        or not _plain_full_write(ir, leaf_nid, output)
-    ):
+    if ir.tree.block(block_nid).alloc_buffers or ir.buffer(output.tensor).location not in {"sbuf", "psum"}:
         return False
     if positions is None:
         positions = {nid: index for index, nid in enumerate(ir.tree.preorder())}
     touches = sorted(ir.dependency.touches_by_tensor.get(output.tensor, ()), key=positions.__getitem__)
+    region_start = min(
+        positions[nid]
+        for nid in (block_nid, *ir.tree.ancestors(leaf_nid))
+        if nid == block_nid or isinstance(ir.tree.data(nid), ForNode)
+    )
+    if all(positions[nid] < region_start for nid in touches if output.tensor in ir.dependency.info(nid).reads):
+        return True
+    if not _plain_full_write(ir, leaf_nid, output):
+        return False
     for nid in touches:
         if positions[nid] <= positions[leaf_nid]:
             continue

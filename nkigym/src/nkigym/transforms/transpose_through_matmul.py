@@ -15,6 +15,7 @@ from nkigym.ops.memset import NKIMemset
 from nkigym.ops.tensor_copy import NKITensorCopy
 from nkigym.ops.transpose import NKITranspose
 from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
+from nkigym.transforms.eliminate_identity_initializer import _bank_aligned_free_offset, _explicit_matmul_overwrite
 from nkigym.transforms.helper.canonical_rewrite import (
     block_chain,
     finalize_rewrite,
@@ -216,7 +217,10 @@ def _scheduled_rewrite(
     writes = tuple(region for slot, region in bindings.items() if slot not in op_cls.INPUT_OPERANDS)
     block = replace(old_block, reads=reads, writes=writes, axis_map=axis_map)
     leaf = ISANode(op_cls=op_cls, operand_bindings=bindings, kwargs=kwargs)
-    return _ScheduledRewrite(block_nid, leaf_nid, block, leaf) if _legal_tiles(block, leaf) else None
+    valid = _legal_tiles(block, leaf)
+    if _explicit_matmul_overwrite(leaf):
+        valid = valid and _bank_aligned_free_offset(leaf.operand_bindings["dst"].ranges[1][0])
+    return _ScheduledRewrite(block_nid, leaf_nid, block, leaf) if valid else None
 
 
 def _legal_tiles(block: BlockNode, leaf: ISANode) -> bool:

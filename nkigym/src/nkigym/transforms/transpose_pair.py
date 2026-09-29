@@ -115,6 +115,8 @@ class TransposePair(Transform[TransposePairOption]):
                     if _match_insert(ir, option, pair_edges, facts) is not None:
                         options.append(option)
         for block_nid, match in cancel_matches.items():
+            if not _has_single_output_definition(ir, match):
+                continue
             options.extend(
                 CancelTransposePairOption(first_transpose_nid=block_nid, consumer_nid=consumer_nid, operand=operand)
                 for consumer_nid, operand in match.consumers
@@ -137,7 +139,7 @@ class TransposePair(Transform[TransposePairOption]):
             _apply_insert(new_ir, match)
         else:
             match = cancel_matches.get(option.first_transpose_nid)
-            if match is None:
+            if match is None or not _has_single_output_definition(ir, match):
                 raise TransformLegalityError(f"illegal transpose-pair cancellation at {option.first_transpose_nid}")
             new_ir = copy_for_rewrite(ir)
             selected = (option.consumer_nid, option.operand)
@@ -148,6 +150,15 @@ class TransposePair(Transform[TransposePairOption]):
                 raise TransformLegalityError(f"illegal transpose-pair cancellation option: {option}")
         finalize_rewrite(new_ir)
         return new_ir
+
+
+def _has_single_output_definition(ir: KernelIR, match: _CancelMatch) -> bool:
+    """Require the pair's output value to remain unchanged before its readers."""
+    output = match.second.output
+    writers = {
+        nid for nid in ir.dependency.touches_by_tensor.get(output, ()) if output in ir.dependency.info(nid).writes
+    }
+    return writers == {match.second.output_leaf}
 
 
 def _match_insert(

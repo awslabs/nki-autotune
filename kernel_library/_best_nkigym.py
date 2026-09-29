@@ -35,6 +35,7 @@ from nkigym.transforms import (
     FuseOption,
     FusePointwise,
     FusePointwiseOption,
+    InsertTransposePairOption,
     InterleaveContraction,
     InterleaveContractionOption,
     MatmulColumnTiling,
@@ -2614,6 +2615,12 @@ BEST_NKIGYM_LADDERS["output_projection_tkg_0"] = (
     (Reorder(), ReorderOption(outer_nid=18, inner_nid=19)),
     (Reorder(), ReorderOption(outer_nid=19, inner_nid=20)),
     (Split(), SplitOption(target_nid=16, factors=(6, 512), target_axis="d2")),
+    (
+        SetFirstWriteOverwrite(),
+        SetFirstWriteOverwriteOption(
+            initializer_block_nid=14, reduction_block_nid=17, tensor="psum_out", initializer_leaf_nid=16
+        ),
+    ),
     (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=18, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=19, index=0)),
     (Split(), SplitOption(target_nid=24, factors=(6, 512), target_axis="d2")),
@@ -2632,6 +2639,22 @@ BEST_NKIGYM_LADDERS["output_projection_tkg_0"] = (
     (BufferCompaction(), BufferCompactionOption(tensor="psum_out", axis=1)),
     (BufferPlacement(), BufferPlacementOption(tensor="psum_out", scope_nid=0, reuse_tensor=None)),
     (ProgramShard(), ProgramShardOption(loop_nid=36, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (ProgramShard(), ProgramShardOption(loop_nid=33, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (ProgramShard(), ProgramShardOption(loop_nid=26, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (ProgramShard(), ProgramShardOption(loop_nid=8, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (ProgramShard(), ProgramShardOption(loop_nid=30, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (ProgramShard(), ProgramShardOption(loop_nid=19, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (Split(), SplitOption(target_nid=6, factors=(2, 1536), target_axis="d2")),
+    (ProgramShard(), ProgramShardOption(loop_nid=40, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1, consumer_block_nid=10, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1)),
+    (BatchPermutation(), BatchPermutationOption(loop_nid=12)),
+    (BatchPermutation(), BatchPermutationOption(loop_nid=30)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_weight", axis=1, anchor_loop_nid=19, program_loop_nids=(19, 40)),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_weight", axis=1)),
 )
 
 
@@ -3222,11 +3245,6 @@ BEST_NKIGYM_LADDERS["mlp_tkg_0"] = (
     (CodeMotion(), CodeMotionOption(block_nid=407, target_loop_nid=410, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=413, target_loop_nid=410, index=2)),
     (BufferPlacement(), BufferPlacementOption(tensor="psum_result_3", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="psum_result_3", axis=1, anchor_loop_nid=410, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_result_3", axis=1)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=2)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=3)),
@@ -3835,23 +3853,10 @@ BEST_NKIGYM_LADDERS["mlp_tkg_0"] = (
             tensor="sbuf_down_proj_weights_tensor", axis=0, anchor_loop_nid=411, program_loop_nids=()
         ),
     ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_down_proj_weights_tensor", axis=1, anchor_loop_nid=410, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=1)),
     (Split(), SplitOption(target_nid=416, factors=(22, 384), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=415, target_loop_nid=409, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=415, target_loop_nid=410, index=3)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_3", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_result_3", axis=1, anchor_loop_nid=410, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_3", axis=1)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_reciprocal", scope_nid=None, reuse_tensor="sbuf_add")),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=17)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=10)),
@@ -3873,7 +3878,6 @@ BEST_NKIGYM_LADDERS["mlp_tkg_0"] = (
     (Fuse(), FuseOption(target_nids=(432, 395), target_axis="d3", operation_batch=False)),
     (BufferRegionNormalization(), BufferAxisFoldOption(tensor="psum_result_1", free_tile=352)),
     (BufferLayout(), BufferLayoutOption(tensor="psum_result_1", list_len=4)),
-    (ProgramShard(), ProgramShardOption(loop_nid=410, axis="d4", programs=2, reduction_tensor=None, stage_drain=False)),
     (
         ProgramShard(),
         ProgramShardOption(loop_nid=382, axis="d2", programs=1, reduction_tensor="psum_result", stage_drain=False),
@@ -4000,6 +4004,39 @@ BEST_NKIGYM_LADDERS["mlp_tkg_0"] = (
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=15, consumer_block_nid=20)),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=236, consumer_block_nid=238)),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=288, consumer_block_nid=290)),
+    (Split(), SplitOption(target_nid=410, factors=(2, 11), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=407, target_loop_nid=441, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=415, target_loop_nid=441, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=413, target_loop_nid=441, index=2)),
+    (Reorder(), ReorderOption(outer_nid=442, inner_nid=411)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=442, index=0)),
+    (Fuse(), FuseOption(target_nids=(446, 9), target_axis="d4", operation_batch=False)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_down_proj_weights_tensor", axis=1, anchor_loop_nid=441, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="psum_result_3", axis=1, anchor_loop_nid=441, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="psum_result_3", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_result_3", axis=1, anchor_loop_nid=441, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_3", axis=1)),
+    (BufferRegionNormalization(), BufferAxisFoldOption(tensor="psum_result_3", free_tile=384)),
+    (SetBufferAlignment(), SetBufferAlignmentOption(tensor="psum_result_3", alignment=512)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=412, column_size=32)),
+    (ProgramShard(), ProgramShardOption(loop_nid=441, axis="d4", programs=2, reduction_tensor=None, stage_drain=False)),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=257, engine="vector")),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=277, engine="vector")),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=299, engine="vector")),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=343, engine="vector")),
 )
 
 
@@ -4048,13 +4085,6 @@ BEST_NKIGYM_LADDERS["shared_expert_mlp_bwd_0"] = (
     (CodeMotion(), CodeMotionOption(block_nid=85, target_loop_nid=89, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=92, target_loop_nid=89, index=2)),
     (BufferPlacement(), BufferPlacementOption(tensor="psum_up_proj_weight_grad", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_up_proj_weight_grad", axis=0, anchor_loop_nid=89, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_up_proj_weight_grad", axis=0)),
     (Reorder(), ReorderOption(outer_nid=27, inner_nid=28)),
     (CodeMotion(), CodeMotionOption(block_nid=26, target_loop_nid=33, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=26, target_loop_nid=33, index=1)),
@@ -4072,16 +4102,6 @@ BEST_NKIGYM_LADDERS["shared_expert_mlp_bwd_0"] = (
     (CodeMotion(), CodeMotionOption(block_nid=22, target_loop_nid=34, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=22, target_loop_nid=35, index=0)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_d_a_stationary", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_d_a_stationary", axis=0, anchor_loop_nid=34, program_loop_nids=()),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_d_a_stationary", axis=1, anchor_loop_nid=35, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_d_a_stationary", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_d_a_stationary", axis=1)),
     (Split(), SplitOption(target_nid=42, factors=(16, 512), target_axis="d4")),
     (Reorder(), ReorderOption(outer_nid=41, inner_nid=108)),
     (CodeMotion(), CodeMotionOption(block_nid=40, target_loop_nid=46, index=0)),
@@ -4231,20 +4251,6 @@ BEST_NKIGYM_LADDERS["shared_expert_mlp_bwd_0"] = (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_hidden_states_float32_21", scope_nid=None, reuse_tensor=None),
     ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_hidden_states_float32_21", axis=0, anchor_loop_nid=90, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_hidden_states_float32_21", axis=1, anchor_loop_nid=89, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_hidden_states_float32_21", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_hidden_states_float32_21", axis=1)),
     (Split(), SplitOption(target_nid=3, factors=(64, 128), target_axis="d1")),
     (Reorder(), ReorderOption(outer_nid=2, inner_nid=116)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=1)),
@@ -4261,29 +4267,11 @@ BEST_NKIGYM_LADDERS["shared_expert_mlp_bwd_0"] = (
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=89, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=90, index=0)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_hidden_states", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_hidden_states", axis=0, anchor_loop_nid=90, program_loop_nids=()),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_hidden_states", axis=1, anchor_loop_nid=89, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_hidden_states", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_hidden_states", axis=1)),
     (CodeMotion(), CodeMotionOption(block_nid=98, target_loop_nid=88, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=98, target_loop_nid=89, index=3)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_up_proj_weight_grad", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_up_proj_weight_grad", axis=0, anchor_loop_nid=89, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weight_grad", axis=0)),
     (ProgramShard(), ProgramShardOption(loop_nid=47, axis="d4", programs=2, reduction_tensor=None, stage_drain=False)),
     (ProgramShard(), ProgramShardOption(loop_nid=75, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
-    (ProgramShard(), ProgramShardOption(loop_nid=89, axis="d1", programs=2, reduction_tensor=None, stage_drain=False)),
     (BufferLayout(), BufferLayoutOption(tensor="psum_d_a", list_len=8)),
     (BufferLayout(), BufferLayoutOption(tensor="psum_hidden_states_grad", list_len=8)),
     (BufferLayout(), BufferLayoutOption(tensor="psum_down_proj_weight_grad", list_len=4)),
@@ -4298,6 +4286,59 @@ BEST_NKIGYM_LADDERS["shared_expert_mlp_bwd_0"] = (
         ProgramShardOption(loop_nid=34, axis="d4", programs=2, reduction_tensor="psum_d_a", stage_drain=False),
     ),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=1, consumer_block_nid=82)),
+    (Split(), SplitOption(target_nid=89, factors=(8, 8), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=85, target_loop_nid=121, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=98, target_loop_nid=121, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=92, target_loop_nid=121, index=2)),
+    (Reorder(), ReorderOption(outer_nid=122, inner_nid=90)),
+    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=122, index=0)),
+    (Fuse(), FuseOption(target_nids=(126, 3), target_axis="d1", operation_batch=False)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="psum_up_proj_weight_grad", axis=0, anchor_loop_nid=121, program_loop_nids=()
+        ),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_up_proj_weight_grad", axis=0, anchor_loop_nid=121, program_loop_nids=()
+        ),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_hidden_states_float32_21", axis=0, anchor_loop_nid=122, program_loop_nids=()
+        ),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_hidden_states_float32_21", axis=1, anchor_loop_nid=121, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="psum_up_proj_weight_grad", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weight_grad", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_hidden_states_float32_21", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_hidden_states_float32_21", axis=1)),
+    (BufferLayout(), BufferLayoutOption(tensor="psum_up_proj_weight_grad", list_len=8)),
+    (ProgramShard(), ProgramShardOption(loop_nid=121, axis="d1", programs=2, reduction_tensor=None, stage_drain=False)),
+    (Split(), SplitOption(target_nid=35, factors=(2, 4), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=22, target_loop_nid=127, index=0)),
+    (Fuse(), FuseOption(target_nids=(129, 25), target_axis="d0", operation_batch=False)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_d_a_stationary", axis=0, anchor_loop_nid=34, program_loop_nids=()),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_d_a_stationary", axis=1, anchor_loop_nid=127, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_d_a_stationary", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_d_a_stationary", axis=1)),
+    (Fuse(), FuseOption(target_nids=(28, 29), target_axis="d3", operation_batch=False)),
 )
 
 
@@ -4326,23 +4367,12 @@ BEST_NKIGYM_LADDERS["mlp_tkg_1"] = (
     (CodeMotion(), CodeMotionOption(block_nid=340, target_loop_nid=343, index=0)),
     (Split(), SplitOption(target_nid=347, factors=(2, 448), target_axis="d3")),
     (CodeMotion(), CodeMotionOption(block_nid=346, target_loop_nid=343, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_result_1", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="psum_result_1", axis=1, anchor_loop_nid=343, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_result_1", axis=1)),
     (Reorder(), ReorderOption(outer_nid=360, inner_nid=361)),
     (Split(), SplitOption(target_nid=358, factors=(16, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=357, target_loop_nid=360, index=0)),
     (Split(), SplitOption(target_nid=364, factors=(16, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=363, target_loop_nid=360, index=2)),
     (BufferPlacement(), BufferPlacementOption(tensor="psum_result_3", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="psum_result_3", axis=1, anchor_loop_nid=360, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_result_3", axis=1)),
     (Split(), SplitOption(target_nid=3, factors=(2, 448), target_axis="d3")),
     (Reorder(), ReorderOption(outer_nid=2, inner_nid=381)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=1)),
@@ -4531,190 +4561,8 @@ BEST_NKIGYM_LADDERS["mlp_tkg_1"] = (
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_gate_proj_weights_tensor", axis=1)),
     (Split(), SplitOption(target_nid=6, factors=(2, 448), target_axis="d3")),
     (Reorder(), ReorderOption(outer_nid=5, inner_nid=382)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=2)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=3)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=4)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=5)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=6)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=7)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=8)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=9)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=10)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=11)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=12)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=13)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=14)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=15)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=16)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=17)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=18)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=19)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=20)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=21)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=22)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=23)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=24)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=25)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=26)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=27)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=28)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=29)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=30)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=31)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=32)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=33)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=34)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=35)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=36)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=37)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=38)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=39)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=40)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=41)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=42)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=43)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=44)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=45)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=46)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=47)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=48)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=49)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=50)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=51)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=52)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=53)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=54)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=55)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=56)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=57)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=58)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=59)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=60)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=61)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=62)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=63)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=64)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=65)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=66)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=67)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=68)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=69)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=70)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=71)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=72)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=73)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=74)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=75)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=76)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=77)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=78)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=79)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=80)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=81)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=82)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=83)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=84)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=85)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=86)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=87)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=88)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=89)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=90)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=91)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=92)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=93)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=94)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=95)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=96)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=97)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=98)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=99)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=100)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=101)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=102)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=103)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=104)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=105)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=106)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=107)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=108)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=109)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=110)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=111)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=112)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=113)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=114)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=115)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=116)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=117)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=118)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=119)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=120)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=121)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=122)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=123)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=124)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=125)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=126)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=127)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=128)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=129)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=130)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=131)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=132)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=133)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=134)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=135)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=136)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=137)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=138)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=139)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=140)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=141)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=142)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=143)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=144)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=145)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=146)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=147)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=148)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=149)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=150)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=151)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=152)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=153)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=154)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=155)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=156)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=157)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=158)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=159)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=160)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=161)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=162)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=342, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=343, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=343, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=373, index=0)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_up_proj_weights_tensor", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_up_proj_weights_tensor", axis=0, anchor_loop_nid=373, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_up_proj_weights_tensor", axis=1, anchor_loop_nid=343, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=1)),
     (Split(), SplitOption(target_nid=9, factors=(16, 512), target_axis="d4")),
     (Reorder(), ReorderOption(outer_nid=8, inner_nid=383)),
-    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=2)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=3)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=4)),
@@ -4880,6 +4728,7 @@ BEST_NKIGYM_LADDERS["mlp_tkg_1"] = (
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=164)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=165)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=166)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=167)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=359, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=360, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=360, index=1)),
@@ -4894,25 +4743,10 @@ BEST_NKIGYM_LADDERS["mlp_tkg_1"] = (
             tensor="sbuf_down_proj_weights_tensor", axis=0, anchor_loop_nid=361, program_loop_nids=()
         ),
     ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_down_proj_weights_tensor", axis=1, anchor_loop_nid=360, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=1)),
     (Split(), SplitOption(target_nid=366, factors=(16, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=365, target_loop_nid=359, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=365, target_loop_nid=360, index=3)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_3", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_result_3", axis=1, anchor_loop_nid=360, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_3", axis=1)),
-    (ProgramShard(), ProgramShardOption(loop_nid=360, axis="d4", programs=2, reduction_tensor=None, stage_drain=False)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_intermediate", scope_nid=None, reuse_tensor="sbuf_result")),
     (
         ProgramShard(),
         ProgramShardOption(loop_nid=369, axis="d2", programs=1, reduction_tensor="psum_result", stage_drain=False),
@@ -4921,21 +4755,8 @@ BEST_NKIGYM_LADDERS["mlp_tkg_1"] = (
         ProgramShard(),
         ProgramShardOption(loop_nid=369, axis="d2", programs=2, reduction_tensor="psum_result", stage_drain=False),
     ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=373, axis="d2", programs=1, reduction_tensor="psum_result_1", stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=373, axis="d2", programs=2, reduction_tensor="psum_result_1", stage_drain=False),
-    ),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=17)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=10)),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_scratch", scope_nid=None, reuse_tensor="sbuf_norm"),
-    ),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_norm_1", scope_nid=None, reuse_tensor="sbuf_norm")),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=15, consumer_block_nid=232, consumer_operand="data")),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=15, consumer_block_nid=290, consumer_operand="data")),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=26, consumer_block_nid=28, consumer_operand="data")),
@@ -5019,19 +4840,217 @@ BEST_NKIGYM_LADDERS["mlp_tkg_1"] = (
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=202, consumer_block_nid=204)),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=250, consumer_block_nid=252)),
     (OnChipReshape(), OnChipReshapeOption(load_block_nid=92)),
+    (BatchPermutation(), BatchPermutationOption(loop_nid=395)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=90)),
+    (CodeMotion(), CodeMotionOption(block_nid=340, target_loop_nid=342, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=346, target_loop_nid=342, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=340, target_loop_nid=0, index=119)),
+    (CodeMotion(), CodeMotionOption(block_nid=346, target_loop_nid=0, index=121)),
+    (CodeMotion(), CodeMotionOption(block_nid=340, target_loop_nid=0, index=118)),
+    (CodeMotion(), CodeMotionOption(block_nid=342, target_loop_nid=0, index=119)),
+    (CodeMotion(), CodeMotionOption(block_nid=342, target_loop_nid=334, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=342, target_loop_nid=335, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=340, target_loop_nid=334, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=340, target_loop_nid=335, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=346, target_loop_nid=334, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=346, target_loop_nid=335, index=5)),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=373, axis="d2", programs=1, reduction_tensor="psum_result_1", stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=373, axis="d2", programs=2, reduction_tensor="psum_result_1", stage_drain=False),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=342, target_loop_nid=335, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=342, target_loop_nid=369, index=0)),
+    (BufferPlacement(), BufferPlacementOption(tensor="psum_result_1", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="psum_result_1", axis=1, anchor_loop_nid=335, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="psum_result_1", axis=1)),
     (Split(), SplitOption(target_nid=333, factors=(2, 224), target_axis="d3")),
     (Split(), SplitOption(target_nid=337, factors=(2, 224), target_axis="d3")),
     (Split(), SplitOption(target_nid=339, factors=(2, 224), target_axis="d3")),
     (Split(), SplitOption(target_nid=341, factors=(2, 224), target_axis="d3")),
     (Split(), SplitOption(target_nid=345, factors=(2, 224), target_axis="d3")),
     (Split(), SplitOption(target_nid=347, factors=(2, 224), target_axis="d3")),
-    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=337, column_size=32)),
-    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=345, column_size=32)),
-    (Split(), SplitOption(target_nid=358, factors=(2, 256), target_axis="d4")),
-    (Split(), SplitOption(target_nid=362, factors=(2, 256), target_axis="d4")),
-    (Split(), SplitOption(target_nid=364, factors=(2, 256), target_axis="d4")),
+    (CodeMotion(), CodeMotionOption(block_nid=342, target_loop_nid=369, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=342, target_loop_nid=403, index=0)),
+    (ProgramShard(), ProgramShardOption(loop_nid=382, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=4)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=5)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=6)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=7)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=8)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=9)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=10)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=11)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=12)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=13)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=14)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=15)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=16)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=17)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=18)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=19)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=20)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=21)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=22)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=23)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=24)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=25)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=26)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=27)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=28)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=29)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=30)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=31)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=32)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=33)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=34)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=35)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=36)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=37)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=38)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=39)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=40)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=41)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=42)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=43)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=44)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=45)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=46)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=47)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=48)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=49)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=50)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=51)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=52)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=53)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=54)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=55)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=56)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=57)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=58)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=59)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=60)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=61)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=62)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=63)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=64)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=65)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=66)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=67)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=68)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=69)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=70)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=71)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=72)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=73)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=74)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=75)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=76)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=77)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=78)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=79)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=80)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=81)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=82)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=83)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=84)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=85)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=86)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=87)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=88)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=89)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=90)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=91)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=92)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=93)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=94)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=95)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=96)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=97)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=98)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=99)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=100)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=101)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=102)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=103)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=104)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=105)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=106)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=107)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=108)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=109)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=110)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=111)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=112)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=113)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=114)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=115)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=116)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=117)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=334, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=335, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=335, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=335, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=369, index=0)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_up_proj_weights_tensor", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_up_proj_weights_tensor", axis=0, anchor_loop_nid=369, program_loop_nids=()
+        ),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_up_proj_weights_tensor", axis=1, anchor_loop_nid=335, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=1)),
+    (Split(), SplitOption(target_nid=360, factors=(2, 8), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=357, target_loop_nid=408, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=365, target_loop_nid=408, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=363, target_loop_nid=408, index=2)),
+    (Reorder(), ReorderOption(outer_nid=409, inner_nid=361)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=409, index=0)),
+    (Fuse(), FuseOption(target_nids=(413, 9), target_axis="d4", operation_batch=False)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_down_proj_weights_tensor", axis=1, anchor_loop_nid=408, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="psum_result_3", axis=1, anchor_loop_nid=408, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="psum_result_3", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_result_3", axis=1, anchor_loop_nid=408, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_3", axis=1)),
     (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=362, column_size=32)),
+    (ProgramShard(), ProgramShardOption(loop_nid=408, axis="d4", programs=2, reduction_tensor=None, stage_drain=False)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=24)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=22)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=324, consumer_block_nid=326)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=350, consumer_block_nid=352)),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=223, engine="vector")),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=241, engine="vector")),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=261, engine="vector")),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=301, engine="vector")),
 )
 
 
@@ -5177,236 +5196,89 @@ BEST_NKIGYM_LADDERS["conv1d_2"] = (
 
 
 BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
-    (Reorder(), ReorderOption(outer_nid=1283, inner_nid=1284)),
-    (Split(), SplitOption(target_nid=1281, factors=(2, 384), target_axis="d93")),
-    (CodeMotion(), CodeMotionOption(block_nid=1280, target_loop_nid=1282, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1280, target_loop_nid=1283, index=0)),
-    (Split(), SplitOption(target_nid=1287, factors=(2, 384), target_axis="d93")),
-    (CodeMotion(), CodeMotionOption(block_nid=1286, target_loop_nid=1283, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_0", scope_nid=None, reuse_tensor=None)),
+    (Split(), SplitOption(target_nid=1308, factors=(32, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1312, factors=(4, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1314, factors=(32, 128), target_axis="d92")),
     (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_gate_up_0", axis=1, anchor_loop_nid=1283, program_loop_nids=()
-        ),
+        TransposePair(),
+        InsertTransposePairOption(consumer_nid=1316, operand="data", source="sbuf_moe_experts_partial_0"),
     ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_gate_up_0", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1310, inner_nid=1311)),
-    (Split(), SplitOption(target_nid=1308, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1307, target_loop_nid=1309, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1307, target_loop_nid=1310, index=0)),
-    (Split(), SplitOption(target_nid=1314, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1313, target_loop_nid=1310, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_partial_0", scope_nid=None, reuse_tensor=None)),
+    (TransposeThroughMatmul(), TransposeThroughMatmulOption(transpose_nid=1739)),
+    (Split(), SplitOption(target_nid=1359, factors=(32, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1363, factors=(4, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1365, factors=(32, 128), target_axis="d92")),
     (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_partial_0", axis=1, anchor_loop_nid=1310, program_loop_nids=()
-        ),
+        TransposePair(),
+        InsertTransposePairOption(consumer_nid=1367, operand="data", source="sbuf_moe_experts_partial_1"),
     ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_partial_0", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1334, inner_nid=1335)),
-    (Split(), SplitOption(target_nid=1332, factors=(2, 384), target_axis="d99")),
-    (CodeMotion(), CodeMotionOption(block_nid=1331, target_loop_nid=1333, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1331, target_loop_nid=1334, index=0)),
-    (Split(), SplitOption(target_nid=1338, factors=(2, 384), target_axis="d99")),
-    (CodeMotion(), CodeMotionOption(block_nid=1337, target_loop_nid=1334, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_1", scope_nid=None, reuse_tensor=None)),
+    (TransposeThroughMatmul(), TransposeThroughMatmulOption(transpose_nid=1751)),
+    (Split(), SplitOption(target_nid=1414, factors=(32, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1418, factors=(4, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1420, factors=(32, 128), target_axis="d92")),
     (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_gate_up_1", axis=1, anchor_loop_nid=1334, program_loop_nids=()
-        ),
+        TransposePair(),
+        InsertTransposePairOption(consumer_nid=1422, operand="data", source="sbuf_moe_experts_partial_2"),
     ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_gate_up_1", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1361, inner_nid=1362)),
-    (Split(), SplitOption(target_nid=1359, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1358, target_loop_nid=1360, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1358, target_loop_nid=1361, index=0)),
-    (Split(), SplitOption(target_nid=1365, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1364, target_loop_nid=1361, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_partial_1", scope_nid=None, reuse_tensor=None)),
+    (TransposeThroughMatmul(), TransposeThroughMatmulOption(transpose_nid=1763)),
+    (Split(), SplitOption(target_nid=1469, factors=(32, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1473, factors=(4, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1475, factors=(32, 128), target_axis="d92")),
     (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_partial_1", axis=1, anchor_loop_nid=1361, program_loop_nids=()
-        ),
+        TransposePair(),
+        InsertTransposePairOption(consumer_nid=1477, operand="data", source="sbuf_moe_experts_partial_3"),
     ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_partial_1", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1389, inner_nid=1390)),
-    (Split(), SplitOption(target_nid=1387, factors=(2, 384), target_axis="d104")),
-    (CodeMotion(), CodeMotionOption(block_nid=1386, target_loop_nid=1388, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1386, target_loop_nid=1389, index=0)),
-    (Split(), SplitOption(target_nid=1393, factors=(2, 384), target_axis="d104")),
-    (CodeMotion(), CodeMotionOption(block_nid=1392, target_loop_nid=1389, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_2", scope_nid=None, reuse_tensor=None)),
+    (TransposeThroughMatmul(), TransposeThroughMatmulOption(transpose_nid=1775)),
+    (Split(), SplitOption(target_nid=1524, factors=(32, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1528, factors=(4, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1530, factors=(32, 128), target_axis="d92")),
     (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_gate_up_2", axis=1, anchor_loop_nid=1389, program_loop_nids=()
-        ),
+        TransposePair(),
+        InsertTransposePairOption(consumer_nid=1532, operand="data", source="sbuf_moe_experts_partial_4"),
     ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_gate_up_2", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1416, inner_nid=1417)),
-    (Split(), SplitOption(target_nid=1414, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1413, target_loop_nid=1415, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1413, target_loop_nid=1416, index=0)),
-    (Split(), SplitOption(target_nid=1420, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1419, target_loop_nid=1416, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_partial_2", scope_nid=None, reuse_tensor=None)),
+    (TransposeThroughMatmul(), TransposeThroughMatmulOption(transpose_nid=1787)),
+    (Split(), SplitOption(target_nid=1579, factors=(32, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1583, factors=(4, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1585, factors=(32, 128), target_axis="d92")),
     (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_partial_2", axis=1, anchor_loop_nid=1416, program_loop_nids=()
-        ),
+        TransposePair(),
+        InsertTransposePairOption(consumer_nid=1587, operand="data", source="sbuf_moe_experts_partial_5"),
     ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_partial_2", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1444, inner_nid=1445)),
-    (Split(), SplitOption(target_nid=1442, factors=(2, 384), target_axis="d109")),
-    (CodeMotion(), CodeMotionOption(block_nid=1441, target_loop_nid=1443, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1441, target_loop_nid=1444, index=0)),
-    (Split(), SplitOption(target_nid=1448, factors=(2, 384), target_axis="d109")),
-    (CodeMotion(), CodeMotionOption(block_nid=1447, target_loop_nid=1444, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_3", scope_nid=None, reuse_tensor=None)),
+    (TransposeThroughMatmul(), TransposeThroughMatmulOption(transpose_nid=1799)),
+    (Split(), SplitOption(target_nid=1634, factors=(32, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1638, factors=(4, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1640, factors=(32, 128), target_axis="d92")),
     (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_gate_up_3", axis=1, anchor_loop_nid=1444, program_loop_nids=()
-        ),
+        TransposePair(),
+        InsertTransposePairOption(consumer_nid=1642, operand="data", source="sbuf_moe_experts_partial_6"),
     ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_gate_up_3", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1471, inner_nid=1472)),
-    (Split(), SplitOption(target_nid=1469, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1468, target_loop_nid=1470, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1468, target_loop_nid=1471, index=0)),
-    (Split(), SplitOption(target_nid=1475, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1474, target_loop_nid=1471, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_partial_3", scope_nid=None, reuse_tensor=None)),
+    (TransposeThroughMatmul(), TransposeThroughMatmulOption(transpose_nid=1811)),
+    (Split(), SplitOption(target_nid=1689, factors=(32, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1693, factors=(4, 128), target_axis="d92")),
+    (Split(), SplitOption(target_nid=1695, factors=(32, 128), target_axis="d92")),
     (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_partial_3", axis=1, anchor_loop_nid=1471, program_loop_nids=()
-        ),
+        TransposePair(),
+        InsertTransposePairOption(consumer_nid=1697, operand="data", source="sbuf_moe_experts_partial_7"),
     ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_partial_3", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1499, inner_nid=1500)),
-    (Split(), SplitOption(target_nid=1497, factors=(2, 384), target_axis="d114")),
-    (CodeMotion(), CodeMotionOption(block_nid=1496, target_loop_nid=1498, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1496, target_loop_nid=1499, index=0)),
-    (Split(), SplitOption(target_nid=1503, factors=(2, 384), target_axis="d114")),
-    (CodeMotion(), CodeMotionOption(block_nid=1502, target_loop_nid=1499, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_4", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_gate_up_4", axis=1, anchor_loop_nid=1499, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_gate_up_4", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1526, inner_nid=1527)),
-    (Split(), SplitOption(target_nid=1524, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1523, target_loop_nid=1525, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1523, target_loop_nid=1526, index=0)),
-    (Split(), SplitOption(target_nid=1530, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1529, target_loop_nid=1526, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_partial_4", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_partial_4", axis=1, anchor_loop_nid=1526, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_partial_4", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1554, inner_nid=1555)),
-    (Split(), SplitOption(target_nid=1552, factors=(2, 384), target_axis="d119")),
-    (CodeMotion(), CodeMotionOption(block_nid=1551, target_loop_nid=1553, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1551, target_loop_nid=1554, index=0)),
-    (Split(), SplitOption(target_nid=1558, factors=(2, 384), target_axis="d119")),
-    (CodeMotion(), CodeMotionOption(block_nid=1557, target_loop_nid=1554, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_5", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_gate_up_5", axis=1, anchor_loop_nid=1554, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_gate_up_5", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1581, inner_nid=1582)),
-    (Split(), SplitOption(target_nid=1579, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1578, target_loop_nid=1580, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1578, target_loop_nid=1581, index=0)),
-    (Split(), SplitOption(target_nid=1585, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1584, target_loop_nid=1581, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_partial_5", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_partial_5", axis=1, anchor_loop_nid=1581, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_partial_5", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1609, inner_nid=1610)),
-    (Split(), SplitOption(target_nid=1607, factors=(2, 384), target_axis="d124")),
-    (CodeMotion(), CodeMotionOption(block_nid=1606, target_loop_nid=1608, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1606, target_loop_nid=1609, index=0)),
-    (Split(), SplitOption(target_nid=1613, factors=(2, 384), target_axis="d124")),
-    (CodeMotion(), CodeMotionOption(block_nid=1612, target_loop_nid=1609, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_6", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_gate_up_6", axis=1, anchor_loop_nid=1609, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_gate_up_6", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1636, inner_nid=1637)),
-    (Split(), SplitOption(target_nid=1634, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1633, target_loop_nid=1635, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1633, target_loop_nid=1636, index=0)),
-    (Split(), SplitOption(target_nid=1640, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1639, target_loop_nid=1636, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_partial_6", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_partial_6", axis=1, anchor_loop_nid=1636, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_partial_6", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1664, inner_nid=1665)),
-    (Split(), SplitOption(target_nid=1662, factors=(2, 384), target_axis="d129")),
-    (CodeMotion(), CodeMotionOption(block_nid=1661, target_loop_nid=1663, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1661, target_loop_nid=1664, index=0)),
-    (Split(), SplitOption(target_nid=1668, factors=(2, 384), target_axis="d129")),
-    (CodeMotion(), CodeMotionOption(block_nid=1667, target_loop_nid=1664, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_7", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_gate_up_7", axis=1, anchor_loop_nid=1664, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_gate_up_7", axis=1)),
-    (Reorder(), ReorderOption(outer_nid=1691, inner_nid=1692)),
-    (Split(), SplitOption(target_nid=1689, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1688, target_loop_nid=1690, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1688, target_loop_nid=1691, index=0)),
-    (Split(), SplitOption(target_nid=1695, factors=(8, 512), target_axis="d95")),
-    (CodeMotion(), CodeMotionOption(block_nid=1694, target_loop_nid=1691, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_partial_7", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="psum_moe_experts_partial_7", axis=1, anchor_loop_nid=1691, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_moe_experts_partial_7", axis=1)),
-    (Split(), SplitOption(target_nid=1279, factors=(2, 384), target_axis="d93")),
-    (Reorder(), ReorderOption(outer_nid=1278, inner_nid=1768)),
+    (TransposeThroughMatmul(), TransposeThroughMatmulOption(transpose_nid=1823)),
+    (Split(), SplitOption(target_nid=1281, factors=(2, 384), target_axis="d90")),
+    (Split(), SplitOption(target_nid=1287, factors=(2, 384), target_axis="d90")),
+    (Split(), SplitOption(target_nid=1332, factors=(2, 384), target_axis="d96")),
+    (Split(), SplitOption(target_nid=1338, factors=(2, 384), target_axis="d96")),
+    (Split(), SplitOption(target_nid=1387, factors=(2, 384), target_axis="d101")),
+    (Split(), SplitOption(target_nid=1393, factors=(2, 384), target_axis="d101")),
+    (Split(), SplitOption(target_nid=1442, factors=(2, 384), target_axis="d106")),
+    (Split(), SplitOption(target_nid=1448, factors=(2, 384), target_axis="d106")),
+    (Split(), SplitOption(target_nid=1497, factors=(2, 384), target_axis="d111")),
+    (Split(), SplitOption(target_nid=1503, factors=(2, 384), target_axis="d111")),
+    (Split(), SplitOption(target_nid=1552, factors=(2, 384), target_axis="d116")),
+    (Split(), SplitOption(target_nid=1558, factors=(2, 384), target_axis="d116")),
+    (Split(), SplitOption(target_nid=1607, factors=(2, 384), target_axis="d121")),
+    (Split(), SplitOption(target_nid=1613, factors=(2, 384), target_axis="d121")),
+    (Split(), SplitOption(target_nid=1662, factors=(2, 384), target_axis="d126")),
+    (Split(), SplitOption(target_nid=1668, factors=(2, 384), target_axis="d126")),
+    (CodeMotion(), CodeMotionOption(block_nid=1277, target_loop_nid=0, index=82)),
     (CodeMotion(), CodeMotionOption(block_nid=1277, target_loop_nid=1282, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1277, target_loop_nid=1283, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1277, target_loop_nid=1283, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1277, target_loop_nid=1284, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(
@@ -5416,23 +5288,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_0_float32_654", axis=0, anchor_loop_nid=1284, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_0_float32_654", axis=1, anchor_loop_nid=1283, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_0_float32_654", axis=0, anchor_loop_nid=1283, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_0_float32_654", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_0_float32_654", axis=1)),
-    (Split(), SplitOption(target_nid=1276, factors=(2, 384), target_axis="d93")),
-    (Reorder(), ReorderOption(outer_nid=1275, inner_nid=1769)),
+    (CodeMotion(), CodeMotionOption(block_nid=1274, target_loop_nid=0, index=81)),
     (CodeMotion(), CodeMotionOption(block_nid=1274, target_loop_nid=1282, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1274, target_loop_nid=1283, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1274, target_loop_nid=1283, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1274, target_loop_nid=1284, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_gate_up_weight_0", scope_nid=None, reuse_tensor=None),
@@ -5440,15 +5302,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_0", axis=1, anchor_loop_nid=1283, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_0", axis=0, anchor_loop_nid=1283, program_loop_nids=()
         ),
     ),
-    (Split(), SplitOption(target_nid=1306, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1305, inner_nid=1770)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_0", axis=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1304, target_loop_nid=0, index=91)),
     (CodeMotion(), CodeMotionOption(block_nid=1304, target_loop_nid=1309, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1304, target_loop_nid=1310, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1304, target_loop_nid=1310, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1304, target_loop_nid=1311, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_0_float32_664", scope_nid=None, reuse_tensor=None),
@@ -5456,23 +5316,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_0_float32_664", axis=0, anchor_loop_nid=1311, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_0_float32_664", axis=1, anchor_loop_nid=1310, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_0_float32_664", axis=0, anchor_loop_nid=1310, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_0_float32_664", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_0_float32_664", axis=1)),
-    (Split(), SplitOption(target_nid=1303, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1302, inner_nid=1771)),
+    (CodeMotion(), CodeMotionOption(block_nid=1301, target_loop_nid=0, index=90)),
     (CodeMotion(), CodeMotionOption(block_nid=1301, target_loop_nid=1309, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1301, target_loop_nid=1310, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1301, target_loop_nid=1310, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1301, target_loop_nid=1311, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_0", scope_nid=None, reuse_tensor=None),
@@ -5480,23 +5330,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_0", axis=0, anchor_loop_nid=1311, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_0", axis=1, anchor_loop_nid=1310, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_0", axis=0, anchor_loop_nid=1310, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_0", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_0", axis=1)),
-    (Split(), SplitOption(target_nid=1330, factors=(2, 384), target_axis="d99")),
-    (Reorder(), ReorderOption(outer_nid=1329, inner_nid=1772)),
+    (CodeMotion(), CodeMotionOption(block_nid=1328, target_loop_nid=0, index=100)),
     (CodeMotion(), CodeMotionOption(block_nid=1328, target_loop_nid=1333, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1328, target_loop_nid=1334, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1328, target_loop_nid=1334, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1328, target_loop_nid=1335, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(
@@ -5506,23 +5346,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_1_float32_673", axis=0, anchor_loop_nid=1335, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_1_float32_673", axis=1, anchor_loop_nid=1334, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_1_float32_673", axis=0, anchor_loop_nid=1334, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_1_float32_673", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_1_float32_673", axis=1)),
-    (Split(), SplitOption(target_nid=1327, factors=(2, 384), target_axis="d99")),
-    (Reorder(), ReorderOption(outer_nid=1326, inner_nid=1773)),
+    (CodeMotion(), CodeMotionOption(block_nid=1325, target_loop_nid=0, index=99)),
     (CodeMotion(), CodeMotionOption(block_nid=1325, target_loop_nid=1333, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1325, target_loop_nid=1334, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1325, target_loop_nid=1334, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1325, target_loop_nid=1335, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_gate_up_weight_1", scope_nid=None, reuse_tensor=None),
@@ -5530,15 +5360,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_1", axis=1, anchor_loop_nid=1334, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_1", axis=0, anchor_loop_nid=1334, program_loop_nids=()
         ),
     ),
-    (Split(), SplitOption(target_nid=1357, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1356, inner_nid=1774)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_1", axis=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1355, target_loop_nid=0, index=109)),
     (CodeMotion(), CodeMotionOption(block_nid=1355, target_loop_nid=1360, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1355, target_loop_nid=1361, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1355, target_loop_nid=1361, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1355, target_loop_nid=1362, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_1_float32_683", scope_nid=None, reuse_tensor=None),
@@ -5546,23 +5374,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_1_float32_683", axis=0, anchor_loop_nid=1362, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_1_float32_683", axis=1, anchor_loop_nid=1361, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_1_float32_683", axis=0, anchor_loop_nid=1361, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_1_float32_683", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_1_float32_683", axis=1)),
-    (Split(), SplitOption(target_nid=1354, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1353, inner_nid=1775)),
+    (CodeMotion(), CodeMotionOption(block_nid=1352, target_loop_nid=0, index=108)),
     (CodeMotion(), CodeMotionOption(block_nid=1352, target_loop_nid=1360, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1352, target_loop_nid=1361, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1352, target_loop_nid=1361, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1352, target_loop_nid=1362, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_1", scope_nid=None, reuse_tensor=None),
@@ -5570,23 +5388,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_1", axis=0, anchor_loop_nid=1362, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_1", axis=1, anchor_loop_nid=1361, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_1", axis=0, anchor_loop_nid=1361, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_1", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_1", axis=1)),
-    (Split(), SplitOption(target_nid=1385, factors=(2, 384), target_axis="d104")),
-    (Reorder(), ReorderOption(outer_nid=1384, inner_nid=1776)),
+    (CodeMotion(), CodeMotionOption(block_nid=1383, target_loop_nid=0, index=120)),
     (CodeMotion(), CodeMotionOption(block_nid=1383, target_loop_nid=1388, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1383, target_loop_nid=1389, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1383, target_loop_nid=1389, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1383, target_loop_nid=1390, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(
@@ -5596,23 +5404,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_2_float32_694", axis=0, anchor_loop_nid=1390, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_2_float32_694", axis=1, anchor_loop_nid=1389, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_2_float32_694", axis=0, anchor_loop_nid=1389, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_2_float32_694", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_2_float32_694", axis=1)),
-    (Split(), SplitOption(target_nid=1382, factors=(2, 384), target_axis="d104")),
-    (Reorder(), ReorderOption(outer_nid=1381, inner_nid=1777)),
+    (CodeMotion(), CodeMotionOption(block_nid=1380, target_loop_nid=0, index=119)),
     (CodeMotion(), CodeMotionOption(block_nid=1380, target_loop_nid=1388, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1380, target_loop_nid=1389, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1380, target_loop_nid=1389, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1380, target_loop_nid=1390, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_gate_up_weight_2", scope_nid=None, reuse_tensor=None),
@@ -5620,15 +5418,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_2", axis=1, anchor_loop_nid=1389, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_2", axis=0, anchor_loop_nid=1389, program_loop_nids=()
         ),
     ),
-    (Split(), SplitOption(target_nid=1412, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1411, inner_nid=1778)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_2", axis=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1410, target_loop_nid=0, index=129)),
     (CodeMotion(), CodeMotionOption(block_nid=1410, target_loop_nid=1415, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1410, target_loop_nid=1416, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1410, target_loop_nid=1416, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1410, target_loop_nid=1417, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_2_float32_704", scope_nid=None, reuse_tensor=None),
@@ -5636,23 +5432,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_2_float32_704", axis=0, anchor_loop_nid=1417, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_2_float32_704", axis=1, anchor_loop_nid=1416, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_2_float32_704", axis=0, anchor_loop_nid=1416, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_2_float32_704", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_2_float32_704", axis=1)),
-    (Split(), SplitOption(target_nid=1409, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1408, inner_nid=1779)),
+    (CodeMotion(), CodeMotionOption(block_nid=1407, target_loop_nid=0, index=128)),
     (CodeMotion(), CodeMotionOption(block_nid=1407, target_loop_nid=1415, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1407, target_loop_nid=1416, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1407, target_loop_nid=1416, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1407, target_loop_nid=1417, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_2", scope_nid=None, reuse_tensor=None),
@@ -5660,23 +5446,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_2", axis=0, anchor_loop_nid=1417, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_2", axis=1, anchor_loop_nid=1416, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_2", axis=0, anchor_loop_nid=1416, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_2", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_2", axis=1)),
-    (Split(), SplitOption(target_nid=1440, factors=(2, 384), target_axis="d109")),
-    (Reorder(), ReorderOption(outer_nid=1439, inner_nid=1780)),
+    (CodeMotion(), CodeMotionOption(block_nid=1438, target_loop_nid=0, index=140)),
     (CodeMotion(), CodeMotionOption(block_nid=1438, target_loop_nid=1443, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1438, target_loop_nid=1444, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1438, target_loop_nid=1444, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1438, target_loop_nid=1445, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(
@@ -5686,23 +5462,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_3_float32_715", axis=0, anchor_loop_nid=1445, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_3_float32_715", axis=1, anchor_loop_nid=1444, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_3_float32_715", axis=0, anchor_loop_nid=1444, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_3_float32_715", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_3_float32_715", axis=1)),
-    (Split(), SplitOption(target_nid=1437, factors=(2, 384), target_axis="d109")),
-    (Reorder(), ReorderOption(outer_nid=1436, inner_nid=1781)),
+    (CodeMotion(), CodeMotionOption(block_nid=1435, target_loop_nid=0, index=139)),
     (CodeMotion(), CodeMotionOption(block_nid=1435, target_loop_nid=1443, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1435, target_loop_nid=1444, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1435, target_loop_nid=1444, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1435, target_loop_nid=1445, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_gate_up_weight_3", scope_nid=None, reuse_tensor=None),
@@ -5710,15 +5476,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_3", axis=1, anchor_loop_nid=1444, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_3", axis=0, anchor_loop_nid=1444, program_loop_nids=()
         ),
     ),
-    (Split(), SplitOption(target_nid=1467, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1466, inner_nid=1782)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_3", axis=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1465, target_loop_nid=0, index=149)),
     (CodeMotion(), CodeMotionOption(block_nid=1465, target_loop_nid=1470, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1465, target_loop_nid=1471, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1465, target_loop_nid=1471, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1465, target_loop_nid=1472, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_3_float32_725", scope_nid=None, reuse_tensor=None),
@@ -5726,23 +5490,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_3_float32_725", axis=0, anchor_loop_nid=1472, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_3_float32_725", axis=1, anchor_loop_nid=1471, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_3_float32_725", axis=0, anchor_loop_nid=1471, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_3_float32_725", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_3_float32_725", axis=1)),
-    (Split(), SplitOption(target_nid=1464, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1463, inner_nid=1783)),
+    (CodeMotion(), CodeMotionOption(block_nid=1462, target_loop_nid=0, index=148)),
     (CodeMotion(), CodeMotionOption(block_nid=1462, target_loop_nid=1470, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1462, target_loop_nid=1471, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1462, target_loop_nid=1471, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1462, target_loop_nid=1472, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_3", scope_nid=None, reuse_tensor=None),
@@ -5750,23 +5504,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_3", axis=0, anchor_loop_nid=1472, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_3", axis=1, anchor_loop_nid=1471, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_3", axis=0, anchor_loop_nid=1471, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_3", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_3", axis=1)),
-    (Split(), SplitOption(target_nid=1495, factors=(2, 384), target_axis="d114")),
-    (Reorder(), ReorderOption(outer_nid=1494, inner_nid=1784)),
+    (CodeMotion(), CodeMotionOption(block_nid=1493, target_loop_nid=0, index=160)),
     (CodeMotion(), CodeMotionOption(block_nid=1493, target_loop_nid=1498, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1493, target_loop_nid=1499, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1493, target_loop_nid=1499, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1493, target_loop_nid=1500, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(
@@ -5776,23 +5520,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_4_float32_736", axis=0, anchor_loop_nid=1500, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_4_float32_736", axis=1, anchor_loop_nid=1499, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_4_float32_736", axis=0, anchor_loop_nid=1499, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_4_float32_736", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_4_float32_736", axis=1)),
-    (Split(), SplitOption(target_nid=1492, factors=(2, 384), target_axis="d114")),
-    (Reorder(), ReorderOption(outer_nid=1491, inner_nid=1785)),
+    (CodeMotion(), CodeMotionOption(block_nid=1490, target_loop_nid=0, index=159)),
     (CodeMotion(), CodeMotionOption(block_nid=1490, target_loop_nid=1498, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1490, target_loop_nid=1499, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1490, target_loop_nid=1499, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1490, target_loop_nid=1500, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_gate_up_weight_4", scope_nid=None, reuse_tensor=None),
@@ -5800,15 +5534,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_4", axis=1, anchor_loop_nid=1499, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_4", axis=0, anchor_loop_nid=1499, program_loop_nids=()
         ),
     ),
-    (Split(), SplitOption(target_nid=1522, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1521, inner_nid=1786)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_4", axis=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1520, target_loop_nid=0, index=169)),
     (CodeMotion(), CodeMotionOption(block_nid=1520, target_loop_nid=1525, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1520, target_loop_nid=1526, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1520, target_loop_nid=1526, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1520, target_loop_nid=1527, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_4_float32_746", scope_nid=None, reuse_tensor=None),
@@ -5816,23 +5548,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_4_float32_746", axis=0, anchor_loop_nid=1527, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_4_float32_746", axis=1, anchor_loop_nid=1526, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_4_float32_746", axis=0, anchor_loop_nid=1526, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_4_float32_746", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_4_float32_746", axis=1)),
-    (Split(), SplitOption(target_nid=1519, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1518, inner_nid=1787)),
+    (CodeMotion(), CodeMotionOption(block_nid=1517, target_loop_nid=0, index=168)),
     (CodeMotion(), CodeMotionOption(block_nid=1517, target_loop_nid=1525, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1517, target_loop_nid=1526, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1517, target_loop_nid=1526, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1517, target_loop_nid=1527, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_4", scope_nid=None, reuse_tensor=None),
@@ -5840,23 +5562,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_4", axis=0, anchor_loop_nid=1527, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_4", axis=1, anchor_loop_nid=1526, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_4", axis=0, anchor_loop_nid=1526, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_4", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_4", axis=1)),
-    (Split(), SplitOption(target_nid=1550, factors=(2, 384), target_axis="d119")),
-    (Reorder(), ReorderOption(outer_nid=1549, inner_nid=1788)),
+    (CodeMotion(), CodeMotionOption(block_nid=1548, target_loop_nid=0, index=180)),
     (CodeMotion(), CodeMotionOption(block_nid=1548, target_loop_nid=1553, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1548, target_loop_nid=1554, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1548, target_loop_nid=1554, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1548, target_loop_nid=1555, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(
@@ -5866,23 +5578,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_5_float32_757", axis=0, anchor_loop_nid=1555, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_5_float32_757", axis=1, anchor_loop_nid=1554, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_5_float32_757", axis=0, anchor_loop_nid=1554, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_5_float32_757", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_5_float32_757", axis=1)),
-    (Split(), SplitOption(target_nid=1547, factors=(2, 384), target_axis="d119")),
-    (Reorder(), ReorderOption(outer_nid=1546, inner_nid=1789)),
+    (CodeMotion(), CodeMotionOption(block_nid=1545, target_loop_nid=0, index=179)),
     (CodeMotion(), CodeMotionOption(block_nid=1545, target_loop_nid=1553, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1545, target_loop_nid=1554, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1545, target_loop_nid=1554, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1545, target_loop_nid=1555, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_gate_up_weight_5", scope_nid=None, reuse_tensor=None),
@@ -5890,15 +5592,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_5", axis=1, anchor_loop_nid=1554, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_5", axis=0, anchor_loop_nid=1554, program_loop_nids=()
         ),
     ),
-    (Split(), SplitOption(target_nid=1577, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1576, inner_nid=1790)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_5", axis=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1575, target_loop_nid=0, index=189)),
     (CodeMotion(), CodeMotionOption(block_nid=1575, target_loop_nid=1580, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1575, target_loop_nid=1581, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1575, target_loop_nid=1581, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1575, target_loop_nid=1582, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_5_float32_767", scope_nid=None, reuse_tensor=None),
@@ -5906,23 +5606,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_5_float32_767", axis=0, anchor_loop_nid=1582, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_5_float32_767", axis=1, anchor_loop_nid=1581, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_5_float32_767", axis=0, anchor_loop_nid=1581, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_5_float32_767", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_5_float32_767", axis=1)),
-    (Split(), SplitOption(target_nid=1574, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1573, inner_nid=1791)),
+    (CodeMotion(), CodeMotionOption(block_nid=1572, target_loop_nid=0, index=188)),
     (CodeMotion(), CodeMotionOption(block_nid=1572, target_loop_nid=1580, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1572, target_loop_nid=1581, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1572, target_loop_nid=1581, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1572, target_loop_nid=1582, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_5", scope_nid=None, reuse_tensor=None),
@@ -5930,23 +5620,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_5", axis=0, anchor_loop_nid=1582, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_5", axis=1, anchor_loop_nid=1581, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_5", axis=0, anchor_loop_nid=1581, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_5", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_5", axis=1)),
-    (Split(), SplitOption(target_nid=1605, factors=(2, 384), target_axis="d124")),
-    (Reorder(), ReorderOption(outer_nid=1604, inner_nid=1792)),
+    (CodeMotion(), CodeMotionOption(block_nid=1603, target_loop_nid=0, index=200)),
     (CodeMotion(), CodeMotionOption(block_nid=1603, target_loop_nid=1608, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1603, target_loop_nid=1609, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1603, target_loop_nid=1609, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1603, target_loop_nid=1610, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(
@@ -5956,23 +5636,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_6_float32_778", axis=0, anchor_loop_nid=1610, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_6_float32_778", axis=1, anchor_loop_nid=1609, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_6_float32_778", axis=0, anchor_loop_nid=1609, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_6_float32_778", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_6_float32_778", axis=1)),
-    (Split(), SplitOption(target_nid=1602, factors=(2, 384), target_axis="d124")),
-    (Reorder(), ReorderOption(outer_nid=1601, inner_nid=1793)),
+    (CodeMotion(), CodeMotionOption(block_nid=1600, target_loop_nid=0, index=199)),
     (CodeMotion(), CodeMotionOption(block_nid=1600, target_loop_nid=1608, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1600, target_loop_nid=1609, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1600, target_loop_nid=1609, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1600, target_loop_nid=1610, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_gate_up_weight_6", scope_nid=None, reuse_tensor=None),
@@ -5980,15 +5650,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_6", axis=1, anchor_loop_nid=1609, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_6", axis=0, anchor_loop_nid=1609, program_loop_nids=()
         ),
     ),
-    (Split(), SplitOption(target_nid=1632, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1631, inner_nid=1794)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_6", axis=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1630, target_loop_nid=0, index=209)),
     (CodeMotion(), CodeMotionOption(block_nid=1630, target_loop_nid=1635, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1630, target_loop_nid=1636, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1630, target_loop_nid=1636, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1630, target_loop_nid=1637, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_6_float32_788", scope_nid=None, reuse_tensor=None),
@@ -5996,23 +5664,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_6_float32_788", axis=0, anchor_loop_nid=1637, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_6_float32_788", axis=1, anchor_loop_nid=1636, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_6_float32_788", axis=0, anchor_loop_nid=1636, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_6_float32_788", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_6_float32_788", axis=1)),
-    (Split(), SplitOption(target_nid=1629, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1628, inner_nid=1795)),
+    (CodeMotion(), CodeMotionOption(block_nid=1627, target_loop_nid=0, index=208)),
     (CodeMotion(), CodeMotionOption(block_nid=1627, target_loop_nid=1635, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1627, target_loop_nid=1636, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1627, target_loop_nid=1636, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1627, target_loop_nid=1637, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_6", scope_nid=None, reuse_tensor=None),
@@ -6020,23 +5678,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_6", axis=0, anchor_loop_nid=1637, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_6", axis=1, anchor_loop_nid=1636, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_6", axis=0, anchor_loop_nid=1636, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_6", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_6", axis=1)),
-    (Split(), SplitOption(target_nid=1660, factors=(2, 384), target_axis="d129")),
-    (Reorder(), ReorderOption(outer_nid=1659, inner_nid=1796)),
+    (CodeMotion(), CodeMotionOption(block_nid=1658, target_loop_nid=0, index=220)),
     (CodeMotion(), CodeMotionOption(block_nid=1658, target_loop_nid=1663, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1658, target_loop_nid=1664, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1658, target_loop_nid=1664, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1658, target_loop_nid=1665, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(
@@ -6046,23 +5694,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_7_float32_799", axis=0, anchor_loop_nid=1665, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_7_float32_799", axis=1, anchor_loop_nid=1664, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_7_float32_799", axis=0, anchor_loop_nid=1664, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_7_float32_799", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_7_float32_799", axis=1)),
-    (Split(), SplitOption(target_nid=1657, factors=(2, 384), target_axis="d129")),
-    (Reorder(), ReorderOption(outer_nid=1656, inner_nid=1797)),
+    (CodeMotion(), CodeMotionOption(block_nid=1655, target_loop_nid=0, index=219)),
     (CodeMotion(), CodeMotionOption(block_nid=1655, target_loop_nid=1663, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1655, target_loop_nid=1664, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1655, target_loop_nid=1664, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1655, target_loop_nid=1665, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_gate_up_weight_7", scope_nid=None, reuse_tensor=None),
@@ -6070,15 +5708,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_7", axis=1, anchor_loop_nid=1664, program_loop_nids=()
+            tensor="sbuf_moe_experts_gate_up_weight_7", axis=0, anchor_loop_nid=1664, program_loop_nids=()
         ),
     ),
-    (Split(), SplitOption(target_nid=1687, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1686, inner_nid=1798)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_7", axis=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1685, target_loop_nid=0, index=229)),
     (CodeMotion(), CodeMotionOption(block_nid=1685, target_loop_nid=1690, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1685, target_loop_nid=1691, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1685, target_loop_nid=1691, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1685, target_loop_nid=1692, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_7_float32_809", scope_nid=None, reuse_tensor=None),
@@ -6086,23 +5722,13 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_7_float32_809", axis=0, anchor_loop_nid=1692, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_7_float32_809", axis=1, anchor_loop_nid=1691, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_7_float32_809", axis=0, anchor_loop_nid=1691, program_loop_nids=()
         ),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_7_float32_809", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_7_float32_809", axis=1)),
-    (Split(), SplitOption(target_nid=1684, factors=(8, 512), target_axis="d95")),
-    (Reorder(), ReorderOption(outer_nid=1683, inner_nid=1799)),
+    (CodeMotion(), CodeMotionOption(block_nid=1682, target_loop_nid=0, index=228)),
     (CodeMotion(), CodeMotionOption(block_nid=1682, target_loop_nid=1690, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1682, target_loop_nid=1691, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1682, target_loop_nid=1691, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1682, target_loop_nid=1692, index=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_moe_experts_down_weight_7", scope_nid=None, reuse_tensor=None),
@@ -6110,221 +5736,946 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_7", axis=0, anchor_loop_nid=1692, program_loop_nids=()
+            tensor="sbuf_moe_experts_down_weight_7", axis=0, anchor_loop_nid=1691, program_loop_nids=()
         ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_7", axis=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1280, target_loop_nid=1282, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1286, target_loop_nid=1282, index=2)),
+    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_0", scope_nid=None, reuse_tensor=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1307, target_loop_nid=1309, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1313, target_loop_nid=1309, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_0_t_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1331, target_loop_nid=1333, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1337, target_loop_nid=1333, index=2)),
+    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_1", scope_nid=None, reuse_tensor=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1358, target_loop_nid=1360, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1364, target_loop_nid=1360, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_1_t_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1386, target_loop_nid=1388, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1392, target_loop_nid=1388, index=2)),
+    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_2", scope_nid=None, reuse_tensor=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1413, target_loop_nid=1415, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1419, target_loop_nid=1415, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_2_t_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1441, target_loop_nid=1443, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1447, target_loop_nid=1443, index=2)),
+    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_3", scope_nid=None, reuse_tensor=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1468, target_loop_nid=1470, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1474, target_loop_nid=1470, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_3_t_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1496, target_loop_nid=1498, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1502, target_loop_nid=1498, index=2)),
+    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_4", scope_nid=None, reuse_tensor=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1523, target_loop_nid=1525, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1529, target_loop_nid=1525, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_4_t_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1551, target_loop_nid=1553, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1557, target_loop_nid=1553, index=2)),
+    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_5", scope_nid=None, reuse_tensor=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1578, target_loop_nid=1580, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1584, target_loop_nid=1580, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_5_t_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1606, target_loop_nid=1608, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1612, target_loop_nid=1608, index=2)),
+    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_6", scope_nid=None, reuse_tensor=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1633, target_loop_nid=1635, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1639, target_loop_nid=1635, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_6_t_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1661, target_loop_nid=1663, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1667, target_loop_nid=1663, index=2)),
+    (BufferPlacement(), BufferPlacementOption(tensor="psum_moe_experts_gate_up_7", scope_nid=None, reuse_tensor=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1688, target_loop_nid=1690, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=1694, target_loop_nid=1690, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_7_t_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=36, target_loop_nid=38, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=41, target_loop_nid=38, index=2)),
+    (BufferPlacement(), BufferPlacementOption(tensor="psum_matmul", scope_nid=None, reuse_tensor=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1315, target_loop_nid=1745, index=1)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_0_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1366, target_loop_nid=1757, index=1)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_1_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1421, target_loop_nid=1769, index=1)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_2_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1476, target_loop_nid=1781, index=1)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_3_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1531, target_loop_nid=1793, index=1)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_4_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1586, target_loop_nid=1805, index=1)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_5_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1641, target_loop_nid=1817, index=1)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_6_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1696, target_loop_nid=1829, index=1)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_7_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (Fuse(), FuseOption(target_nids=(1311, 1737), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=1848, factors=(2, 16), target_axis=None)),
+    (Split(), SplitOption(target_nid=1306, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1304, target_loop_nid=1849, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_0_float32_664", axis=1, anchor_loop_nid=1849, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_0_float32_664", axis=1)),
+    (Split(), SplitOption(target_nid=1303, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1301, target_loop_nid=1849, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_0", axis=1, anchor_loop_nid=1849, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_0", axis=1)),
+    (Fuse(), FuseOption(target_nids=(1362, 1749), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=1853, factors=(2, 16), target_axis=None)),
+    (Split(), SplitOption(target_nid=1357, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1355, target_loop_nid=1854, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_1_float32_683", axis=1, anchor_loop_nid=1854, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_1_float32_683", axis=1)),
+    (Split(), SplitOption(target_nid=1354, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1352, target_loop_nid=1854, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_1", axis=1, anchor_loop_nid=1854, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_1", axis=1)),
+    (Fuse(), FuseOption(target_nids=(1417, 1761), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=1858, factors=(2, 16), target_axis=None)),
+    (Split(), SplitOption(target_nid=1412, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1410, target_loop_nid=1859, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_2_float32_704", axis=1, anchor_loop_nid=1859, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_2_float32_704", axis=1)),
+    (Split(), SplitOption(target_nid=1409, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1407, target_loop_nid=1859, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_2", axis=1, anchor_loop_nid=1859, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_2", axis=1)),
+    (Fuse(), FuseOption(target_nids=(1472, 1773), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=1863, factors=(2, 16), target_axis=None)),
+    (Split(), SplitOption(target_nid=1467, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1465, target_loop_nid=1864, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_3_float32_725", axis=1, anchor_loop_nid=1864, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_3_float32_725", axis=1)),
+    (Split(), SplitOption(target_nid=1464, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1462, target_loop_nid=1864, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_3", axis=1, anchor_loop_nid=1864, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_3", axis=1)),
+    (Fuse(), FuseOption(target_nids=(1527, 1785), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=1868, factors=(2, 16), target_axis=None)),
+    (Split(), SplitOption(target_nid=1522, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1520, target_loop_nid=1869, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_4_float32_746", axis=1, anchor_loop_nid=1869, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_4_float32_746", axis=1)),
+    (Split(), SplitOption(target_nid=1519, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1517, target_loop_nid=1869, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_4", axis=1, anchor_loop_nid=1869, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_4", axis=1)),
+    (Fuse(), FuseOption(target_nids=(1582, 1797), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=1873, factors=(2, 16), target_axis=None)),
+    (Split(), SplitOption(target_nid=1577, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1575, target_loop_nid=1874, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_5_float32_767", axis=1, anchor_loop_nid=1874, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_5_float32_767", axis=1)),
+    (Split(), SplitOption(target_nid=1574, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1572, target_loop_nid=1874, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_5", axis=1, anchor_loop_nid=1874, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_5", axis=1)),
+    (Fuse(), FuseOption(target_nids=(1637, 1809), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=1878, factors=(2, 16), target_axis=None)),
+    (Split(), SplitOption(target_nid=1632, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1630, target_loop_nid=1879, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_6_float32_788", axis=1, anchor_loop_nid=1879, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_6_float32_788", axis=1)),
+    (Split(), SplitOption(target_nid=1629, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1627, target_loop_nid=1879, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_6", axis=1, anchor_loop_nid=1879, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_6", axis=1)),
+    (Fuse(), FuseOption(target_nids=(1692, 1821), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=1883, factors=(2, 16), target_axis=None)),
+    (Split(), SplitOption(target_nid=1687, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1685, target_loop_nid=1884, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_7_float32_809", axis=1, anchor_loop_nid=1884, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_7_float32_809", axis=1)),
+    (Split(), SplitOption(target_nid=1684, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1682, target_loop_nid=1884, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_down_weight_7", axis=1, anchor_loop_nid=1884, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_7", axis=1)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1317, consumer_block_nid=1368, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1368, consumer_block_nid=1370, consumer_operand="data1")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1317)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1368)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1372, consumer_block_nid=1423, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1423, consumer_block_nid=1425, consumer_operand="data1")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1372)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1423)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1427, consumer_block_nid=1478, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1478, consumer_block_nid=1480, consumer_operand="data1")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1427)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1478)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1482, consumer_block_nid=1533, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1533, consumer_block_nid=1535, consumer_operand="data1")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1482)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1533)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1537, consumer_block_nid=1588, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1588, consumer_block_nid=1590, consumer_operand="data1")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1537)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1588)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1592, consumer_block_nid=1643, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1643, consumer_block_nid=1645, consumer_operand="data1")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1592)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1643)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1647, consumer_block_nid=1698, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1698, consumer_block_nid=1700, consumer_operand="data1")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1647)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1698)),
+    (Reorder(), ReorderOption(outer_nid=1310, inner_nid=1849)),
+    (Split(), SplitOption(target_nid=1736, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1307, target_loop_nid=1310, index=0)),
+    (Split(), SplitOption(target_nid=1738, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1313, target_loop_nid=1310, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_0_tt_psum", scope_nid=0, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1315, target_loop_nid=0, index=87)),
+    (Split(), SplitOption(target_nid=1746, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1745, target_loop_nid=1309, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1745, target_loop_nid=1310, index=3)),
+    (Split(), SplitOption(target_nid=1316, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1315, target_loop_nid=1309, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1315, target_loop_nid=1310, index=4)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_0_t_psum", axis=0, anchor_loop_nid=1310, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_0_t_psum", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_0_t", scope_nid=None, reuse_tensor=None),
     ),
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_down_weight_7", axis=1, anchor_loop_nid=1691, program_loop_nids=()
+            tensor="sbuf_moe_experts_partial_0_t", axis=0, anchor_loop_nid=1310, program_loop_nids=()
         ),
     ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_7", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_down_weight_7", axis=1)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_0_t", axis=0)),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=30, redundant_block_nid=1265, consumer_nid=1285, consumer_operand="stationary"
-        ),
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_0_tt_psum", scope_nid=None, reuse_tensor=None),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=30, redundant_block_nid=1265, consumer_nid=1336, consumer_operand="stationary"
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_0_tt_psum", axis=1, anchor_loop_nid=1310, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_0_tt_psum", axis=1)),
+    (Reorder(), ReorderOption(outer_nid=1361, inner_nid=1854)),
+    (Split(), SplitOption(target_nid=1748, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1358, target_loop_nid=1361, index=0)),
+    (Split(), SplitOption(target_nid=1750, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1364, target_loop_nid=1361, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_1_tt_psum", scope_nid=0, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1366, target_loop_nid=0, index=98)),
+    (Split(), SplitOption(target_nid=1758, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1757, target_loop_nid=1360, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1757, target_loop_nid=1361, index=3)),
+    (Split(), SplitOption(target_nid=1367, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1366, target_loop_nid=1360, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1366, target_loop_nid=1361, index=4)),
+    (Split(), SplitOption(target_nid=1371, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1370, target_loop_nid=1360, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1370, target_loop_nid=1361, index=5)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_1_t_psum", axis=0, anchor_loop_nid=1361, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_1_t_psum", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_1_t", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_1_t", axis=0, anchor_loop_nid=1361, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_1_t", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_1_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_1_tt_psum", axis=1, anchor_loop_nid=1361, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_1_tt_psum", axis=1)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_moe_experts_scaled_1", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_scaled_1", axis=1, anchor_loop_nid=1361, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_1", axis=1)),
+    (Reorder(), ReorderOption(outer_nid=1416, inner_nid=1859)),
+    (Split(), SplitOption(target_nid=1760, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1413, target_loop_nid=1416, index=0)),
+    (Split(), SplitOption(target_nid=1762, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1419, target_loop_nid=1416, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_2_tt_psum", scope_nid=0, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1421, target_loop_nid=0, index=109)),
+    (Split(), SplitOption(target_nid=1770, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1769, target_loop_nid=1415, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1769, target_loop_nid=1416, index=3)),
+    (Split(), SplitOption(target_nid=1422, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1421, target_loop_nid=1415, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1421, target_loop_nid=1416, index=4)),
+    (Split(), SplitOption(target_nid=1426, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1425, target_loop_nid=1415, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1425, target_loop_nid=1416, index=5)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_2_t_psum", axis=0, anchor_loop_nid=1416, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_2_t_psum", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_2_t", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_2_t", axis=0, anchor_loop_nid=1416, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_2_t", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_2_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_2_tt_psum", axis=1, anchor_loop_nid=1416, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_2_tt_psum", axis=1)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_moe_experts_scaled_2", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_scaled_2", axis=1, anchor_loop_nid=1416, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_2", axis=1)),
+    (Reorder(), ReorderOption(outer_nid=1471, inner_nid=1864)),
+    (Split(), SplitOption(target_nid=1772, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1468, target_loop_nid=1471, index=0)),
+    (Split(), SplitOption(target_nid=1774, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1474, target_loop_nid=1471, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_3_tt_psum", scope_nid=0, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1476, target_loop_nid=0, index=120)),
+    (Split(), SplitOption(target_nid=1782, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1781, target_loop_nid=1470, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1781, target_loop_nid=1471, index=3)),
+    (Split(), SplitOption(target_nid=1477, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1476, target_loop_nid=1470, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1476, target_loop_nid=1471, index=4)),
+    (Split(), SplitOption(target_nid=1481, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1480, target_loop_nid=1470, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1480, target_loop_nid=1471, index=5)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_3_t_psum", axis=0, anchor_loop_nid=1471, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_3_t_psum", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_3_t", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_3_t", axis=0, anchor_loop_nid=1471, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_3_t", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_3_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_3_tt_psum", axis=1, anchor_loop_nid=1471, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_3_tt_psum", axis=1)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_moe_experts_scaled_3", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_scaled_3", axis=1, anchor_loop_nid=1471, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_3", axis=1)),
+    (Reorder(), ReorderOption(outer_nid=1526, inner_nid=1869)),
+    (Split(), SplitOption(target_nid=1784, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1523, target_loop_nid=1526, index=0)),
+    (Split(), SplitOption(target_nid=1786, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1529, target_loop_nid=1526, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_4_tt_psum", scope_nid=0, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1531, target_loop_nid=0, index=131)),
+    (Split(), SplitOption(target_nid=1794, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1793, target_loop_nid=1525, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1793, target_loop_nid=1526, index=3)),
+    (Split(), SplitOption(target_nid=1532, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1531, target_loop_nid=1525, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1531, target_loop_nid=1526, index=4)),
+    (Split(), SplitOption(target_nid=1536, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1535, target_loop_nid=1525, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1535, target_loop_nid=1526, index=5)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_4_t_psum", axis=0, anchor_loop_nid=1526, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_4_t_psum", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_4_t", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_4_t", axis=0, anchor_loop_nid=1526, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_4_t", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_4_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_4_tt_psum", axis=1, anchor_loop_nid=1526, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_4_tt_psum", axis=1)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_moe_experts_scaled_4", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_scaled_4", axis=1, anchor_loop_nid=1526, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_4", axis=1)),
+    (Reorder(), ReorderOption(outer_nid=1581, inner_nid=1874)),
+    (Split(), SplitOption(target_nid=1796, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1578, target_loop_nid=1581, index=0)),
+    (Split(), SplitOption(target_nid=1798, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1584, target_loop_nid=1581, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_5_tt_psum", scope_nid=0, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1586, target_loop_nid=0, index=142)),
+    (Split(), SplitOption(target_nid=1806, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1805, target_loop_nid=1580, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1805, target_loop_nid=1581, index=3)),
+    (Split(), SplitOption(target_nid=1587, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1586, target_loop_nid=1580, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1586, target_loop_nid=1581, index=4)),
+    (Split(), SplitOption(target_nid=1591, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1590, target_loop_nid=1580, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1590, target_loop_nid=1581, index=5)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_5_t_psum", axis=0, anchor_loop_nid=1581, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_5_t_psum", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_5_t", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_5_t", axis=0, anchor_loop_nid=1581, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_5_t", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_5_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_5_tt_psum", axis=1, anchor_loop_nid=1581, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_5_tt_psum", axis=1)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_moe_experts_scaled_5", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_scaled_5", axis=1, anchor_loop_nid=1581, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_5", axis=1)),
+    (Reorder(), ReorderOption(outer_nid=1636, inner_nid=1879)),
+    (Split(), SplitOption(target_nid=1808, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1633, target_loop_nid=1636, index=0)),
+    (Split(), SplitOption(target_nid=1810, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1639, target_loop_nid=1636, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_6_tt_psum", scope_nid=0, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1641, target_loop_nid=0, index=153)),
+    (Split(), SplitOption(target_nid=1818, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1817, target_loop_nid=1635, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1817, target_loop_nid=1636, index=3)),
+    (Split(), SplitOption(target_nid=1642, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1641, target_loop_nid=1635, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1641, target_loop_nid=1636, index=4)),
+    (Split(), SplitOption(target_nid=1646, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1645, target_loop_nid=1635, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1645, target_loop_nid=1636, index=5)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_6_t_psum", axis=0, anchor_loop_nid=1636, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_6_t_psum", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_6_t", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_6_t", axis=0, anchor_loop_nid=1636, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_6_t", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_6_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_6_tt_psum", axis=1, anchor_loop_nid=1636, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_6_tt_psum", axis=1)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_moe_experts_scaled_6", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_scaled_6", axis=1, anchor_loop_nid=1636, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_6", axis=1)),
+    (Reorder(), ReorderOption(outer_nid=1691, inner_nid=1884)),
+    (Split(), SplitOption(target_nid=1820, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1688, target_loop_nid=1691, index=0)),
+    (Split(), SplitOption(target_nid=1822, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1694, target_loop_nid=1691, index=2)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_7_tt_psum", scope_nid=0, reuse_tensor=None),
+    ),
+    (CodeMotion(), CodeMotionOption(block_nid=1696, target_loop_nid=0, index=164)),
+    (Split(), SplitOption(target_nid=1830, factors=(2, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1829, target_loop_nid=1690, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1829, target_loop_nid=1691, index=3)),
+    (Split(), SplitOption(target_nid=1697, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1696, target_loop_nid=1690, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1696, target_loop_nid=1691, index=4)),
+    (Split(), SplitOption(target_nid=1701, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1700, target_loop_nid=1690, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1700, target_loop_nid=1691, index=5)),
+    (Split(), SplitOption(target_nid=1703, factors=(2, 2048), target_axis="d92")),
+    (CodeMotion(), CodeMotionOption(block_nid=1702, target_loop_nid=1690, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=1702, target_loop_nid=1691, index=6)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_7_t_psum", axis=0, anchor_loop_nid=1691, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_7_t_psum", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_7_t", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_7_t", axis=0, anchor_loop_nid=1691, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_7_t", axis=0)),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_partial_7_tt_psum", scope_nid=None, reuse_tensor=None),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_partial_7_tt_psum", axis=1, anchor_loop_nid=1691, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_7_tt_psum", axis=1)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_moe_experts_scaled_7", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_scaled_7", axis=1, anchor_loop_nid=1691, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_7", axis=1)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_moe_experts_combined_7", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_combined_7", axis=1, anchor_loop_nid=1691, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_7", axis=1)),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=39, axis="d1", programs=1, reduction_tensor="psum_matmul", stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=39, axis="d1", programs=2, reduction_tensor="psum_matmul", stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1283, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_0", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=30, redundant_block_nid=1265, consumer_nid=1391, consumer_operand="stationary"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1283, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_0", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=30, redundant_block_nid=1265, consumer_nid=1446, consumer_operand="stationary"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1334, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_1", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=30, redundant_block_nid=1265, consumer_nid=1501, consumer_operand="stationary"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1334, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_1", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=30, redundant_block_nid=1265, consumer_nid=1556, consumer_operand="stationary"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1389, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_2", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=30, redundant_block_nid=1265, consumer_nid=1611, consumer_operand="stationary"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1389, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_2", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=30, redundant_block_nid=1265, consumer_nid=1666, consumer_operand="stationary"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1444, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_3", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=253, redundant_block_nid=265, consumer_nid=270, consumer_operand="data"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1444, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_3", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=255, redundant_block_nid=277, consumer_nid=282, consumer_operand="data"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1499, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_4", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=267, redundant_block_nid=279, consumer_nid=286, consumer_operand="data2"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1499, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_4", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=357, redundant_block_nid=379, consumer_nid=384, consumer_operand="data1"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1554, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_5", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=359, redundant_block_nid=381, consumer_nid=384, consumer_operand="data2"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1554, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_5", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=359, redundant_block_nid=537, consumer_nid=540, consumer_operand="data2"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1609, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_6", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=361, redundant_block_nid=383, consumer_nid=400, consumer_operand="data1"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1609, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_6", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=363, redundant_block_nid=385, consumer_nid=394, consumer_operand="data"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1664, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_7", stage_drain=False
         ),
     ),
     (
-        CommonSubexpressionElimination(),
-        CommonSubexpressionEliminationOption(
-            canonical_block_nid=365, redundant_block_nid=387, consumer_nid=392, consumer_operand="data"
+        ProgramShard(),
+        ProgramShardOption(
+            loop_nid=1664, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_7", stage_drain=False
         ),
     ),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=71, consumer_block_nid=75, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=73, consumer_block_nid=75, consumer_operand="data2")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=487, consumer_block_nid=517, consumer_operand="data2")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=559, consumer_block_nid=561, consumer_operand="data")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=563, consumer_block_nid=565, consumer_operand="data")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=579, consumer_block_nid=581, consumer_operand="data")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=583, consumer_block_nid=585, consumer_operand="data")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=601, consumer_block_nid=603, consumer_operand="data")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=605, consumer_block_nid=607, consumer_operand="data")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=653, consumer_block_nid=655, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1141, consumer_block_nid=1143, consumer_operand="data")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1145, consumer_block_nid=1147, consumer_operand="data")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1189, consumer_block_nid=1191, consumer_operand="data")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1193, consumer_block_nid=1195, consumer_operand="data")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1231, consumer_block_nid=1233, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1288, consumer_block_nid=1294, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1290, consumer_block_nid=1296, consumer_operand="data2")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1339, consumer_block_nid=1345, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1341, consumer_block_nid=1347, consumer_operand="data2")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1394, consumer_block_nid=1400, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1396, consumer_block_nid=1402, consumer_operand="data2")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1449, consumer_block_nid=1455, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1451, consumer_block_nid=1457, consumer_operand="data2")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1504, consumer_block_nid=1510, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1506, consumer_block_nid=1512, consumer_operand="data2")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1559, consumer_block_nid=1565, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1561, consumer_block_nid=1567, consumer_operand="data2")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1614, consumer_block_nid=1620, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1616, consumer_block_nid=1622, consumer_operand="data2")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1669, consumer_block_nid=1675, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1671, consumer_block_nid=1677, consumer_operand="data2")),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=12, consumer_block_nid=14)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=26, consumer_block_nid=28)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=1257, consumer_block_nid=1259)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=319, consumer_block_nid=321)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=323, consumer_block_nid=325)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=369, consumer_block_nid=371)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=375, consumer_block_nid=377)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=397, consumer_block_nid=399)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=449, consumer_block_nid=451)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=721, consumer_block_nid=723)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=757, consumer_block_nid=759)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=837, consumer_block_nid=839)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=947, consumer_block_nid=949)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=1027, consumer_block_nid=1029)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=71)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=73)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=171)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=173)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=175)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=265)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=277)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=279)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=379)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=381)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=383)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=385)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=387)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=537)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=559)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=563)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=579)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=583)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=601)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=605)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=653)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1141)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1145)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1189)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1193)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1231)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1265)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1290)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1341)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1396)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1451)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1506)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1561)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1616)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1671)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_square", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_632", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_586", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_588", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_610", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_612", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_134", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_140", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_141", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_191", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_192", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_193", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_194", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_195", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_268", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_279", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_281", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_289", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_291", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_300", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_302", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_sorted_prefix_326", scope_nid=None, reuse_tensor=None)),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=1691, axis="d92", programs=2, reduction_tensor=None, stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=1636, axis="d92", programs=2, reduction_tensor=None, stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=1581, axis="d92", programs=2, reduction_tensor=None, stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=1526, axis="d92", programs=2, reduction_tensor=None, stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=1471, axis="d92", programs=2, reduction_tensor=None, stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=1416, axis="d92", programs=2, reduction_tensor=None, stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=1361, axis="d92", programs=2, reduction_tensor=None, stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=1310, axis="d92", programs=2, reduction_tensor=None, stage_drain=False),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_scaled_0", axis=1, anchor_loop_nid=1310, program_loop_nids=(1310, 1361)
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_0", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_combined_1", axis=1, anchor_loop_nid=1361, program_loop_nids=(1361, 1416)
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_1", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_combined_2", axis=1, anchor_loop_nid=1416, program_loop_nids=(1416, 1471)
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_2", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_combined_3", axis=1, anchor_loop_nid=1471, program_loop_nids=(1471, 1526)
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_3", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_combined_4", axis=1, anchor_loop_nid=1526, program_loop_nids=(1526, 1581)
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_4", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_combined_5", axis=1, anchor_loop_nid=1581, program_loop_nids=(1581, 1636)
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_5", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_moe_experts_combined_6", axis=1, anchor_loop_nid=1636, program_loop_nids=(1636, 1691)
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_6", axis=1)),
     (
         BufferPlacement(),
         BufferPlacementOption(
@@ -6370,14 +6721,72 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferPlacement(),
         BufferPlacementOption(
-            tensor="sbuf_moe_experts_activated_7", scope_nid=None, reuse_tensor="sbuf_moe_experts_gate_0"
+            tensor="sbuf_moe_experts_affinity_0", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_1"
         ),
     ),
     (
         BufferPlacement(),
         BufferPlacementOption(
-            tensor="sbuf_moe_experts_gate_0", scope_nid=None, reuse_tensor="sbuf_moe_experts_intermediate_7"
+            tensor="sbuf_moe_experts_affinity_1", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_2"
         ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_moe_experts_affinity_2", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_3"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_moe_experts_affinity_3", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_4"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_moe_experts_affinity_4", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_5"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_moe_experts_affinity_5", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_6"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_moe_experts_affinity_6", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_7"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_moe_experts_combined_1", scope_nid=None, reuse_tensor="sbuf_moe_experts_combined_3"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_moe_experts_combined_2", scope_nid=None, reuse_tensor="sbuf_moe_experts_combined_4"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_moe_experts_combined_3", scope_nid=None, reuse_tensor="sbuf_moe_experts_combined_5"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_moe_experts_combined_4", scope_nid=None, reuse_tensor="sbuf_moe_experts_combined_6"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_gate_0", scope_nid=None, reuse_tensor="sbuf_moe_experts_gate_1"),
     ),
     (
         BufferPlacement(),
@@ -6406,55 +6815,7 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferPlacement(),
         BufferPlacementOption(
-            tensor="sbuf_moe_experts_gate_7", scope_nid=None, reuse_tensor="sbuf_moe_experts_intermediate_0"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_gate_up_0", scope_nid=None, reuse_tensor="sbuf_moe_experts_gate_up_1"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_gate_up_1", scope_nid=None, reuse_tensor="sbuf_moe_experts_gate_up_2"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_gate_up_2", scope_nid=None, reuse_tensor="sbuf_moe_experts_gate_up_3"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_gate_up_3", scope_nid=None, reuse_tensor="sbuf_moe_experts_gate_up_4"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_gate_up_4", scope_nid=None, reuse_tensor="sbuf_moe_experts_gate_up_5"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_gate_up_5", scope_nid=None, reuse_tensor="sbuf_moe_experts_gate_up_6"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_gate_up_6", scope_nid=None, reuse_tensor="sbuf_moe_experts_gate_up_7"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_intermediate_0", scope_nid=None, reuse_tensor="sbuf_moe_experts_sigmoid_0"
+            tensor="sbuf_moe_experts_intermediate_0", scope_nid=None, reuse_tensor="sbuf_moe_experts_intermediate_1"
         ),
     ),
     (
@@ -6490,13 +6851,19 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     (
         BufferPlacement(),
         BufferPlacementOption(
-            tensor="sbuf_moe_experts_intermediate_6", scope_nid=None, reuse_tensor="sbuf_moe_experts_sigmoid_1"
+            tensor="sbuf_moe_experts_intermediate_6", scope_nid=None, reuse_tensor="sbuf_moe_experts_intermediate_7"
         ),
     ),
     (
         BufferPlacement(),
         BufferPlacementOption(
-            tensor="sbuf_moe_experts_sigmoid_0", scope_nid=None, reuse_tensor="sbuf_moe_experts_sigmoid_7"
+            tensor="sbuf_moe_experts_sigmoid_0", scope_nid=None, reuse_tensor="sbuf_moe_experts_sigmoid_1"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_moe_experts_sigmoid_1", scope_nid=None, reuse_tensor="sbuf_moe_experts_sigmoid_2"
         ),
     ),
     (
@@ -6525,1975 +6892,273 @@ BEST_NKIGYM_LADDERS["moe_block_tkg_0"] = (
     ),
     (
         BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_120", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_123"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_121", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_137"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_122", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_124"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_123", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_126"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_124", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_143"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_125", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_127"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_126", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_147"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_127", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_144"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_128", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_136"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_129", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_142"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_130", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_132"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_131", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_133"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_132", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_135"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_133", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_177"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_135", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_145"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_136", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_138"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_137", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_139"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_138", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_146"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_139", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_158"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_142", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_149"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_143", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_152"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_144", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_155"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_145", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_179"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_146", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_184"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_147", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_150"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_149", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_197"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_150", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_153"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_152", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_210"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_153", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_156"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_155", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_220"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_156", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_159"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_158", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_243"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_159", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_178"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_162", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_170"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_164", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_173"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_165", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_175"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_166", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_180"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_167", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_181"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_168", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_171"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_170", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_182"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_171", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_174"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_173", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_183"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_174", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_227"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_175", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_267"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_177", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_254"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_178", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_255"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_179", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_256"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_180", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_185"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_181", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_269"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_182", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_208"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_183", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_198"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_184", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_257"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_185", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_188"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_187", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_190"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_188", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_196"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_190", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_235"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_196", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_199"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_197", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_258"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_198", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_201"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_199", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_211"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_201", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_239"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_203", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_213"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_206", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_216"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_207", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_217"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_208", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_270"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_209", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_219"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_210", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_259"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_211", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_222"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_218", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_271"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_220", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_261"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_221", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_223"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_222", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_234"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_223", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_238"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_225", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_226"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_226", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_228"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_227", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_231"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_228", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_229"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_229", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_247"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_230", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_232"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_231", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_245"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_232", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_233"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_233", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_250"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_234", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_236"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_235", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_237"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_236", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_240"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_237", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_252"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_238", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_241"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_239", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_242"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_240", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_244"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_241", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_274"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_242", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_275"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_243", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_262"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_245", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_248"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_247", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_108"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_248", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_251"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_251", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_272"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_253", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_109"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_254", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_263"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_255", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_260"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_256", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_264"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_257", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_112"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_258", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_113"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_259", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_116"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_260", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_265"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_261", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_119"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_265", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_114"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_272", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_276"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_280", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_290"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_282", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_292"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_283", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_284"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_284", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_293"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_285", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_295"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_286", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_288"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_288", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_299"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_290", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_301"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_292", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_303"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_293", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_294"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_294", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_304"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_295", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_306"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_296", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_307"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_304", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_305"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_312", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_328"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_313", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_314"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_317", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_318"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_321", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_322"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_327", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_338"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_328", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_329"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_reciprocal", scope_nid=None, reuse_tensor="sbuf_stable_softmax_maximum"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_330", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_331"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_331", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_337"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_332", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_336"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_345", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_92"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_346", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_625"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_351", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_353"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_352", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_355"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_353", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_561"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_354", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_356"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_355", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_359"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_359", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_562"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_362", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_460"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_364", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_367"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_370", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_371"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_371", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_373"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_372", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_457"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_374", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_458"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_377", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_378"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_378", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_380"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_379", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_454"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_382", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_453"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_385", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_410"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_386", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_407"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_388", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_399"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_389", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_390"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_390", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_392"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_391", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_396"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_392", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_416"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_394", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_395"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_395", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_397"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_396", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_408"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_399", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_406"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_400", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_402"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_401", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_404"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_402", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_405"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_408", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_411"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_411", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_414"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_414", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_417"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_417", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_423"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_427", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_430"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_428", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_433"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_429", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_445"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_431", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_432"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_432", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_434"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_433", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_451"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_436", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_443"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_437", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_439"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_438", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_441"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_439", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_442"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_440", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_444"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_462", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_463"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_463", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_465"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_466", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_559"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_469", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_471"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_470", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_474"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_473", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_475"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_474", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_477"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_475", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_483"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_477", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_556"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_483", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_555"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_487", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_512"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_488", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_509"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_490", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_501"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_491", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_492"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_492", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_494"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_493", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_498"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_494", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_518"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_496", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_497"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_497", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_499"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_498", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_510"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_34", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_39"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_501", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_508"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_502", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_504"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_503", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_506"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_504", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_507"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_510", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_513"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_513", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_516"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_516", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_519"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_519", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_525"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_529", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_532"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_530", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_535"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_531", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_547"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_533", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_534"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_534", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_536"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_535", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_553"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_538", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_545"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_539", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_541"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_540", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_543"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_541", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_544"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_542", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_546"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_564", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_573"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_565", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_576"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_566", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_581"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_567", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_569"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_568", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_579"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_569", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_572"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_570", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_571"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_571", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_574"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_572", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_575"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_573", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_577"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_574", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_578"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_575", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_580"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_576", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_582"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_577", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_583"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_584", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_595"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_585", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_609"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_589", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_613"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_590", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_591"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_591", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_614"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_592", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_616"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_593", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_617"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_595", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_619"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_596", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_606"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_597", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_607"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_598", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_602"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_599", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_601"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_600", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_603"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_601", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_608"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_603", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_605"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_609", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_621"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_614", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_615"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_94", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_96"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_sorted_prefix_97", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_100"),
-    ),
-    (
-        BufferPlacement(),
         BufferPlacementOption(
-            tensor="sbuf_stable_softmax_maximum", scope_nid=None, reuse_tensor="sbuf_stable_softmax_reciprocal"
+            tensor="sbuf_moe_experts_sigmoid_6", scope_nid=None, reuse_tensor="sbuf_moe_experts_sigmoid_7"
         ),
     ),
     (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=39, axis="d1", programs=1, reduction_tensor="psum_matmul", stage_drain=False),
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_up_0", scope_nid=None, reuse_tensor="sbuf_moe_experts_up_1"),
     ),
     (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=39, axis="d1", programs=2, reduction_tensor="psum_matmul", stage_drain=False),
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_up_1", scope_nid=None, reuse_tensor="sbuf_moe_experts_up_2"),
     ),
     (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1284, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_0", stage_drain=False
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_up_2", scope_nid=None, reuse_tensor="sbuf_moe_experts_up_3"),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_up_3", scope_nid=None, reuse_tensor="sbuf_moe_experts_up_4"),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_up_4", scope_nid=None, reuse_tensor="sbuf_moe_experts_up_5"),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_up_5", scope_nid=None, reuse_tensor="sbuf_moe_experts_up_6"),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_moe_experts_up_6", scope_nid=None, reuse_tensor="sbuf_moe_experts_up_7"),
+    ),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=1285, column_size=32)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=1336, column_size=32)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=1391, column_size=32)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=1446, column_size=32)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=1501, column_size=32)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=1556, column_size=32)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=1611, column_size=32)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=1666, column_size=32)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=171)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=173)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=175)),
+    (
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=127, redundant_block_nid=129, consumer_nid=132, consumer_operand="data"
         ),
     ),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=129)),
     (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1335, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_1", stage_drain=False
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=253, redundant_block_nid=265, consumer_nid=270, consumer_operand="data"
         ),
     ),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=265)),
     (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1390, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_2", stage_drain=False
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=255, redundant_block_nid=277, consumer_nid=282, consumer_operand="data"
         ),
     ),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=277)),
     (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1445, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_3", stage_drain=False
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=267, redundant_block_nid=279, consumer_nid=286, consumer_operand="data2"
         ),
     ),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=279)),
     (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1500, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_4", stage_drain=False
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=357, redundant_block_nid=379, consumer_nid=384, consumer_operand="data1"
         ),
     ),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=379)),
     (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1555, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_5", stage_drain=False
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=359, redundant_block_nid=381, consumer_nid=384, consumer_operand="data2"
         ),
     ),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=381)),
     (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1610, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_6", stage_drain=False
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=359, redundant_block_nid=537, consumer_nid=540, consumer_operand="data2"
         ),
     ),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=537)),
     (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1665, axis="d1", programs=1, reduction_tensor="psum_moe_experts_gate_up_7", stage_drain=False
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=361, redundant_block_nid=383, consumer_nid=400, consumer_operand="data1"
         ),
     ),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=383)),
     (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1311, stages=(), tensor="sbuf_moe_experts_down_weight_0", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1311, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1362, stages=(), tensor="sbuf_moe_experts_down_weight_1", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1362, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1417, stages=(), tensor="sbuf_moe_experts_down_weight_2", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1417, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1472, stages=(), tensor="sbuf_moe_experts_down_weight_3", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1472, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1527, stages=(), tensor="sbuf_moe_experts_down_weight_4", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1527, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1582, stages=(), tensor="sbuf_moe_experts_down_weight_5", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1582, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1637, stages=(), tensor="sbuf_moe_experts_down_weight_6", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1637, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1692, stages=(), tensor="sbuf_moe_experts_down_weight_7", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1692, stages=(0, 1, 1), tensor=None, versions=None)),
-    (Split(), SplitOption(target_nid=1284, factors=(4, 8), target_axis=None)),
-    (CodeMotion(), CodeMotionOption(block_nid=1274, target_loop_nid=1836, index=0)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_0", axis=0, anchor_loop_nid=1836, program_loop_nids=()
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=363, redundant_block_nid=385, consumer_nid=394, consumer_operand="data"
         ),
     ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_0", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_0", axis=1)),
-    (Fuse(), FuseOption(target_nids=(1838, 1276), target_axis=None, operation_batch=True)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=385)),
     (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1836, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_0", stage_drain=False
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=365, redundant_block_nid=387, consumer_nid=392, consumer_operand="data"
         ),
     ),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1836, stages=(), tensor="sbuf_moe_experts_gate_up_weight_0", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1836, stages=(0, 1), tensor=None, versions=None)),
-    (Split(), SplitOption(target_nid=1335, factors=(4, 8), target_axis=None)),
-    (CodeMotion(), CodeMotionOption(block_nid=1325, target_loop_nid=1839, index=0)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_1", axis=0, anchor_loop_nid=1839, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_1", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_1", axis=1)),
-    (Fuse(), FuseOption(target_nids=(1841, 1327), target_axis=None, operation_batch=True)),
-    (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1839, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_1", stage_drain=False
-        ),
-    ),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1839, stages=(), tensor="sbuf_moe_experts_gate_up_weight_1", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1839, stages=(0, 1), tensor=None, versions=None)),
-    (Split(), SplitOption(target_nid=1390, factors=(4, 8), target_axis=None)),
-    (CodeMotion(), CodeMotionOption(block_nid=1380, target_loop_nid=1842, index=0)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_2", axis=0, anchor_loop_nid=1842, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_2", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_2", axis=1)),
-    (Fuse(), FuseOption(target_nids=(1844, 1382), target_axis=None, operation_batch=True)),
-    (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1842, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_2", stage_drain=False
-        ),
-    ),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1842, stages=(), tensor="sbuf_moe_experts_gate_up_weight_2", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1842, stages=(0, 1), tensor=None, versions=None)),
-    (Split(), SplitOption(target_nid=1445, factors=(4, 8), target_axis=None)),
-    (CodeMotion(), CodeMotionOption(block_nid=1435, target_loop_nid=1845, index=0)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_3", axis=0, anchor_loop_nid=1845, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_3", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_3", axis=1)),
-    (Fuse(), FuseOption(target_nids=(1847, 1437), target_axis=None, operation_batch=True)),
-    (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1845, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_3", stage_drain=False
-        ),
-    ),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1845, stages=(), tensor="sbuf_moe_experts_gate_up_weight_3", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1845, stages=(0, 1), tensor=None, versions=None)),
-    (Split(), SplitOption(target_nid=1500, factors=(4, 8), target_axis=None)),
-    (CodeMotion(), CodeMotionOption(block_nid=1490, target_loop_nid=1848, index=0)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_4", axis=0, anchor_loop_nid=1848, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_4", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_4", axis=1)),
-    (Fuse(), FuseOption(target_nids=(1850, 1492), target_axis=None, operation_batch=True)),
-    (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1848, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_4", stage_drain=False
-        ),
-    ),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1848, stages=(), tensor="sbuf_moe_experts_gate_up_weight_4", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1848, stages=(0, 1), tensor=None, versions=None)),
-    (Split(), SplitOption(target_nid=1555, factors=(4, 8), target_axis=None)),
-    (CodeMotion(), CodeMotionOption(block_nid=1545, target_loop_nid=1851, index=0)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_5", axis=0, anchor_loop_nid=1851, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_5", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_5", axis=1)),
-    (Fuse(), FuseOption(target_nids=(1853, 1547), target_axis=None, operation_batch=True)),
-    (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1851, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_5", stage_drain=False
-        ),
-    ),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1851, stages=(), tensor="sbuf_moe_experts_gate_up_weight_5", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1851, stages=(0, 1), tensor=None, versions=None)),
-    (Split(), SplitOption(target_nid=1610, factors=(4, 8), target_axis=None)),
-    (CodeMotion(), CodeMotionOption(block_nid=1600, target_loop_nid=1854, index=0)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_6", axis=0, anchor_loop_nid=1854, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_6", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_6", axis=1)),
-    (Fuse(), FuseOption(target_nids=(1856, 1602), target_axis=None, operation_batch=True)),
-    (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1854, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_6", stage_drain=False
-        ),
-    ),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1854, stages=(), tensor="sbuf_moe_experts_gate_up_weight_6", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1854, stages=(0, 1), tensor=None, versions=None)),
-    (Split(), SplitOption(target_nid=1665, factors=(4, 8), target_axis=None)),
-    (CodeMotion(), CodeMotionOption(block_nid=1655, target_loop_nid=1857, index=0)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_gate_up_weight_7", axis=0, anchor_loop_nid=1857, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_7", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_gate_up_weight_7", axis=1)),
-    (Fuse(), FuseOption(target_nids=(1859, 1657), target_axis=None, operation_batch=True)),
-    (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=1857, axis="d1", programs=2, reduction_tensor="psum_moe_experts_gate_up_7", stage_drain=False
-        ),
-    ),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1857, stages=(), tensor="sbuf_moe_experts_gate_up_weight_7", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1857, stages=(0, 1), tensor=None, versions=None)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=387)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=8, consumer_block_nid=12, consumer_operand="data")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=8, consumer_block_nid=26, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=8)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=10, consumer_block_nid=28, consumer_operand="data2")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=10)),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=43, consumer_block_nid=45, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1317, consumer_block_nid=1368, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1372, consumer_block_nid=1423, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1427, consumer_block_nid=1478, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1482, consumer_block_nid=1533, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1537, consumer_block_nid=1588, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1592, consumer_block_nid=1643, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1647, consumer_block_nid=1698, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1368, consumer_block_nid=1370, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1423, consumer_block_nid=1425, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1478, consumer_block_nid=1480, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1533, consumer_block_nid=1535, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1588, consumer_block_nid=1590, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1643, consumer_block_nid=1645, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1698, consumer_block_nid=1700, consumer_operand="data1")),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1317)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1368)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1372)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1423)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1427)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1478)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1482)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1533)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1537)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1588)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1592)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1643)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1647)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1698)),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1311, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1311, stages=(), tensor="sbuf_moe_experts_down_weight_0", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1362, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1362, stages=(), tensor="sbuf_moe_experts_down_weight_1", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1417, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1417, stages=(), tensor="sbuf_moe_experts_down_weight_2", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1472, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1472, stages=(), tensor="sbuf_moe_experts_down_weight_3", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1527, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1527, stages=(), tensor="sbuf_moe_experts_down_weight_4", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1582, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1582, stages=(), tensor="sbuf_moe_experts_down_weight_5", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1637, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1637, stages=(), tensor="sbuf_moe_experts_down_weight_6", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1692, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1692, stages=(), tensor="sbuf_moe_experts_down_weight_7", versions=1),
-    ),
-    (Split(), SplitOption(target_nid=1316, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1367, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1371, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1422, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1426, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1477, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1481, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1532, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1536, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1587, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1591, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1642, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1646, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1697, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1701, factors=(8, 512), target_axis="d95")),
-    (Split(), SplitOption(target_nid=1703, factors=(8, 512), target_axis="d95")),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1875, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1874, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1872, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1870, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1868, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1866, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1864, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1862, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1860, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1310, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1861, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1361, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1863, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1416, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1865, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1471, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1867, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1526, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1869, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1581, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1871, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1636, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1873, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=1691, axis="d95", programs=2, reduction_tensor=None, stage_drain=False),
-    ),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1311, stages=(), tensor="sbuf_moe_experts_down_weight_0", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1311, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1362, stages=(), tensor="sbuf_moe_experts_down_weight_1", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1362, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1417, stages=(), tensor="sbuf_moe_experts_down_weight_2", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1417, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1472, stages=(), tensor="sbuf_moe_experts_down_weight_3", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1472, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1527, stages=(), tensor="sbuf_moe_experts_down_weight_4", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1527, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1582, stages=(), tensor="sbuf_moe_experts_down_weight_5", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1582, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1637, stages=(), tensor="sbuf_moe_experts_down_weight_6", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1637, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1692, stages=(), tensor="sbuf_moe_experts_down_weight_7", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1692, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_mean_sum", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_0_vector"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_0", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_1"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_0_vector",
-            scope_nid=None,
-            reuse_tensor="sbuf_moe_experts_affinity_1_vector",
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_1", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_2"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_1_vector",
-            scope_nid=None,
-            reuse_tensor="sbuf_moe_experts_affinity_2_vector",
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_2", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_3"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_2_vector",
-            scope_nid=None,
-            reuse_tensor="sbuf_moe_experts_affinity_3_vector",
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_3", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_4"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_3_vector",
-            scope_nid=None,
-            reuse_tensor="sbuf_moe_experts_affinity_4_vector",
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_4", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_5"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_4_vector",
-            scope_nid=None,
-            reuse_tensor="sbuf_moe_experts_affinity_5_vector",
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_5", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_6"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_5_vector",
-            scope_nid=None,
-            reuse_tensor="sbuf_moe_experts_affinity_6_vector",
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_6", scope_nid=None, reuse_tensor="sbuf_moe_experts_affinity_7"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_affinity_6_vector",
-            scope_nid=None,
-            reuse_tensor="sbuf_moe_experts_affinity_7_vector",
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_combined_1", axis=1, anchor_loop_nid=1862, program_loop_nids=(1862, 1864)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_combined_2", axis=1, anchor_loop_nid=1864, program_loop_nids=(1864, 1866)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_combined_3", axis=1, anchor_loop_nid=1866, program_loop_nids=(1866, 1868)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_combined_4", axis=1, anchor_loop_nid=1868, program_loop_nids=(1868, 1870)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_combined_5", axis=1, anchor_loop_nid=1870, program_loop_nids=(1870, 1872)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_combined_6", axis=1, anchor_loop_nid=1872, program_loop_nids=(1872, 1874)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_combined_7", axis=1, anchor_loop_nid=1874, program_loop_nids=(1874, 1875)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_partial_0", axis=1, anchor_loop_nid=1310, program_loop_nids=(1310, 1860)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_partial_1", axis=1, anchor_loop_nid=1361, program_loop_nids=(1361, 1861)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_partial_2", axis=1, anchor_loop_nid=1416, program_loop_nids=(1416, 1863)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_partial_3", axis=1, anchor_loop_nid=1471, program_loop_nids=(1471, 1865)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_partial_4", axis=1, anchor_loop_nid=1526, program_loop_nids=(1526, 1867)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_partial_5", axis=1, anchor_loop_nid=1581, program_loop_nids=(1581, 1869)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_partial_6", axis=1, anchor_loop_nid=1636, program_loop_nids=(1636, 1871)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_partial_7", axis=1, anchor_loop_nid=1691, program_loop_nids=(1691, 1873)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_scaled_0", axis=1, anchor_loop_nid=1860, program_loop_nids=(1860, 1862)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_scaled_1", axis=1, anchor_loop_nid=1861, program_loop_nids=(1861, 1862)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_scaled_2", axis=1, anchor_loop_nid=1863, program_loop_nids=(1863, 1864)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_scaled_3", axis=1, anchor_loop_nid=1865, program_loop_nids=(1865, 1866)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_scaled_4", axis=1, anchor_loop_nid=1867, program_loop_nids=(1867, 1868)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_scaled_5", axis=1, anchor_loop_nid=1869, program_loop_nids=(1869, 1870)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_scaled_6", axis=1, anchor_loop_nid=1871, program_loop_nids=(1871, 1872)
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_moe_experts_scaled_7", axis=1, anchor_loop_nid=1873, program_loop_nids=(1873, 1874)
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_0", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_0", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_1", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_1", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_1", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_2", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_2", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_2", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_3", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_3", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_3", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_4", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_4", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_4", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_5", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_5", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_5", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_6", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_6", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_6", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_partial_7", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_scaled_7", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_moe_experts_combined_7", axis=1)),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1311, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1311, stages=(), tensor="sbuf_moe_experts_down_weight_0", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1362, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1362, stages=(), tensor="sbuf_moe_experts_down_weight_1", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1417, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1417, stages=(), tensor="sbuf_moe_experts_down_weight_2", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1472, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1472, stages=(), tensor="sbuf_moe_experts_down_weight_3", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1527, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1527, stages=(), tensor="sbuf_moe_experts_down_weight_4", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1582, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1582, stages=(), tensor="sbuf_moe_experts_down_weight_5", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1637, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1637, stages=(), tensor="sbuf_moe_experts_down_weight_6", versions=1),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1692, stages=(0, 0, 0), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1692, stages=(), tensor="sbuf_moe_experts_down_weight_7", versions=1),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_partial_0", scope_nid=None, reuse_tensor="sbuf_moe_experts_partial_1"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_partial_1", scope_nid=None, reuse_tensor="sbuf_moe_experts_partial_2"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_partial_2", scope_nid=None, reuse_tensor="sbuf_moe_experts_partial_3"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_partial_3", scope_nid=None, reuse_tensor="sbuf_moe_experts_partial_4"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_partial_4", scope_nid=None, reuse_tensor="sbuf_moe_experts_partial_5"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_partial_5", scope_nid=None, reuse_tensor="sbuf_moe_experts_partial_6"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_partial_6", scope_nid=None, reuse_tensor="sbuf_moe_experts_partial_7"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_scaled_1", scope_nid=None, reuse_tensor="sbuf_moe_experts_scaled_2"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_scaled_2", scope_nid=None, reuse_tensor="sbuf_moe_experts_scaled_3"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_scaled_3", scope_nid=None, reuse_tensor="sbuf_moe_experts_scaled_4"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_scaled_4", scope_nid=None, reuse_tensor="sbuf_moe_experts_scaled_5"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_scaled_5", scope_nid=None, reuse_tensor="sbuf_moe_experts_scaled_6"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_combined_1", scope_nid=None, reuse_tensor="sbuf_moe_experts_combined_3"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_combined_2", scope_nid=None, reuse_tensor="sbuf_moe_experts_combined_4"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_combined_3", scope_nid=None, reuse_tensor="sbuf_moe_experts_combined_5"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_combined_4", scope_nid=None, reuse_tensor="sbuf_moe_experts_combined_6"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_combined_5", scope_nid=None, reuse_tensor="sbuf_moe_experts_combined_7"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_moe_experts_scaled_0", scope_nid=None, reuse_tensor="sbuf_moe_experts_scaled_7"
-        ),
-    ),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1311, stages=(), tensor="sbuf_moe_experts_down_weight_0", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1311, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1362, stages=(), tensor="sbuf_moe_experts_down_weight_1", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1362, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1417, stages=(), tensor="sbuf_moe_experts_down_weight_2", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1417, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1472, stages=(), tensor="sbuf_moe_experts_down_weight_3", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1472, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1527, stages=(), tensor="sbuf_moe_experts_down_weight_4", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1527, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1582, stages=(), tensor="sbuf_moe_experts_down_weight_5", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1582, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1637, stages=(), tensor="sbuf_moe_experts_down_weight_6", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1637, stages=(0, 1, 1), tensor=None, versions=None)),
-    (
-        SoftwarePipeline(),
-        SoftwarePipelineOption(loop_nid=1692, stages=(), tensor="sbuf_moe_experts_down_weight_7", versions=2),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1692, stages=(0, 1, 1), tensor=None, versions=None)),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=43, consumer_block_nid=163, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=89, consumer_block_nid=91, consumer_operand="operand0")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1229, consumer_block_nid=1235, consumer_operand="src")),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=45, consumer_block_nid=47)),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=45, consumer_block_nid=91, consumer_operand="data")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=45, consumer_block_nid=91, consumer_operand="operand0")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=45, consumer_block_nid=113, consumer_operand="data")),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=97, consumer_block_nid=99)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=135, consumer_block_nid=137)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=43)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=89)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1229)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=47, consumer_block_nid=49, consumer_operand="data")),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=45, consumer_block_nid=49, consumer_operand="data")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=47, consumer_block_nid=55, consumer_operand="on_true")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=45, consumer_block_nid=55, consumer_operand="on_true")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=47, consumer_block_nid=91, consumer_operand="data")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=45, consumer_block_nid=91, consumer_operand="data")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=47, consumer_block_nid=113, consumer_operand="data")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=45, consumer_block_nid=113, consumer_operand="data")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=71, consumer_block_nid=75, consumer_operand="data1")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=71)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=73, consumer_block_nid=75, consumer_operand="data2")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=73)),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=79, consumer_block_nid=81, consumer_operand="data")),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=79)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=89, consumer_block_nid=91, consumer_operand="operand0")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=89)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=47, consumer_block_nid=91, consumer_operand="operand0")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=47)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=45, consumer_block_nid=91, consumer_operand="operand0")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=45)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=487, consumer_block_nid=509, consumer_operand="data")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=487, consumer_block_nid=517, consumer_operand="data2")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=487, consumer_block_nid=525, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=487)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=559, consumer_block_nid=561, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=559)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=563, consumer_block_nid=565, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=563)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=579, consumer_block_nid=581, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=579)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=583, consumer_block_nid=585, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=583)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=601, consumer_block_nid=603, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=601)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=605, consumer_block_nid=607, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=605)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=653, consumer_block_nid=655, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=653)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1141, consumer_block_nid=1143, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1141)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1145, consumer_block_nid=1147, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1145)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1189, consumer_block_nid=1191, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1189)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1193, consumer_block_nid=1195, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1193)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1229, consumer_block_nid=1235, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1229)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1231, consumer_block_nid=1233, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1231)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=12, consumer_block_nid=14)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=26, consumer_block_nid=28)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=97, consumer_block_nid=99)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=135, consumer_block_nid=137)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=1257, consumer_block_nid=1259)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=319, consumer_block_nid=321)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=323, consumer_block_nid=325)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=369, consumer_block_nid=371)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=375, consumer_block_nid=377)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=397, consumer_block_nid=399)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=449, consumer_block_nid=451)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=721, consumer_block_nid=723)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=757, consumer_block_nid=759)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=837, consumer_block_nid=839)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=947, consumer_block_nid=949)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=1027, consumer_block_nid=1029)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1283, stages=(), tensor="sbuf_moe_experts_gate_up_weight_0", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1283, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1849, stages=(), tensor="sbuf_moe_experts_down_weight_0", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1849, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1334, stages=(), tensor="sbuf_moe_experts_gate_up_weight_1", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1334, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1854, stages=(), tensor="sbuf_moe_experts_down_weight_1", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1854, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1389, stages=(), tensor="sbuf_moe_experts_gate_up_weight_2", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1389, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1859, stages=(), tensor="sbuf_moe_experts_down_weight_2", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1859, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1444, stages=(), tensor="sbuf_moe_experts_gate_up_weight_3", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1444, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1864, stages=(), tensor="sbuf_moe_experts_down_weight_3", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1864, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1499, stages=(), tensor="sbuf_moe_experts_gate_up_weight_4", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1499, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1869, stages=(), tensor="sbuf_moe_experts_down_weight_4", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1869, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1554, stages=(), tensor="sbuf_moe_experts_gate_up_weight_5", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1554, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1874, stages=(), tensor="sbuf_moe_experts_down_weight_5", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1874, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1609, stages=(), tensor="sbuf_moe_experts_gate_up_weight_6", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1609, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1879, stages=(), tensor="sbuf_moe_experts_down_weight_6", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1879, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1664, stages=(), tensor="sbuf_moe_experts_gate_up_weight_7", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1664, stages=(0, 1, 1), tensor=None, versions=None)),
+    (
+        SoftwarePipeline(),
+        SoftwarePipelineOption(loop_nid=1884, stages=(), tensor="sbuf_moe_experts_down_weight_7", versions=2),
+    ),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=1884, stages=(0, 1, 1), tensor=None, versions=None)),
 )
 
 
@@ -12775,12 +11440,6 @@ BEST_NKIGYM_LADDERS["output_projection_tkg_2"] = (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(tensor="psum_out", axis=0, anchor_loop_nid=41, program_loop_nids=()),
     ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="psum_out", axis=1, anchor_loop_nid=42, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_out", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_out", axis=1)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_out_1_data", scope_nid=None, reuse_tensor=None)),
     (
         BufferRegionNormalization(),
@@ -12794,6 +11453,20 @@ BEST_NKIGYM_LADDERS["output_projection_tkg_2"] = (
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_out_1", axis=0)),
     (ProgramShard(), ProgramShardOption(loop_nid=41, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (Split(), SplitOption(target_nid=34, factors=(4, 512), target_axis="d0")),
+    (Split(), SplitOption(target_nid=37, factors=(4, 512), target_axis="d0")),
+    (CodeMotion(), CodeMotionOption(block_nid=32, target_loop_nid=42, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=35, target_loop_nid=42, index=4)),
+    (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=41, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=35, target_loop_nid=41, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=32, target_loop_nid=41, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=22, target_loop_nid=41, index=2)),
+    (Reorder(), ReorderOption(outer_nid=42, inner_nid=43)),
+    (BufferCompaction(), BufferCompactionOption(tensor="psum_out", axis=0)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=1, consumer_block_nid=10, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1)),
+    (Reorder(), ReorderOption(outer_nid=11, inner_nid=12)),
+    (BatchPermutation(), BatchPermutationOption(loop_nid=12)),
 )
 
 
@@ -14664,6 +13337,8 @@ BEST_NKIGYM_LADDERS["mlp_tkg_2"] = (
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_mean", axis=0)),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=103, consumer_block_nid=106, consumer_operand="src")),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=103)),
+    (Split(), SplitOption(target_nid=112, factors=(8, 512), target_axis="d3")),
+    (Split(), SplitOption(target_nid=120, factors=(8, 512), target_axis="d3")),
 )
 
 
@@ -14906,18 +13581,7 @@ BEST_NKIGYM_LADDERS["output_projection_tkg_4"] = (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(tensor="sbuf_weight", axis=0, anchor_loop_nid=32, program_loop_nids=()),
     ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_weight", axis=1, anchor_loop_nid=31, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_weight", axis=1)),
     (BufferPlacement(), BufferPlacementOption(tensor="psum_out", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="psum_out", axis=1, anchor_loop_nid=31, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_out", axis=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_weight", axis=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_truediv", scope_nid=None, reuse_tensor="sbuf_attention_cast"),
@@ -14936,19 +13600,34 @@ BEST_NKIGYM_LADDERS["output_projection_tkg_4"] = (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(tensor="sbuf_weight_cast", axis=0, anchor_loop_nid=32, program_loop_nids=()),
     ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_weight_cast", axis=1, anchor_loop_nid=31, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_weight_cast", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_weight_cast", axis=1)),
     (Split(), SplitOption(target_nid=47, factors=(2, 4096), target_axis="d2")),
     (ProgramShard(), ProgramShardOption(loop_nid=52, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
     (Split(), SplitOption(target_nid=45, factors=(2, 4096), target_axis="d2")),
     (ProgramShard(), ProgramShardOption(loop_nid=53, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
     (Split(), SplitOption(target_nid=39, factors=(2, 4096), target_axis="d2")),
     (ProgramShard(), ProgramShardOption(loop_nid=54, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
-    (ProgramShard(), ProgramShardOption(loop_nid=31, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (Split(), SplitOption(target_nid=31, factors=(2, 8), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=28, target_loop_nid=55, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=34, target_loop_nid=55, index=2)),
+    (Reorder(), ReorderOption(outer_nid=56, inner_nid=32)),
+    (CodeMotion(), CodeMotionOption(block_nid=3, target_loop_nid=56, index=0)),
+    (Fuse(), FuseOption(target_nids=(59, 5), target_axis="d2", operation_batch=False)),
+    (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=56, index=1)),
+    (Fuse(), FuseOption(target_nids=(60, 16), target_axis="d2", operation_batch=False)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_weight", axis=1, anchor_loop_nid=55, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_weight", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_weight", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_weight_cast", axis=1, anchor_loop_nid=55, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_weight_cast", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_weight_cast", axis=1)),
+    (ProgramShard(), ProgramShardOption(loop_nid=55, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=33, column_size=32)),
 )
 
 BEST_NKIGYM_LADDERS["output_projection_tkg_5"] = (
@@ -16166,24 +14845,123 @@ BEST_NKIGYM_LADDERS["rotational_topk_3"] = (
 )
 
 BEST_NKIGYM_LADDERS["rotational_topk_4"] = (
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_topk_0_selected_indices", scope_nid=None, reuse_tensor="sbuf_topk_1_selected_indices"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_topk_1_selected_indices", scope_nid=None, reuse_tensor="sbuf_topk_2_selected_indices"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_topk_2_selected_indices", scope_nid=None, reuse_tensor="sbuf_topk_3_selected_indices"
-        ),
-    ),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=11, target_loop_nid=0, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=11, target_loop_nid=0, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=16, target_loop_nid=0, index=5)),
+    (CodeMotion(), CodeMotionOption(block_nid=16, target_loop_nid=0, index=4)),
+    (CodeMotion(), CodeMotionOption(block_nid=16, target_loop_nid=0, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=2, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=13, target_loop_nid=2, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=18, target_loop_nid=2, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=21, target_loop_nid=2, index=4)),
+    (CodeMotion(), CodeMotionOption(block_nid=24, target_loop_nid=2, index=5)),
+    (CodeMotion(), CodeMotionOption(block_nid=27, target_loop_nid=2, index=6)),
+    (CodeMotion(), CodeMotionOption(block_nid=30, target_loop_nid=2, index=7)),
+    (CodeMotion(), CodeMotionOption(block_nid=33, target_loop_nid=2, index=8)),
+    (CodeMotion(), CodeMotionOption(block_nid=36, target_loop_nid=2, index=9)),
+    (CodeMotion(), CodeMotionOption(block_nid=39, target_loop_nid=2, index=10)),
+    (CodeMotion(), CodeMotionOption(block_nid=42, target_loop_nid=2, index=11)),
+    (CodeMotion(), CodeMotionOption(block_nid=45, target_loop_nid=2, index=12)),
+    (CodeMotion(), CodeMotionOption(block_nid=48, target_loop_nid=2, index=13)),
+    (CodeMotion(), CodeMotionOption(block_nid=51, target_loop_nid=2, index=14)),
+    (CodeMotion(), CodeMotionOption(block_nid=54, target_loop_nid=2, index=15)),
+    (CodeMotion(), CodeMotionOption(block_nid=57, target_loop_nid=2, index=16)),
+    (CodeMotion(), CodeMotionOption(block_nid=60, target_loop_nid=2, index=17)),
+    (CodeMotion(), CodeMotionOption(block_nid=63, target_loop_nid=2, index=18)),
+    (CodeMotion(), CodeMotionOption(block_nid=66, target_loop_nid=2, index=19)),
+    (CodeMotion(), CodeMotionOption(block_nid=69, target_loop_nid=2, index=20)),
+    (CodeMotion(), CodeMotionOption(block_nid=72, target_loop_nid=2, index=21)),
+    (CodeMotion(), CodeMotionOption(block_nid=75, target_loop_nid=2, index=22)),
+    (CodeMotion(), CodeMotionOption(block_nid=78, target_loop_nid=2, index=23)),
+    (CodeMotion(), CodeMotionOption(block_nid=81, target_loop_nid=2, index=24)),
+    (CodeMotion(), CodeMotionOption(block_nid=84, target_loop_nid=2, index=25)),
+    (CodeMotion(), CodeMotionOption(block_nid=87, target_loop_nid=2, index=26)),
+    (CodeMotion(), CodeMotionOption(block_nid=90, target_loop_nid=2, index=27)),
+    (CodeMotion(), CodeMotionOption(block_nid=93, target_loop_nid=2, index=28)),
+    (CodeMotion(), CodeMotionOption(block_nid=96, target_loop_nid=2, index=29)),
+    (CodeMotion(), CodeMotionOption(block_nid=99, target_loop_nid=2, index=30)),
+    (CodeMotion(), CodeMotionOption(block_nid=102, target_loop_nid=2, index=31)),
+    (CodeMotion(), CodeMotionOption(block_nid=105, target_loop_nid=2, index=32)),
+    (CodeMotion(), CodeMotionOption(block_nid=108, target_loop_nid=2, index=33)),
+    (CodeMotion(), CodeMotionOption(block_nid=111, target_loop_nid=2, index=34)),
+    (CodeMotion(), CodeMotionOption(block_nid=114, target_loop_nid=2, index=35)),
+    (CodeMotion(), CodeMotionOption(block_nid=117, target_loop_nid=2, index=36)),
+    (CodeMotion(), CodeMotionOption(block_nid=120, target_loop_nid=2, index=37)),
+    (CodeMotion(), CodeMotionOption(block_nid=123, target_loop_nid=2, index=38)),
+    (CodeMotion(), CodeMotionOption(block_nid=126, target_loop_nid=2, index=39)),
+    (CodeMotion(), CodeMotionOption(block_nid=129, target_loop_nid=2, index=40)),
+    (CodeMotion(), CodeMotionOption(block_nid=132, target_loop_nid=2, index=41)),
+    (CodeMotion(), CodeMotionOption(block_nid=135, target_loop_nid=2, index=42)),
+    (CodeMotion(), CodeMotionOption(block_nid=138, target_loop_nid=2, index=43)),
+    (CodeMotion(), CodeMotionOption(block_nid=141, target_loop_nid=2, index=44)),
+    (CodeMotion(), CodeMotionOption(block_nid=144, target_loop_nid=2, index=45)),
+    (CodeMotion(), CodeMotionOption(block_nid=147, target_loop_nid=2, index=46)),
+    (CodeMotion(), CodeMotionOption(block_nid=150, target_loop_nid=2, index=47)),
+    (CodeMotion(), CodeMotionOption(block_nid=153, target_loop_nid=2, index=48)),
+    (CodeMotion(), CodeMotionOption(block_nid=156, target_loop_nid=2, index=49)),
+    (CodeMotion(), CodeMotionOption(block_nid=159, target_loop_nid=2, index=50)),
+    (CodeMotion(), CodeMotionOption(block_nid=162, target_loop_nid=2, index=51)),
+    (CodeMotion(), CodeMotionOption(block_nid=165, target_loop_nid=2, index=52)),
+    (CodeMotion(), CodeMotionOption(block_nid=168, target_loop_nid=2, index=53)),
+    (CodeMotion(), CodeMotionOption(block_nid=171, target_loop_nid=2, index=54)),
+    (CodeMotion(), CodeMotionOption(block_nid=174, target_loop_nid=2, index=55)),
+    (CodeMotion(), CodeMotionOption(block_nid=177, target_loop_nid=2, index=56)),
+    (CodeMotion(), CodeMotionOption(block_nid=180, target_loop_nid=2, index=57)),
+    (CodeMotion(), CodeMotionOption(block_nid=183, target_loop_nid=2, index=58)),
+    (CodeMotion(), CodeMotionOption(block_nid=186, target_loop_nid=2, index=59)),
+    (CodeMotion(), CodeMotionOption(block_nid=189, target_loop_nid=2, index=60)),
+    (CodeMotion(), CodeMotionOption(block_nid=192, target_loop_nid=2, index=61)),
+    (CodeMotion(), CodeMotionOption(block_nid=195, target_loop_nid=2, index=62)),
+    (CodeMotion(), CodeMotionOption(block_nid=198, target_loop_nid=2, index=63)),
+    (CodeMotion(), CodeMotionOption(block_nid=201, target_loop_nid=2, index=64)),
+    (CodeMotion(), CodeMotionOption(block_nid=204, target_loop_nid=2, index=65)),
+    (CodeMotion(), CodeMotionOption(block_nid=207, target_loop_nid=2, index=66)),
+    (CodeMotion(), CodeMotionOption(block_nid=210, target_loop_nid=2, index=67)),
+    (CodeMotion(), CodeMotionOption(block_nid=213, target_loop_nid=2, index=68)),
+    (CodeMotion(), CodeMotionOption(block_nid=216, target_loop_nid=2, index=69)),
+    (CodeMotion(), CodeMotionOption(block_nid=219, target_loop_nid=2, index=70)),
+    (CodeMotion(), CodeMotionOption(block_nid=222, target_loop_nid=2, index=71)),
+    (CodeMotion(), CodeMotionOption(block_nid=225, target_loop_nid=2, index=72)),
+    (CodeMotion(), CodeMotionOption(block_nid=228, target_loop_nid=2, index=73)),
+    (CodeMotion(), CodeMotionOption(block_nid=231, target_loop_nid=2, index=74)),
+    (CodeMotion(), CodeMotionOption(block_nid=234, target_loop_nid=2, index=75)),
+    (CodeMotion(), CodeMotionOption(block_nid=237, target_loop_nid=2, index=76)),
+    (CodeMotion(), CodeMotionOption(block_nid=240, target_loop_nid=2, index=77)),
+    (CodeMotion(), CodeMotionOption(block_nid=243, target_loop_nid=2, index=78)),
+    (CodeMotion(), CodeMotionOption(block_nid=246, target_loop_nid=2, index=79)),
+    (CodeMotion(), CodeMotionOption(block_nid=249, target_loop_nid=2, index=80)),
+    (CodeMotion(), CodeMotionOption(block_nid=252, target_loop_nid=2, index=81)),
+    (CodeMotion(), CodeMotionOption(block_nid=255, target_loop_nid=2, index=82)),
+    (CodeMotion(), CodeMotionOption(block_nid=258, target_loop_nid=2, index=83)),
+    (CodeMotion(), CodeMotionOption(block_nid=261, target_loop_nid=2, index=84)),
+    (CodeMotion(), CodeMotionOption(block_nid=264, target_loop_nid=2, index=85)),
+    (CodeMotion(), CodeMotionOption(block_nid=267, target_loop_nid=2, index=86)),
+    (CodeMotion(), CodeMotionOption(block_nid=270, target_loop_nid=2, index=87)),
+    (CodeMotion(), CodeMotionOption(block_nid=273, target_loop_nid=2, index=88)),
+    (CodeMotion(), CodeMotionOption(block_nid=276, target_loop_nid=2, index=89)),
+    (CodeMotion(), CodeMotionOption(block_nid=279, target_loop_nid=2, index=90)),
+    (CodeMotion(), CodeMotionOption(block_nid=282, target_loop_nid=2, index=91)),
+    (CodeMotion(), CodeMotionOption(block_nid=285, target_loop_nid=2, index=92)),
+    (CodeMotion(), CodeMotionOption(block_nid=288, target_loop_nid=2, index=93)),
+    (CodeMotion(), CodeMotionOption(block_nid=291, target_loop_nid=2, index=94)),
+    (CodeMotion(), CodeMotionOption(block_nid=294, target_loop_nid=2, index=95)),
+    (CodeMotion(), CodeMotionOption(block_nid=297, target_loop_nid=2, index=96)),
+    (CodeMotion(), CodeMotionOption(block_nid=300, target_loop_nid=2, index=97)),
+    (CodeMotion(), CodeMotionOption(block_nid=303, target_loop_nid=2, index=98)),
+    (CodeMotion(), CodeMotionOption(block_nid=306, target_loop_nid=2, index=99)),
+    (CodeMotion(), CodeMotionOption(block_nid=309, target_loop_nid=2, index=100)),
+    (CodeMotion(), CodeMotionOption(block_nid=312, target_loop_nid=2, index=101)),
+    (CodeMotion(), CodeMotionOption(block_nid=315, target_loop_nid=2, index=102)),
+    (CodeMotion(), CodeMotionOption(block_nid=318, target_loop_nid=2, index=103)),
+    (CodeMotion(), CodeMotionOption(block_nid=321, target_loop_nid=2, index=104)),
+    (CodeMotion(), CodeMotionOption(block_nid=324, target_loop_nid=2, index=105)),
+    (CodeMotion(), CodeMotionOption(block_nid=327, target_loop_nid=2, index=106)),
+    (CodeMotion(), CodeMotionOption(block_nid=330, target_loop_nid=2, index=107)),
+    (ProgramShard(), ProgramShardOption(loop_nid=2, axis="d40", programs=2, reduction_tensor=None, stage_drain=False)),
     (
         BufferPlacement(),
         BufferPlacementOption(
@@ -16199,6 +14977,30 @@ BEST_NKIGYM_LADDERS["rotational_topk_4"] = (
     (
         BufferPlacement(),
         BufferPlacementOption(
+            tensor="sbuf_topk_rotated_indices_2", scope_nid=None, reuse_tensor="sbuf_topk_rotated_indices_3"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_topk_rotated_indices_3", scope_nid=None, reuse_tensor="sbuf_topk_rotated_indices_4"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_topk_rotated_indices_4", scope_nid=None, reuse_tensor="sbuf_topk_rotated_indices_5"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_topk_rotated_indices_5", scope_nid=None, reuse_tensor="sbuf_topk_rotated_indices_6"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
             tensor="sbuf_topk_rotated_values_0", scope_nid=None, reuse_tensor="sbuf_topk_rotated_values_1"
         ),
     ),
@@ -16208,24 +15010,220 @@ BEST_NKIGYM_LADDERS["rotational_topk_4"] = (
             tensor="sbuf_topk_rotated_values_1", scope_nid=None, reuse_tensor="sbuf_topk_rotated_values_2"
         ),
     ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_topk_rotated_values_2", scope_nid=None, reuse_tensor="sbuf_topk_rotated_values_3"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_topk_rotated_values_3", scope_nid=None, reuse_tensor="sbuf_topk_rotated_values_4"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_topk_rotated_values_4", scope_nid=None, reuse_tensor="sbuf_topk_rotated_values_5"
+        ),
+    ),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(
+            tensor="sbuf_topk_rotated_values_5", scope_nid=None, reuse_tensor="sbuf_topk_rotated_values_6"
+        ),
+    ),
 )
 
 BEST_NKIGYM_LADDERS["rotational_topk_5"] = (
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_topk_0_selected_indices", scope_nid=None, reuse_tensor="sbuf_topk_1_selected_indices"
-        ),
-    ),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=11, target_loop_nid=0, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=11, target_loop_nid=0, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=16, target_loop_nid=0, index=5)),
+    (CodeMotion(), CodeMotionOption(block_nid=16, target_loop_nid=0, index=4)),
+    (CodeMotion(), CodeMotionOption(block_nid=16, target_loop_nid=0, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=2, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=13, target_loop_nid=2, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=18, target_loop_nid=2, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=21, target_loop_nid=2, index=4)),
+    (CodeMotion(), CodeMotionOption(block_nid=24, target_loop_nid=2, index=5)),
+    (CodeMotion(), CodeMotionOption(block_nid=27, target_loop_nid=2, index=6)),
+    (CodeMotion(), CodeMotionOption(block_nid=30, target_loop_nid=2, index=7)),
+    (CodeMotion(), CodeMotionOption(block_nid=33, target_loop_nid=2, index=8)),
+    (CodeMotion(), CodeMotionOption(block_nid=36, target_loop_nid=2, index=9)),
+    (CodeMotion(), CodeMotionOption(block_nid=39, target_loop_nid=2, index=10)),
+    (CodeMotion(), CodeMotionOption(block_nid=42, target_loop_nid=2, index=11)),
+    (CodeMotion(), CodeMotionOption(block_nid=45, target_loop_nid=2, index=12)),
+    (CodeMotion(), CodeMotionOption(block_nid=48, target_loop_nid=2, index=13)),
+    (CodeMotion(), CodeMotionOption(block_nid=51, target_loop_nid=2, index=14)),
+    (CodeMotion(), CodeMotionOption(block_nid=54, target_loop_nid=2, index=15)),
+    (CodeMotion(), CodeMotionOption(block_nid=57, target_loop_nid=2, index=16)),
+    (CodeMotion(), CodeMotionOption(block_nid=60, target_loop_nid=2, index=17)),
+    (CodeMotion(), CodeMotionOption(block_nid=63, target_loop_nid=2, index=18)),
+    (CodeMotion(), CodeMotionOption(block_nid=66, target_loop_nid=2, index=19)),
+    (CodeMotion(), CodeMotionOption(block_nid=69, target_loop_nid=2, index=20)),
+    (CodeMotion(), CodeMotionOption(block_nid=72, target_loop_nid=2, index=21)),
+    (CodeMotion(), CodeMotionOption(block_nid=75, target_loop_nid=2, index=22)),
+    (CodeMotion(), CodeMotionOption(block_nid=78, target_loop_nid=2, index=23)),
+    (CodeMotion(), CodeMotionOption(block_nid=81, target_loop_nid=2, index=24)),
+    (CodeMotion(), CodeMotionOption(block_nid=84, target_loop_nid=2, index=25)),
+    (CodeMotion(), CodeMotionOption(block_nid=87, target_loop_nid=2, index=26)),
+    (CodeMotion(), CodeMotionOption(block_nid=90, target_loop_nid=2, index=27)),
+    (CodeMotion(), CodeMotionOption(block_nid=93, target_loop_nid=2, index=28)),
+    (CodeMotion(), CodeMotionOption(block_nid=96, target_loop_nid=2, index=29)),
+    (CodeMotion(), CodeMotionOption(block_nid=99, target_loop_nid=2, index=30)),
+    (CodeMotion(), CodeMotionOption(block_nid=102, target_loop_nid=2, index=31)),
+    (CodeMotion(), CodeMotionOption(block_nid=105, target_loop_nid=2, index=32)),
+    (CodeMotion(), CodeMotionOption(block_nid=108, target_loop_nid=2, index=33)),
+    (CodeMotion(), CodeMotionOption(block_nid=111, target_loop_nid=2, index=34)),
+    (CodeMotion(), CodeMotionOption(block_nid=114, target_loop_nid=2, index=35)),
+    (CodeMotion(), CodeMotionOption(block_nid=117, target_loop_nid=2, index=36)),
+    (CodeMotion(), CodeMotionOption(block_nid=120, target_loop_nid=2, index=37)),
+    (CodeMotion(), CodeMotionOption(block_nid=123, target_loop_nid=2, index=38)),
+    (CodeMotion(), CodeMotionOption(block_nid=126, target_loop_nid=2, index=39)),
+    (CodeMotion(), CodeMotionOption(block_nid=129, target_loop_nid=2, index=40)),
+    (CodeMotion(), CodeMotionOption(block_nid=132, target_loop_nid=2, index=41)),
+    (CodeMotion(), CodeMotionOption(block_nid=135, target_loop_nid=2, index=42)),
+    (CodeMotion(), CodeMotionOption(block_nid=138, target_loop_nid=2, index=43)),
+    (CodeMotion(), CodeMotionOption(block_nid=141, target_loop_nid=2, index=44)),
+    (CodeMotion(), CodeMotionOption(block_nid=144, target_loop_nid=2, index=45)),
+    (CodeMotion(), CodeMotionOption(block_nid=147, target_loop_nid=2, index=46)),
+    (CodeMotion(), CodeMotionOption(block_nid=150, target_loop_nid=2, index=47)),
+    (CodeMotion(), CodeMotionOption(block_nid=153, target_loop_nid=2, index=48)),
+    (CodeMotion(), CodeMotionOption(block_nid=156, target_loop_nid=2, index=49)),
+    (CodeMotion(), CodeMotionOption(block_nid=159, target_loop_nid=2, index=50)),
+    (CodeMotion(), CodeMotionOption(block_nid=162, target_loop_nid=2, index=51)),
+    (CodeMotion(), CodeMotionOption(block_nid=165, target_loop_nid=2, index=52)),
+    (CodeMotion(), CodeMotionOption(block_nid=168, target_loop_nid=2, index=53)),
+    (CodeMotion(), CodeMotionOption(block_nid=171, target_loop_nid=2, index=54)),
+    (CodeMotion(), CodeMotionOption(block_nid=174, target_loop_nid=2, index=55)),
+    (CodeMotion(), CodeMotionOption(block_nid=177, target_loop_nid=2, index=56)),
+    (CodeMotion(), CodeMotionOption(block_nid=180, target_loop_nid=2, index=57)),
+    (CodeMotion(), CodeMotionOption(block_nid=183, target_loop_nid=2, index=58)),
+    (CodeMotion(), CodeMotionOption(block_nid=186, target_loop_nid=2, index=59)),
+    (CodeMotion(), CodeMotionOption(block_nid=189, target_loop_nid=2, index=60)),
+    (CodeMotion(), CodeMotionOption(block_nid=192, target_loop_nid=2, index=61)),
+    (CodeMotion(), CodeMotionOption(block_nid=195, target_loop_nid=2, index=62)),
+    (CodeMotion(), CodeMotionOption(block_nid=198, target_loop_nid=2, index=63)),
+    (CodeMotion(), CodeMotionOption(block_nid=201, target_loop_nid=2, index=64)),
+    (CodeMotion(), CodeMotionOption(block_nid=204, target_loop_nid=2, index=65)),
+    (CodeMotion(), CodeMotionOption(block_nid=207, target_loop_nid=2, index=66)),
+    (CodeMotion(), CodeMotionOption(block_nid=210, target_loop_nid=2, index=67)),
+    (CodeMotion(), CodeMotionOption(block_nid=213, target_loop_nid=2, index=68)),
+    (CodeMotion(), CodeMotionOption(block_nid=216, target_loop_nid=2, index=69)),
+    (CodeMotion(), CodeMotionOption(block_nid=219, target_loop_nid=2, index=70)),
+    (CodeMotion(), CodeMotionOption(block_nid=222, target_loop_nid=2, index=71)),
+    (CodeMotion(), CodeMotionOption(block_nid=225, target_loop_nid=2, index=72)),
+    (CodeMotion(), CodeMotionOption(block_nid=228, target_loop_nid=2, index=73)),
+    (CodeMotion(), CodeMotionOption(block_nid=231, target_loop_nid=2, index=74)),
+    (CodeMotion(), CodeMotionOption(block_nid=234, target_loop_nid=2, index=75)),
+    (CodeMotion(), CodeMotionOption(block_nid=237, target_loop_nid=2, index=76)),
+    (CodeMotion(), CodeMotionOption(block_nid=240, target_loop_nid=2, index=77)),
+    (ProgramShard(), ProgramShardOption(loop_nid=2, axis="d22", programs=2, reduction_tensor=None, stage_drain=False)),
 )
 
 BEST_NKIGYM_LADDERS["rotational_topk_6"] = (
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_topk_0_selected_indices", scope_nid=None, reuse_tensor="sbuf_topk_1_selected_indices"
-        ),
-    ),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=11, target_loop_nid=0, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=11, target_loop_nid=0, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=16, target_loop_nid=0, index=5)),
+    (CodeMotion(), CodeMotionOption(block_nid=16, target_loop_nid=0, index=4)),
+    (CodeMotion(), CodeMotionOption(block_nid=16, target_loop_nid=0, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=2, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=13, target_loop_nid=2, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=18, target_loop_nid=2, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=21, target_loop_nid=2, index=4)),
+    (CodeMotion(), CodeMotionOption(block_nid=24, target_loop_nid=2, index=5)),
+    (CodeMotion(), CodeMotionOption(block_nid=27, target_loop_nid=2, index=6)),
+    (CodeMotion(), CodeMotionOption(block_nid=30, target_loop_nid=2, index=7)),
+    (CodeMotion(), CodeMotionOption(block_nid=33, target_loop_nid=2, index=8)),
+    (CodeMotion(), CodeMotionOption(block_nid=36, target_loop_nid=2, index=9)),
+    (CodeMotion(), CodeMotionOption(block_nid=39, target_loop_nid=2, index=10)),
+    (CodeMotion(), CodeMotionOption(block_nid=42, target_loop_nid=2, index=11)),
+    (CodeMotion(), CodeMotionOption(block_nid=45, target_loop_nid=2, index=12)),
+    (CodeMotion(), CodeMotionOption(block_nid=48, target_loop_nid=2, index=13)),
+    (CodeMotion(), CodeMotionOption(block_nid=51, target_loop_nid=2, index=14)),
+    (CodeMotion(), CodeMotionOption(block_nid=54, target_loop_nid=2, index=15)),
+    (CodeMotion(), CodeMotionOption(block_nid=57, target_loop_nid=2, index=16)),
+    (CodeMotion(), CodeMotionOption(block_nid=60, target_loop_nid=2, index=17)),
+    (CodeMotion(), CodeMotionOption(block_nid=63, target_loop_nid=2, index=18)),
+    (CodeMotion(), CodeMotionOption(block_nid=66, target_loop_nid=2, index=19)),
+    (CodeMotion(), CodeMotionOption(block_nid=69, target_loop_nid=2, index=20)),
+    (CodeMotion(), CodeMotionOption(block_nid=72, target_loop_nid=2, index=21)),
+    (CodeMotion(), CodeMotionOption(block_nid=75, target_loop_nid=2, index=22)),
+    (CodeMotion(), CodeMotionOption(block_nid=78, target_loop_nid=2, index=23)),
+    (CodeMotion(), CodeMotionOption(block_nid=81, target_loop_nid=2, index=24)),
+    (CodeMotion(), CodeMotionOption(block_nid=84, target_loop_nid=2, index=25)),
+    (CodeMotion(), CodeMotionOption(block_nid=87, target_loop_nid=2, index=26)),
+    (CodeMotion(), CodeMotionOption(block_nid=90, target_loop_nid=2, index=27)),
+    (CodeMotion(), CodeMotionOption(block_nid=93, target_loop_nid=2, index=28)),
+    (CodeMotion(), CodeMotionOption(block_nid=96, target_loop_nid=2, index=29)),
+    (CodeMotion(), CodeMotionOption(block_nid=99, target_loop_nid=2, index=30)),
+    (CodeMotion(), CodeMotionOption(block_nid=102, target_loop_nid=2, index=31)),
+    (CodeMotion(), CodeMotionOption(block_nid=105, target_loop_nid=2, index=32)),
+    (CodeMotion(), CodeMotionOption(block_nid=108, target_loop_nid=2, index=33)),
+    (CodeMotion(), CodeMotionOption(block_nid=111, target_loop_nid=2, index=34)),
+    (CodeMotion(), CodeMotionOption(block_nid=114, target_loop_nid=2, index=35)),
+    (CodeMotion(), CodeMotionOption(block_nid=117, target_loop_nid=2, index=36)),
+    (CodeMotion(), CodeMotionOption(block_nid=120, target_loop_nid=2, index=37)),
+    (CodeMotion(), CodeMotionOption(block_nid=123, target_loop_nid=2, index=38)),
+    (CodeMotion(), CodeMotionOption(block_nid=126, target_loop_nid=2, index=39)),
+    (CodeMotion(), CodeMotionOption(block_nid=129, target_loop_nid=2, index=40)),
+    (CodeMotion(), CodeMotionOption(block_nid=132, target_loop_nid=2, index=41)),
+    (CodeMotion(), CodeMotionOption(block_nid=135, target_loop_nid=2, index=42)),
+    (CodeMotion(), CodeMotionOption(block_nid=138, target_loop_nid=2, index=43)),
+    (CodeMotion(), CodeMotionOption(block_nid=141, target_loop_nid=2, index=44)),
+    (CodeMotion(), CodeMotionOption(block_nid=144, target_loop_nid=2, index=45)),
+    (CodeMotion(), CodeMotionOption(block_nid=147, target_loop_nid=2, index=46)),
+    (CodeMotion(), CodeMotionOption(block_nid=150, target_loop_nid=2, index=47)),
+    (CodeMotion(), CodeMotionOption(block_nid=153, target_loop_nid=2, index=48)),
+    (CodeMotion(), CodeMotionOption(block_nid=156, target_loop_nid=2, index=49)),
+    (CodeMotion(), CodeMotionOption(block_nid=159, target_loop_nid=2, index=50)),
+    (CodeMotion(), CodeMotionOption(block_nid=162, target_loop_nid=2, index=51)),
+    (CodeMotion(), CodeMotionOption(block_nid=165, target_loop_nid=2, index=52)),
+    (CodeMotion(), CodeMotionOption(block_nid=168, target_loop_nid=2, index=53)),
+    (CodeMotion(), CodeMotionOption(block_nid=171, target_loop_nid=2, index=54)),
+    (CodeMotion(), CodeMotionOption(block_nid=174, target_loop_nid=2, index=55)),
+    (CodeMotion(), CodeMotionOption(block_nid=177, target_loop_nid=2, index=56)),
+    (CodeMotion(), CodeMotionOption(block_nid=180, target_loop_nid=2, index=57)),
+    (CodeMotion(), CodeMotionOption(block_nid=183, target_loop_nid=2, index=58)),
+    (CodeMotion(), CodeMotionOption(block_nid=186, target_loop_nid=2, index=59)),
+    (CodeMotion(), CodeMotionOption(block_nid=189, target_loop_nid=2, index=60)),
+    (CodeMotion(), CodeMotionOption(block_nid=192, target_loop_nid=2, index=61)),
+    (CodeMotion(), CodeMotionOption(block_nid=195, target_loop_nid=2, index=62)),
+    (CodeMotion(), CodeMotionOption(block_nid=198, target_loop_nid=2, index=63)),
+    (CodeMotion(), CodeMotionOption(block_nid=201, target_loop_nid=2, index=64)),
+    (CodeMotion(), CodeMotionOption(block_nid=204, target_loop_nid=2, index=65)),
+    (CodeMotion(), CodeMotionOption(block_nid=207, target_loop_nid=2, index=66)),
+    (CodeMotion(), CodeMotionOption(block_nid=210, target_loop_nid=2, index=67)),
+    (CodeMotion(), CodeMotionOption(block_nid=213, target_loop_nid=2, index=68)),
+    (CodeMotion(), CodeMotionOption(block_nid=216, target_loop_nid=2, index=69)),
+    (CodeMotion(), CodeMotionOption(block_nid=219, target_loop_nid=2, index=70)),
+    (CodeMotion(), CodeMotionOption(block_nid=222, target_loop_nid=2, index=71)),
+    (CodeMotion(), CodeMotionOption(block_nid=225, target_loop_nid=2, index=72)),
+    (CodeMotion(), CodeMotionOption(block_nid=228, target_loop_nid=2, index=73)),
+    (CodeMotion(), CodeMotionOption(block_nid=231, target_loop_nid=2, index=74)),
+    (CodeMotion(), CodeMotionOption(block_nid=234, target_loop_nid=2, index=75)),
+    (CodeMotion(), CodeMotionOption(block_nid=237, target_loop_nid=2, index=76)),
+    (CodeMotion(), CodeMotionOption(block_nid=240, target_loop_nid=2, index=77)),
+    (CodeMotion(), CodeMotionOption(block_nid=243, target_loop_nid=2, index=78)),
+    (CodeMotion(), CodeMotionOption(block_nid=246, target_loop_nid=2, index=79)),
+    (CodeMotion(), CodeMotionOption(block_nid=249, target_loop_nid=2, index=80)),
+    (CodeMotion(), CodeMotionOption(block_nid=252, target_loop_nid=2, index=81)),
+    (CodeMotion(), CodeMotionOption(block_nid=255, target_loop_nid=2, index=82)),
+    (CodeMotion(), CodeMotionOption(block_nid=258, target_loop_nid=2, index=83)),
+    (CodeMotion(), CodeMotionOption(block_nid=261, target_loop_nid=2, index=84)),
+    (CodeMotion(), CodeMotionOption(block_nid=264, target_loop_nid=2, index=85)),
+    (CodeMotion(), CodeMotionOption(block_nid=267, target_loop_nid=2, index=86)),
+    (CodeMotion(), CodeMotionOption(block_nid=270, target_loop_nid=2, index=87)),
+    (ProgramShard(), ProgramShardOption(loop_nid=2, axis="d28", programs=2, reduction_tensor=None, stage_drain=False)),
 )
 
 BEST_NKIGYM_LADDERS["rmsnorm_quant_3"] = (
@@ -16987,13 +15985,6 @@ BEST_NKIGYM_LADDERS["qkv_tkg_8"] = (
     (CodeMotion(), CodeMotionOption(block_nid=25, target_loop_nid=30, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=25, target_loop_nid=31, index=0)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_qkv_w_float32_11", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_qkv_w_float32_11", axis=0, anchor_loop_nid=31, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_qkv_w_float32_11", axis=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=2)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=3)),
@@ -17008,19 +15999,6 @@ BEST_NKIGYM_LADDERS["qkv_tkg_8"] = (
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=30, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=31, index=0)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_qkv_w", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_qkv_w", axis=0, anchor_loop_nid=31, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_qkv_w", axis=0)),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=31, axis="d2", programs=1, reduction_tensor="psum_qkv_out", stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=31, axis="d2", programs=2, reduction_tensor="psum_qkv_out", stage_drain=False),
-    ),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=6, consumer_block_nid=16, consumer_operand="data1")),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=10, consumer_block_nid=16, consumer_operand="data2")),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=14, consumer_block_nid=18, consumer_operand="data2")),
@@ -17030,197 +16008,44 @@ BEST_NKIGYM_LADDERS["qkv_tkg_8"] = (
     (Split(), SplitOption(target_nid=29, factors=(3, 128), target_axis="d3")),
     (Split(), SplitOption(target_nid=32, factors=(3, 128), target_axis="d3")),
     (Split(), SplitOption(target_nid=34, factors=(3, 128), target_axis="d3")),
+    (SetBufferAlignment(), SetBufferAlignmentOption(tensor="sbuf_qkv_out_stationary", alignment=8)),
+    (BufferLayout(), BufferLayoutOption(tensor="sbuf_qkv_out_stationary", list_len=1)),
+    (OnChipReshape(), OnChipReshapeOption(load_block_nid=22)),
+    (BatchPermutation(), BatchPermutationOption(loop_nid=42)),
+    (Split(), SplitOption(target_nid=31, factors=(64, 4), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=45, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=25, target_loop_nid=45, index=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_qkv_w", axis=0, anchor_loop_nid=45, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_qkv_w", axis=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_qkv_w_float32_11", axis=0, anchor_loop_nid=45, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_qkv_w_float32_11", axis=0)),
+    (Fuse(), FuseOption(target_nids=(47, 3), target_axis=None, operation_batch=True)),
+    (Fuse(), FuseOption(target_nids=(48, 27), target_axis=None, operation_batch=True)),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=45, axis="d2", programs=1, reduction_tensor="psum_qkv_out", stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=45, axis="d2", programs=2, reduction_tensor="psum_qkv_out", stage_drain=False),
+    ),
     (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=32, column_size=32)),
+    (Split(), SplitOption(target_nid=21, factors=(2, 512), target_axis="d9")),
+    (ProgramShard(), ProgramShardOption(loop_nid=53, axis="d9", programs=2, reduction_tensor=None, stage_drain=False)),
+    (Split(), SplitOption(target_nid=36, factors=(2, 192), target_axis="d3")),
+    (ProgramShard(), ProgramShardOption(loop_nid=54, axis="d3", programs=2, reduction_tensor=None, stage_drain=False)),
 )
 
 BEST_NKIGYM_LADDERS["qkv_tkg_4"] = (
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=2)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=3)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=4)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=5)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=6)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=7)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=8)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=9)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=10)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=11)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=12)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=13)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=14)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=15)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=16)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=17)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=18)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=19)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=20)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=21)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=22)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=23)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=24)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=25)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=26)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=27)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=28)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=29)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=30)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=31)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=32)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=33)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=34)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=35)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=36)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=37)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=38)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=39)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=40)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=41)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=42)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=43)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=44)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=45)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=46)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=47)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=48)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=49)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=50)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=51)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=52)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=53)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=54)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=55)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=56)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=57)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=58)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=59)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=60)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=61)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=62)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=63)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=64)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=65)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=66)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=67)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=68)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=69)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=70)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=71)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=72)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=73)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=74)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=75)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=76)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=77)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=78)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=79)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=80)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=81)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=82)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=83)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=84)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=85)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=86)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=87)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=88)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=89)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=90)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=91)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=92)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=93)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=94)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=95)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=96)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=97)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=98)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=99)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=100)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=101)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=102)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=103)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=104)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=105)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=106)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=107)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=108)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=109)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=110)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=111)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=112)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=113)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=114)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=115)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=116)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=117)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=118)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=119)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=120)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=121)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=122)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=123)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=124)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=125)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=126)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=127)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=128)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=129)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=130)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=131)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=132)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=133)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=134)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=135)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=136)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=137)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=138)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=139)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=140)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=141)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=142)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=143)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=144)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=145)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=146)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=147)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=148)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=149)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=150)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=151)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=152)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=153)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=154)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=155)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=156)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=157)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=158)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=159)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=160)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=161)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=162)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=163)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=164)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=165)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=166)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=167)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=168)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=169)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=170)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=348, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=349, index=0)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_qkv_w", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_qkv_w", axis=0, anchor_loop_nid=349, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_qkv_w", axis=0)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_reciprocal", scope_nid=None, reuse_tensor="sbuf_add")),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=349, axis="d2", programs=1, reduction_tensor="psum_qkv_out", stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=349, axis="d2", programs=2, reduction_tensor="psum_qkv_out", stage_drain=False),
-    ),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=14)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=4)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=17)),
@@ -17309,9 +16134,64 @@ BEST_NKIGYM_LADDERS["qkv_tkg_4"] = (
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=202, consumer_block_nid=204)),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=250, consumer_block_nid=252)),
     (OnChipReshape(), OnChipReshapeOption(load_block_nid=92)),
+    (BatchPermutation(), BatchPermutationOption(loop_nid=361)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=90)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=24)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=22)),
+    (Split(), SplitOption(target_nid=347, factors=(2, 192), target_axis="d3")),
+    (Split(), SplitOption(target_nid=350, factors=(2, 192), target_axis="d3")),
+    (Split(), SplitOption(target_nid=352, factors=(2, 192), target_axis="d3")),
+    (Split(), SplitOption(target_nid=354, factors=(2, 192), target_axis="d3")),
+    (Reorder(), ReorderOption(outer_nid=349, inner_nid=363)),
+    (CodeMotion(), CodeMotionOption(block_nid=346, target_loop_nid=348, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=346, target_loop_nid=349, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=351, target_loop_nid=348, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=351, target_loop_nid=349, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=353, target_loop_nid=348, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=353, target_loop_nid=349, index=3)),
+    (BufferPlacement(), BufferPlacementOption(tensor="psum_qkv_out", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="psum_qkv_out", axis=1, anchor_loop_nid=349, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="psum_qkv_out", axis=1)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_qkv_out", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_qkv_out", axis=1, anchor_loop_nid=349, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_qkv_out", axis=1)),
+    (ProgramShard(), ProgramShardOption(loop_nid=349, axis="d3", programs=2, reduction_tensor=None, stage_drain=False)),
+    (Split(), SplitOption(target_nid=3, factors=(2, 192), target_axis="d3")),
+    (Reorder(), ReorderOption(outer_nid=2, inner_nid=366)),
+    (ProgramShard(), ProgramShardOption(loop_nid=2, axis="d3", programs=2, reduction_tensor=None, stage_drain=False)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_qkv_w", axis=1, anchor_loop_nid=2, program_loop_nids=(2, 349)),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_qkv_w", axis=1)),
+    (SetBufferAlignment(), SetBufferAlignmentOption(tensor="psum_qkv_out", alignment=512)),
+    (Split(), SplitOption(target_nid=363, factors=(16, 4), target_axis=None)),
+    (RFactor(), RFactorOption(target_loop_nid=368, factor_axis=0, factors=None, target_axis=None)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=350, column_size=32)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=351, consumer_block_nid=353, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=351)),
+    (Split(), SplitOption(target_nid=366, factors=(4, 16), target_axis=None)),
+    (Fuse(), FuseOption(target_nids=(376, 3), target_axis=None, operation_batch=True)),
+    (CodeMotion(), CodeMotionOption(block_nid=290, target_loop_nid=0, index=96)),
+    (CodeMotion(), CodeMotionOption(block_nid=290, target_loop_nid=0, index=97)),
+    (CodeMotion(), CodeMotionOption(block_nid=290, target_loop_nid=0, index=98)),
+    (CodeMotion(), CodeMotionOption(block_nid=290, target_loop_nid=0, index=99)),
+    (CodeMotion(), CodeMotionOption(block_nid=290, target_loop_nid=0, index=100)),
+    (CodeMotion(), CodeMotionOption(block_nid=290, target_loop_nid=0, index=101)),
+    (CodeMotion(), CodeMotionOption(block_nid=290, target_loop_nid=0, index=102)),
+    (CodeMotion(), CodeMotionOption(block_nid=290, target_loop_nid=0, index=103)),
+    (CodeMotion(), CodeMotionOption(block_nid=290, target_loop_nid=0, index=104)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=290, consumer_block_nid=310)),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=223, engine="vector")),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=241, engine="vector")),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=261, engine="vector")),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=301, engine="vector")),
 )
 
 BEST_NKIGYM_LADDERS["qkv_tkg_9"] = (
@@ -17448,6 +16328,15 @@ BEST_NKIGYM_LADDERS["qkv_tkg_3"] = (
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_reciprocal", scope_nid=None, reuse_tensor="sbuf_add")),
     (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=61, stages=(), tensor="sbuf_qkv_w", versions=2)),
     (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=61, stages=(0, 1), tensor=None, versions=None)),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=61, stages=(0, 0), tensor=None, versions=None)),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=61, stages=(), tensor="sbuf_qkv_w", versions=1)),
+    (Split(), SplitOption(target_nid=62, factors=(4, 4), target_axis=None)),
+    (RFactor(), RFactorOption(target_loop_nid=67, factor_axis=0, factors=None, target_axis=None)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=53, column_size=32)),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=61, stages=(), tensor="sbuf_qkv_w", versions=2)),
+    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=61, stages=(0, 1), tensor=None, versions=None)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=54, consumer_block_nid=56, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=54)),
 )
 
 BEST_NKIGYM_LADDERS["qkv_tkg_5"] = (
@@ -17601,161 +16490,6 @@ BEST_NKIGYM_LADDERS["qkv_tkg_5"] = (
     (CodeMotion(), CodeMotionOption(block_nid=17, target_loop_nid=0, index=154)),
     (CodeMotion(), CodeMotionOption(block_nid=17, target_loop_nid=0, index=155)),
     (CodeMotion(), CodeMotionOption(block_nid=17, target_loop_nid=0, index=156)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=2)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=3)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=4)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=5)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=6)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=7)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=8)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=9)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=10)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=11)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=12)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=13)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=14)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=15)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=16)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=17)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=18)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=19)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=20)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=21)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=22)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=23)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=24)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=25)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=26)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=27)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=28)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=29)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=30)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=31)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=32)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=33)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=34)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=35)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=36)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=37)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=38)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=39)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=40)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=41)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=42)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=43)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=44)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=45)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=46)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=47)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=48)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=49)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=50)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=51)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=52)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=53)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=54)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=55)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=56)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=57)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=58)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=59)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=60)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=61)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=62)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=63)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=64)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=65)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=66)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=67)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=68)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=69)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=70)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=71)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=72)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=73)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=74)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=75)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=76)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=77)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=78)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=79)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=80)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=81)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=82)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=83)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=84)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=85)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=86)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=87)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=88)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=89)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=90)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=91)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=92)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=93)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=94)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=95)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=96)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=97)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=98)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=99)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=100)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=101)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=102)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=103)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=104)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=105)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=106)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=107)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=108)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=109)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=110)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=111)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=112)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=113)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=114)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=115)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=116)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=117)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=118)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=119)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=120)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=121)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=122)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=123)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=124)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=125)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=126)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=127)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=128)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=129)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=130)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=131)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=132)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=133)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=134)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=135)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=136)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=137)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=138)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=139)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=140)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=141)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=142)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=143)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=144)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=145)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=146)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=147)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=148)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=149)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=150)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=151)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=152)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=153)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=154)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=155)),
     (
         CommonSubexpressionElimination(),
         CommonSubexpressionEliminationOption(
@@ -17770,334 +16504,18 @@ BEST_NKIGYM_LADDERS["qkv_tkg_5"] = (
     ),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=262)),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=218, consumer_block_nid=220)),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_11", scope_nid=None, reuse_tensor="sbuf_mean_sum_13"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_12", scope_nid=None, reuse_tensor="sbuf_mean_sum_14"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_13", scope_nid=None, reuse_tensor="sbuf_mean_sum_15"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_14", scope_nid=None, reuse_tensor="sbuf_mean_sum_16"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_15", scope_nid=None, reuse_tensor="sbuf_mean_sum_17"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_16", scope_nid=None, reuse_tensor="sbuf_mean_sum_18"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_17", scope_nid=None, reuse_tensor="sbuf_mean_sum_19"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_18", scope_nid=None, reuse_tensor="sbuf_mean_sum_20"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_19", scope_nid=None, reuse_tensor="sbuf_mean_sum_21"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_20", scope_nid=None, reuse_tensor="sbuf_mean_sum_22"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_21", scope_nid=None, reuse_tensor="sbuf_mean_sum_23"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_22", scope_nid=None, reuse_tensor="sbuf_mean_sum_24"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_23", scope_nid=None, reuse_tensor="sbuf_mean_sum_25"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_24", scope_nid=None, reuse_tensor="sbuf_mean_sum_26"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_25", scope_nid=None, reuse_tensor="sbuf_mean_sum_27"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_26", scope_nid=None, reuse_tensor="sbuf_mean_sum_28"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_27", scope_nid=None, reuse_tensor="sbuf_mean_sum_29"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_28", scope_nid=None, reuse_tensor="sbuf_mean_sum_30"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_29", scope_nid=None, reuse_tensor="sbuf_mean_sum_31"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_30", scope_nid=None, reuse_tensor="sbuf_mean_sum_32"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_31", scope_nid=None, reuse_tensor="sbuf_mean_sum_33"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_32", scope_nid=None, reuse_tensor="sbuf_mean_sum_34"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_33", scope_nid=None, reuse_tensor="sbuf_mean_sum_35"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_34", scope_nid=None, reuse_tensor="sbuf_mean_sum_36"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_35", scope_nid=None, reuse_tensor="sbuf_mean_sum_37"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_36", scope_nid=None, reuse_tensor="sbuf_mean_sum_38"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_38", scope_nid=None, reuse_tensor="sbuf_mean_sum_9"),
-    ),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_mean", scope_nid=None, reuse_tensor="sbuf_add")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_mean_sum", scope_nid=None, reuse_tensor="sbuf_add")),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_43", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_45", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_46", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_47", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_48", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_49", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_50", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_51", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_52", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_53", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_54", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_55", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_56", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_57", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_58", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_59", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_60", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_61", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_62", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_63", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_64", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_65", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_66", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_67", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_68", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_69", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_70", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_71", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_72", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_73", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_74", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_75", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_76", scope_nid=None, reuse_tensor="sbuf_mean_sum_44"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_77", scope_nid=None, reuse_tensor="sbuf_mean_sum_42"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_80", scope_nid=None, reuse_tensor="sbuf_mean_sum_78"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_81", scope_nid=None, reuse_tensor="sbuf_mean_sum_79"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_8", scope_nid=None, reuse_tensor="sbuf_mean_sum_10"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_82", scope_nid=None, reuse_tensor="sbuf_mean_sum_78"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_83", scope_nid=None, reuse_tensor="sbuf_mean_sum_79"),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_mean_sum_84", scope_nid=None, reuse_tensor="sbuf_mean_sum_78"),
-    ),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_reciprocal", scope_nid=None, reuse_tensor="sbuf_add")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_94", scope_nid=None, reuse_tensor="sbuf_rms")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_95", scope_nid=None, reuse_tensor="sbuf_rms_93")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_107", scope_nid=None, reuse_tensor="sbuf_rms_105")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_113", scope_nid=None, reuse_tensor="sbuf_rms_105")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_103", scope_nid=None, reuse_tensor="sbuf_rms_100")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_122", scope_nid=None, reuse_tensor="sbuf_rms_101")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_125", scope_nid=None, reuse_tensor="sbuf_rms_102")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_127", scope_nid=None, reuse_tensor="sbuf_rms_92")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_129", scope_nid=None, reuse_tensor="sbuf_rms_100")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_131", scope_nid=None, reuse_tensor="sbuf_rms_93")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_132", scope_nid=None, reuse_tensor="sbuf_rms_100")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_133", scope_nid=None, reuse_tensor="sbuf_rms_91")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_137", scope_nid=None, reuse_tensor="sbuf_rms_92")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_138", scope_nid=None, reuse_tensor="sbuf_rms_93")),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=7)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=14)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=4)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_qkv_out_1", scope_nid=None, reuse_tensor="sbuf_qkv_out")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_110", scope_nid=None, reuse_tensor="sbuf_rms_97")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_124", scope_nid=None, reuse_tensor="sbuf_rms_114")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_130", scope_nid=None, reuse_tensor="sbuf_rms_104")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_134", scope_nid=None, reuse_tensor="sbuf_rms_114")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_rms_136", scope_nid=None, reuse_tensor="sbuf_rms_97")),
     (Split(), SplitOption(target_nid=325, factors=(5, 256), target_axis="d3")),
     (CodeMotion(), CodeMotionOption(block_nid=17, target_loop_nid=320, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=17, target_loop_nid=321, index=0)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_qkv_w_cast", scope_nid=None, reuse_tensor=None)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=320, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=321, index=0)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_qkv_w", scope_nid=None, reuse_tensor=None)),
-    (Split(), SplitOption(target_nid=321, factors=(8, 8), target_axis=None)),
-    (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=333, index=0)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_qkv_w", axis=0, anchor_loop_nid=333, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_qkv_w", axis=0)),
-    (Fuse(), FuseOption(target_nids=(335, 3), target_axis=None, operation_batch=True)),
+    (Split(), SplitOption(target_nid=321, factors=(32, 2), target_axis=None)),
     (
         BufferRegionNormalization(),
         BufferRegionNormalizationOption(tensor="sbuf_qkv_w_cast", axis=0, anchor_loop_nid=333, program_loop_nids=()),
     ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_qkv_w_cast", axis=0, anchor_loop_nid=334, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_qkv_w_cast", axis=0)),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=333, axis="d2", programs=1, reduction_tensor="psum_qkv_out", stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=333, axis="d2", programs=2, reduction_tensor="psum_qkv_out", stage_drain=False),
-    ),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=333, stages=(), tensor="sbuf_qkv_w", versions=2)),
-    (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=333, stages=(0, 1), tensor=None, versions=None)),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=22, consumer_block_nid=24, consumer_operand="data")),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=162, consumer_block_nid=166, consumer_operand="data1")),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=164, consumer_block_nid=166, consumer_operand="data2")),
@@ -18115,8 +16533,8 @@ BEST_NKIGYM_LADDERS["qkv_tkg_5"] = (
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=82)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=90)),
     (Split(), SplitOption(target_nid=319, factors=(5, 256), target_axis="d3")),
-    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=323, column_size=32)),
     (OnChipReshape(), OnChipReshapeOption(load_block_nid=88)),
+    (BatchPermutation(), BatchPermutationOption(loop_nid=342)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=86)),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=30, consumer_block_nid=32, consumer_operand="data2")),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=34, consumer_block_nid=36, consumer_operand="data2")),
@@ -18183,13 +16601,40 @@ BEST_NKIGYM_LADDERS["qkv_tkg_5"] = (
     (Split(), SplitOption(target_nid=329, factors=(2, 640), target_axis="d3")),
     (Split(), SplitOption(target_nid=331, factors=(2, 640), target_axis="d3")),
     (CodeMotion(), CodeMotionOption(block_nid=328, target_loop_nid=330, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=328, target_loop_nid=349, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=328, target_loop_nid=345, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=326, target_loop_nid=330, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=326, target_loop_nid=349, index=0)),
-    (ProgramShard(), ProgramShardOption(loop_nid=349, axis="d3", programs=2, reduction_tensor=None, stage_drain=False)),
+    (CodeMotion(), CodeMotionOption(block_nid=326, target_loop_nid=345, index=0)),
+    (ProgramShard(), ProgramShardOption(loop_nid=345, axis="d3", programs=2, reduction_tensor=None, stage_drain=False)),
+    (CodeMotion(), CodeMotionOption(block_nid=17, target_loop_nid=333, index=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_qkv_w_cast", axis=0)),
+    (Fuse(), FuseOption(target_nids=(346, 19), target_axis=None, operation_batch=True)),
+    (Fuse(), FuseOption(target_nids=(335, 319), target_axis="d3", operation_batch=False)),
+    (Split(), SplitOption(target_nid=319, factors=(4, 320), target_axis="d3")),
+    (Split(), SplitOption(target_nid=323, factors=(4, 64), target_axis="d3")),
+    (Fuse(), FuseOption(target_nids=(322, 348), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=349, factors=(4, 5), target_axis=None)),
+    (Split(), SplitOption(target_nid=325, factors=(4, 64), target_axis="d3")),
+    (Fuse(), FuseOption(target_nids=(332, 352), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=353, factors=(4, 5), target_axis=None)),
+    (BufferRegionNormalization(), BufferAxisFoldOption(tensor="psum_qkv_out", free_tile=320)),
+    (SetBufferAlignment(), SetBufferAlignmentOption(tensor="psum_qkv_out", alignment=512)),
+    (Fuse(), FuseOption(target_nids=(351, 323), target_axis="d3", operation_batch=False)),
+    (Fuse(), FuseOption(target_nids=(355, 325), target_axis="d3", operation_batch=False)),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=333, axis="d2", programs=1, reduction_tensor="psum_qkv_out", stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=333, axis="d2", programs=2, reduction_tensor="psum_qkv_out", stage_drain=False),
+    ),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=323, column_size=32)),
+    (ProgramShard(), ProgramShardOption(loop_nid=2, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=3, engine="hwdge")),
 )
 
 BEST_NKIGYM_LADDERS["qkv_tkg_6"] = (
+    (Split(), SplitOption(target_nid=334, factors=(5, 256), target_axis="d3")),
     (CodeMotion(), CodeMotionOption(block_nid=330, target_loop_nid=0, index=165)),
     (CodeMotion(), CodeMotionOption(block_nid=330, target_loop_nid=335, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=330, target_loop_nid=336, index=0)),
@@ -18373,14 +16818,6 @@ BEST_NKIGYM_LADDERS["qkv_tkg_6"] = (
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_qkv_w", axis=0)),
     (Split(), SplitOption(target_nid=340, factors=(5, 256), target_axis="d3")),
     (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=336, axis="d2", programs=1, reduction_tensor="psum_matmul", stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=336, axis="d2", programs=2, reduction_tensor="psum_matmul", stage_drain=False),
-    ),
-    (
         CommonSubexpressionElimination(),
         CommonSubexpressionEliminationOption(
             canonical_block_nid=190, redundant_block_nid=256, consumer_nid=259, consumer_operand="data2"
@@ -18485,12 +16922,52 @@ BEST_NKIGYM_LADDERS["qkv_tkg_6"] = (
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=357)),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=212, consumer_block_nid=214)),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=320, consumer_block_nid=322)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=196, consumer_block_nid=198)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=284, consumer_block_nid=296, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=284)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=4, consumer_block_nid=296, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=4)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=296, consumer_block_nid=298, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=296)),
+    (OnChipReshape(), OnChipReshapeOption(load_block_nid=82)),
+    (BatchPermutation(), BatchPermutationOption(loop_nid=375)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=80)),
+    (Fuse(), FuseOption(target_nids=(367, 334), target_axis="d3", operation_batch=False)),
+    (Split(), SplitOption(target_nid=334, factors=(4, 320), target_axis="d3")),
+    (Split(), SplitOption(target_nid=338, factors=(4, 64), target_axis="d3")),
+    (Fuse(), FuseOption(target_nids=(337, 377), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=378, factors=(4, 5), target_axis=None)),
+    (Split(), SplitOption(target_nid=340, factors=(4, 64), target_axis="d3")),
+    (Fuse(), FuseOption(target_nids=(368, 381), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=382, factors=(4, 5), target_axis=None)),
+    (BufferRegionNormalization(), BufferAxisFoldOption(tensor="psum_matmul", free_tile=320)),
+    (SetBufferAlignment(), SetBufferAlignmentOption(tensor="psum_matmul", alignment=512)),
+    (Fuse(), FuseOption(target_nids=(380, 338), target_axis="d3", operation_batch=False)),
+    (Fuse(), FuseOption(target_nids=(384, 340), target_axis="d3", operation_batch=False)),
+    (
+        SetFirstWriteOverwrite(),
+        SetFirstWriteOverwriteOption(
+            initializer_block_nid=333, reduction_block_nid=335, tensor="psum_matmul", initializer_leaf_nid=334
+        ),
+    ),
+    (
+        EliminateIdentityInitializer(),
+        EliminateIdentityInitializerOption(
+            initializer_block_nid=333, reduction_block_nid=335, tensor="psum_matmul", initializer_leaf_nid=334
+        ),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=336, axis="d2", programs=1, reduction_tensor="psum_matmul", stage_drain=False),
+    ),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=336, axis="d2", programs=2, reduction_tensor="psum_matmul", stage_drain=False),
+    ),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=338, column_size=32)),
     (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=336, stages=(), tensor="sbuf_astype_2", versions=2)),
     (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=336, stages=(), tensor="sbuf_qkv_w", versions=2)),
     (SoftwarePipeline(), SoftwarePipelineOption(loop_nid=336, stages=(0, 0, 1), tensor=None, versions=None)),
-    (Split(), SplitOption(target_nid=334, factors=(5, 256), target_axis="d3")),
-    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=338, column_size=32)),
-    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=196, consumer_block_nid=198)),
 )
 
 BEST_NKIGYM_LADDERS["qkv_tkg_7"] = (
@@ -18536,7 +17013,7 @@ BEST_NKIGYM_LADDERS["qkv_tkg_7"] = (
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=32)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=80, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=81, index=0)),
-    (Split(), SplitOption(target_nid=81, factors=(4, 32), target_axis=None)),
+    (Split(), SplitOption(target_nid=81, factors=(8, 16), target_axis=None)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=87, index=0)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_qkv_w", scope_nid=None, reuse_tensor=None)),
     (
@@ -18577,6 +17054,12 @@ BEST_NKIGYM_LADDERS["mlp_tkg_4"] = (
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=21, index=0)),
     (Reorder(), ReorderOption(outer_nid=37, inner_nid=38)),
     (Split(), SplitOption(target_nid=35, factors=(32, 512), target_axis="d5")),
+    (
+        SetFirstWriteOverwrite(),
+        SetFirstWriteOverwriteOption(
+            initializer_block_nid=34, reduction_block_nid=36, tensor="psum_result_2", initializer_leaf_nid=35
+        ),
+    ),
     (CodeMotion(), CodeMotionOption(block_nid=34, target_loop_nid=37, index=0)),
     (Split(), SplitOption(target_nid=41, factors=(32, 512), target_axis="d5")),
     (CodeMotion(), CodeMotionOption(block_nid=40, target_loop_nid=37, index=2)),
@@ -18603,23 +17086,7 @@ BEST_NKIGYM_LADDERS["mlp_tkg_4"] = (
         BufferRegionNormalizationOption(tensor="sbuf_hidden_tensor", axis=1, anchor_loop_nid=21, program_loop_nids=()),
     ),
     (BufferCompaction(), BufferCompactionOption(tensor="sbuf_hidden_tensor", axis=1)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_stationary", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_result_stationary", axis=0, anchor_loop_nid=21, program_loop_nids=()
-        ),
-    ),
-    (BufferLayout(), BufferLayoutOption(tensor="sbuf_result_stationary", list_len=1)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_stationary", axis=0)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_up_proj_weights_tensor", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_up_proj_weights_tensor", axis=0, anchor_loop_nid=21, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=0)),
     (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_down_proj_weights_tensor", scope_nid=None, reuse_tensor=None),
@@ -18631,14 +17098,6 @@ BEST_NKIGYM_LADDERS["mlp_tkg_4"] = (
         ),
     ),
     (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_down_proj_weights_tensor", axis=1, anchor_loop_nid=37, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=1)),
-    (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_down_proj_weights_tensor_float32_10", scope_nid=None, reuse_tensor=None),
     ),
@@ -18648,42 +17107,76 @@ BEST_NKIGYM_LADDERS["mlp_tkg_4"] = (
             tensor="sbuf_down_proj_weights_tensor_float32_10", axis=0, anchor_loop_nid=38, program_loop_nids=()
         ),
     ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_down_proj_weights_tensor_float32_10", axis=1, anchor_loop_nid=37, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor_float32_10", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor_float32_10", axis=1)),
     (BufferPlacement(), BufferPlacementOption(tensor="psum_result_2", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="psum_result_2", axis=1, anchor_loop_nid=37, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_result_2", axis=1)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_2", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_result_2", axis=1, anchor_loop_nid=37, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_2", axis=1)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result", scope_nid=None, reuse_tensor="sbuf_result_1")),
-    (ProgramShard(), ProgramShardOption(loop_nid=37, axis="d5", programs=2, reduction_tensor=None, stage_drain=False)),
     (Split(), SplitOption(target_nid=25, factors=(7, 128), target_axis="d4")),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=21, axis="d1", programs=1, reduction_tensor="psum_result", stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=21, axis="d1", programs=2, reduction_tensor="psum_result", stage_drain=False),
-    ),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=9, consumer_block_nid=31)),
     (SetCopyEngine(), SetCopyEngineOption(isa_nid=25, engine="scalar")),
     (SetCopyEngine(), SetCopyEngineOption(isa_nid=41, engine="scalar")),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=1, consumer_block_nid=15, consumer_operand="src")),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1)),
+    (Split(), SplitOption(target_nid=19, factors=(2, 448), target_axis="d4")),
+    (Split(), SplitOption(target_nid=23, factors=(2, 64), target_axis="d4")),
+    (Fuse(), FuseOption(target_nids=(22, 52), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=53, factors=(2, 7), target_axis=None)),
+    (Split(), SplitOption(target_nid=25, factors=(2, 64), target_axis="d4")),
+    (Fuse(), FuseOption(target_nids=(50, 56), target_axis=None, operation_batch=False)),
+    (Split(), SplitOption(target_nid=57, factors=(2, 7), target_axis=None)),
+    (BufferRegionNormalization(), BufferAxisFoldOption(tensor="psum_result", free_tile=448)),
+    (SetBufferAlignment(), SetBufferAlignmentOption(tensor="psum_result", alignment=512)),
+    (Fuse(), FuseOption(target_nids=(55, 23), target_axis="d4", operation_batch=False)),
+    (Fuse(), FuseOption(target_nids=(59, 25), target_axis="d4", operation_batch=False)),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=21, axis="d1", programs=1, reduction_tensor="psum_result", stage_drain=False),
+    ),
+    (Split(), SplitOption(target_nid=37, factors=(4, 8), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=34, target_loop_nid=64, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=42, target_loop_nid=64, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=40, target_loop_nid=64, index=2)),
+    (Reorder(), ReorderOption(outer_nid=65, inner_nid=38)),
+    (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=65, index=0)),
+    (Fuse(), FuseOption(target_nids=(69, 11), target_axis="d5", operation_batch=False)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_down_proj_weights_tensor_float32_10", axis=1, anchor_loop_nid=64, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor_float32_10", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor_float32_10", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="psum_result_2", axis=1, anchor_loop_nid=64, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="psum_result_2", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_result_2", axis=1, anchor_loop_nid=64, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_2", axis=1)),
+    (ProgramShard(), ProgramShardOption(loop_nid=64, axis="d5", programs=2, reduction_tensor=None, stage_drain=False)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=39, column_size=32)),
+    (CodeMotion(), CodeMotionOption(block_nid=15, target_loop_nid=21, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=15, target_loop_nid=20, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=15, target_loop_nid=0, index=1)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=23, column_size=32)),
+    (Split(), SplitOption(target_nid=21, factors=(8, 16), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=71, index=0)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_up_proj_weights_tensor", axis=0, anchor_loop_nid=71, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=0)),
+    (Fuse(), FuseOption(target_nids=(73, 8), target_axis=None, operation_batch=True)),
+    (
+        ProgramShard(),
+        ProgramShardOption(loop_nid=71, axis="d1", programs=2, reduction_tensor="psum_result", stage_drain=False),
+    ),
+    (ProgramShard(), ProgramShardOption(loop_nid=70, axis="d1", programs=2, reduction_tensor=None, stage_drain=False)),
 )
 
 BEST_NKIGYM_LADDERS["mlp_tkg_6"] = (
@@ -18720,23 +17213,12 @@ BEST_NKIGYM_LADDERS["mlp_tkg_6"] = (
     (CodeMotion(), CodeMotionOption(block_nid=38, target_loop_nid=41, index=0)),
     (Split(), SplitOption(target_nid=45, factors=(2, 448), target_axis="d2")),
     (CodeMotion(), CodeMotionOption(block_nid=44, target_loop_nid=41, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_matmul_1", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="psum_matmul_1", axis=1, anchor_loop_nid=41, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_matmul_1", axis=1)),
     (Reorder(), ReorderOption(outer_nid=60, inner_nid=61)),
     (Split(), SplitOption(target_nid=58, factors=(32, 512), target_axis="d3")),
     (CodeMotion(), CodeMotionOption(block_nid=57, target_loop_nid=60, index=0)),
     (Split(), SplitOption(target_nid=64, factors=(32, 512), target_axis="d3")),
     (CodeMotion(), CodeMotionOption(block_nid=63, target_loop_nid=60, index=2)),
     (BufferPlacement(), BufferPlacementOption(tensor="psum_matmul_2", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="psum_matmul_2", axis=1, anchor_loop_nid=60, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_matmul_2", axis=1)),
     (Split(), SplitOption(target_nid=71, factors=(16, 8), target_axis=None)),
     (Split(), SplitOption(target_nid=5, factors=(2, 448), target_axis="d2")),
     (Split(), SplitOption(target_nid=4, factors=(16, 8), target_axis=None)),
@@ -18776,36 +17258,8 @@ BEST_NKIGYM_LADDERS["mlp_tkg_6"] = (
     (Split(), SplitOption(target_nid=7, factors=(16, 8), target_axis=None)),
     (Reorder(), ReorderOption(outer_nid=92, inner_nid=90)),
     (Reorder(), ReorderOption(outer_nid=91, inner_nid=92)),
-    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=0, index=2)),
-    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=0, index=3)),
-    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=0, index=4)),
-    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=0, index=5)),
-    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=0, index=6)),
-    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=0, index=7)),
-    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=0, index=8)),
-    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=40, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=41, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=41, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=88, index=0)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_up_proj_weights_tensor", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_up_proj_weights_tensor", axis=0, anchor_loop_nid=88, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_up_proj_weights_tensor", axis=1, anchor_loop_nid=41, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=1)),
-    (Fuse(), FuseOption(target_nids=(90, 8), target_axis=None, operation_batch=True)),
     (Split(), SplitOption(target_nid=11, factors=(32, 512), target_axis="d3")),
     (Reorder(), ReorderOption(outer_nid=10, inner_nid=93)),
-    (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=2)),
     (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=3)),
     (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=4)),
     (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=5)),
@@ -18817,6 +17271,7 @@ BEST_NKIGYM_LADDERS["mlp_tkg_6"] = (
     (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=11)),
     (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=12)),
     (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=13)),
+    (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=0, index=14)),
     (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=59, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=60, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=60, index=1)),
@@ -18824,33 +17279,14 @@ BEST_NKIGYM_LADDERS["mlp_tkg_6"] = (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_down_proj_weights_tensor", scope_nid=None, reuse_tensor=None),
     ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_down_proj_weights_tensor", axis=1, anchor_loop_nid=60, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=1)),
-    (Fuse(), FuseOption(target_nids=(93, 11), target_axis=None, operation_batch=True)),
     (Split(), SplitOption(target_nid=66, factors=(32, 512), target_axis="d3")),
     (CodeMotion(), CodeMotionOption(block_nid=65, target_loop_nid=59, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=65, target_loop_nid=60, index=4)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_matmul_2", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_matmul_2", axis=1, anchor_loop_nid=60, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_matmul_2", axis=1)),
     (Split(), SplitOption(target_nid=68, factors=(32, 512), target_axis="d3")),
     (CodeMotion(), CodeMotionOption(block_nid=67, target_loop_nid=59, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=67, target_loop_nid=60, index=5)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_3", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_result_3", axis=1, anchor_loop_nid=60, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_3", axis=1)),
-    (ProgramShard(), ProgramShardOption(loop_nid=60, axis="d3", programs=2, reduction_tensor=None, stage_drain=False)),
     (
         ProgramShard(),
         ProgramShardOption(loop_nid=83, axis="d1", programs=1, reduction_tensor="psum_matmul", stage_drain=True),
@@ -18863,6 +17299,21 @@ BEST_NKIGYM_LADDERS["mlp_tkg_6"] = (
         ProgramShard(),
         ProgramShardOption(loop_nid=83, axis="d1", programs=2, reduction_tensor="psum_matmul", stage_drain=False),
     ),
+    (CodeMotion(), CodeMotionOption(block_nid=38, target_loop_nid=40, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=44, target_loop_nid=40, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=38, target_loop_nid=0, index=8)),
+    (CodeMotion(), CodeMotionOption(block_nid=44, target_loop_nid=0, index=10)),
+    (CodeMotion(), CodeMotionOption(block_nid=38, target_loop_nid=0, index=7)),
+    (CodeMotion(), CodeMotionOption(block_nid=38, target_loop_nid=0, index=6)),
+    (CodeMotion(), CodeMotionOption(block_nid=40, target_loop_nid=0, index=8)),
+    (CodeMotion(), CodeMotionOption(block_nid=40, target_loop_nid=0, index=7)),
+    (CodeMotion(), CodeMotionOption(block_nid=40, target_loop_nid=27, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=40, target_loop_nid=28, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=38, target_loop_nid=27, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=38, target_loop_nid=28, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=44, target_loop_nid=0, index=7)),
+    (CodeMotion(), CodeMotionOption(block_nid=44, target_loop_nid=27, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=44, target_loop_nid=28, index=5)),
     (
         ProgramShard(),
         ProgramShardOption(loop_nid=88, axis="d1", programs=1, reduction_tensor="psum_matmul_1", stage_drain=True),
@@ -18875,6 +17326,82 @@ BEST_NKIGYM_LADDERS["mlp_tkg_6"] = (
         ProgramShard(),
         ProgramShardOption(loop_nid=88, axis="d1", programs=2, reduction_tensor="psum_matmul_1", stage_drain=False),
     ),
+    (CodeMotion(), CodeMotionOption(block_nid=40, target_loop_nid=28, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=40, target_loop_nid=83, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=40, target_loop_nid=83, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=40, target_loop_nid=84, index=0)),
+    (BufferPlacement(), BufferPlacementOption(tensor="psum_matmul_1", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="psum_matmul_1", axis=1, anchor_loop_nid=28, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="psum_matmul_1", axis=1)),
+    (ProgramShard(), ProgramShardOption(loop_nid=92, axis="d1", programs=2, reduction_tensor=None, stage_drain=False)),
+    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=0, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=0, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=0, index=4)),
+    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=0, index=5)),
+    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=27, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=28, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=28, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=28, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=83, index=0)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_up_proj_weights_tensor", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_up_proj_weights_tensor", axis=0, anchor_loop_nid=83, program_loop_nids=()
+        ),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_up_proj_weights_tensor", axis=1, anchor_loop_nid=28, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=1)),
+    (Fuse(), FuseOption(target_nids=(90, 8), target_axis=None, operation_batch=True)),
+    (Split(), SplitOption(target_nid=60, factors=(8, 4), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=57, target_loop_nid=110, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=67, target_loop_nid=110, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=65, target_loop_nid=110, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=63, target_loop_nid=110, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=61, index=0)),
+    (Reorder(), ReorderOption(outer_nid=111, inner_nid=61)),
+    (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=111, index=0)),
+    (Fuse(), FuseOption(target_nids=(116, 11), target_axis="d3", operation_batch=False)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_down_proj_weights_tensor", axis=0, anchor_loop_nid=111, program_loop_nids=()
+        ),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_down_proj_weights_tensor", axis=1, anchor_loop_nid=110, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="psum_matmul_2", axis=1, anchor_loop_nid=110, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="psum_matmul_2", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_matmul_2", axis=1, anchor_loop_nid=110, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_matmul_2", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_result_3", axis=1, anchor_loop_nid=110, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_3", axis=1)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=62, column_size=32)),
+    (ProgramShard(), ProgramShardOption(loop_nid=110, axis="d3", programs=2, reduction_tensor=None, stage_drain=False)),
 )
 
 BEST_NKIGYM_LADDERS["mlp_tkg_5"] = (
@@ -18899,26 +17426,13 @@ BEST_NKIGYM_LADDERS["mlp_tkg_5"] = (
     (BufferCompaction(), BufferCompactionOption(tensor="psum_matmul", axis=1)),
     (Reorder(), ReorderOption(outer_nid=67, inner_nid=120)),
     (Split(), SplitOption(target_nid=65, factors=(2, 448), target_axis="d3")),
-    (CodeMotion(), CodeMotionOption(block_nid=64, target_loop_nid=67, index=0)),
     (Split(), SplitOption(target_nid=71, factors=(2, 448), target_axis="d3")),
-    (CodeMotion(), CodeMotionOption(block_nid=70, target_loop_nid=67, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_matmul_1", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="psum_matmul_1", axis=1, anchor_loop_nid=67, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_matmul_1", axis=1)),
     (Reorder(), ReorderOption(outer_nid=103, inner_nid=104)),
     (Split(), SplitOption(target_nid=101, factors=(32, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=100, target_loop_nid=103, index=0)),
     (Split(), SplitOption(target_nid=107, factors=(32, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=106, target_loop_nid=103, index=2)),
     (BufferPlacement(), BufferPlacementOption(tensor="psum_matmul_2", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="psum_matmul_2", axis=1, anchor_loop_nid=103, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_matmul_2", axis=1)),
     (Split(), SplitOption(target_nid=116, factors=(16, 8), target_axis=None)),
     (Split(), SplitOption(target_nid=3, factors=(2, 448), target_axis="d3")),
     (Split(), SplitOption(target_nid=2, factors=(16, 8), target_axis=None)),
@@ -19000,26 +17514,6 @@ BEST_NKIGYM_LADDERS["mlp_tkg_5"] = (
     (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=23)),
     (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=24)),
     (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=25)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=66, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=67, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=67, index=1)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=133, index=0)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_up_proj_weights_tensor", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_up_proj_weights_tensor", axis=0, anchor_loop_nid=133, program_loop_nids=()
-        ),
-    ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_up_proj_weights_tensor", axis=1, anchor_loop_nid=67, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=0)),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=1)),
-    (Fuse(), FuseOption(target_nids=(135, 6), target_axis=None, operation_batch=True)),
     (Split(), SplitOption(target_nid=9, factors=(32, 512), target_axis="d4")),
     (Reorder(), ReorderOption(outer_nid=8, inner_nid=138)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=1)),
@@ -19060,6 +17554,9 @@ BEST_NKIGYM_LADDERS["mlp_tkg_5"] = (
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=36)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=37)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=38)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=39)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=40)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=41)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=102, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=103, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=103, index=1)),
@@ -19067,32 +17564,14 @@ BEST_NKIGYM_LADDERS["mlp_tkg_5"] = (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_down_proj_weights_tensor", scope_nid=None, reuse_tensor=None),
     ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_down_proj_weights_tensor", axis=1, anchor_loop_nid=103, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=1)),
-    (Fuse(), FuseOption(target_nids=(138, 9), target_axis=None, operation_batch=True)),
     (Split(), SplitOption(target_nid=109, factors=(32, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=108, target_loop_nid=102, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=108, target_loop_nid=103, index=4)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_matmul_2", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_matmul_2", axis=1, anchor_loop_nid=103, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_matmul_2", axis=1)),
     (Split(), SplitOption(target_nid=111, factors=(32, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=110, target_loop_nid=102, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=110, target_loop_nid=103, index=5)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_5", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_result_5", axis=1, anchor_loop_nid=103, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_5", axis=1)),
     (Split(), SplitOption(target_nid=15, factors=(32, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=0, index=3)),
     (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=0, index=4)),
@@ -19129,41 +17608,16 @@ BEST_NKIGYM_LADDERS["mlp_tkg_5"] = (
     (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=0, index=35)),
     (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=0, index=36)),
     (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=0, index=37)),
+    (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=0, index=38)),
+    (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=0, index=39)),
+    (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=0, index=40)),
     (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=102, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=103, index=0)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_down_w_scale", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_down_w_scale", axis=1, anchor_loop_nid=103, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_w_scale", axis=1)),
     (Split(), SplitOption(target_nid=113, factors=(32, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=112, target_loop_nid=102, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=112, target_loop_nid=103, index=7)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_6", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_result_6", axis=1, anchor_loop_nid=103, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_6", axis=1)),
-    (ProgramShard(), ProgramShardOption(loop_nid=103, axis="d4", programs=2, reduction_tensor=None, stage_drain=False)),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_gate_w_scale", scope_nid=None, reuse_tensor="sbuf_matmul_2_stationary_float32"
-        ),
-    ),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_hidden", scope_nid=None, reuse_tensor="sbuf_projection_input"),
-    ),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_intermediate", scope_nid=None, reuse_tensor="sbuf_matmul")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_matmul_1", scope_nid=None, reuse_tensor="sbuf_result")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_matmul_2", scope_nid=None, reuse_tensor="sbuf_result_5")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result", scope_nid=None, reuse_tensor="sbuf_result_2")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_1", scope_nid=None, reuse_tensor="sbuf_result_4")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_2", scope_nid=None, reuse_tensor="sbuf_result_3")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_5", scope_nid=None, reuse_tensor="sbuf_result_6")),
     (
         ProgramShard(),
         ProgramShardOption(loop_nid=128, axis="d2", programs=1, reduction_tensor="psum_matmul", stage_drain=True),
@@ -19196,10 +17650,87 @@ BEST_NKIGYM_LADDERS["mlp_tkg_5"] = (
     (Split(), SplitOption(target_nid=71, factors=(2, 224), target_axis="d3")),
     (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=57, column_size=32)),
     (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=69, column_size=32)),
-    (Split(), SplitOption(target_nid=101, factors=(2, 256), target_axis="d4")),
-    (Split(), SplitOption(target_nid=105, factors=(2, 256), target_axis="d4")),
-    (Split(), SplitOption(target_nid=107, factors=(2, 256), target_axis="d4")),
+    (CodeMotion(), CodeMotionOption(block_nid=64, target_loop_nid=0, index=23)),
+    (CodeMotion(), CodeMotionOption(block_nid=64, target_loop_nid=0, index=22)),
+    (CodeMotion(), CodeMotionOption(block_nid=64, target_loop_nid=0, index=21)),
+    (CodeMotion(), CodeMotionOption(block_nid=64, target_loop_nid=0, index=20)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=23)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=22)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=21)),
+    (CodeMotion(), CodeMotionOption(block_nid=66, target_loop_nid=0, index=24)),
+    (CodeMotion(), CodeMotionOption(block_nid=66, target_loop_nid=0, index=23)),
+    (CodeMotion(), CodeMotionOption(block_nid=66, target_loop_nid=54, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=66, target_loop_nid=55, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=66, target_loop_nid=55, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=66, target_loop_nid=128, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=66, target_loop_nid=129, index=1)),
+    (ProgramShard(), ProgramShardOption(loop_nid=137, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=54, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=55, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=55, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=128, index=0)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_up_proj_weights_tensor", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_up_proj_weights_tensor", axis=0, anchor_loop_nid=128, program_loop_nids=()
+        ),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_up_proj_weights_tensor", axis=1, anchor_loop_nid=55, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=1)),
+    (Fuse(), FuseOption(target_nids=(135, 6), target_axis=None, operation_batch=True)),
+    (Split(), SplitOption(target_nid=103, factors=(8, 4), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=100, target_loop_nid=162, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=100, target_loop_nid=161, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=112, target_loop_nid=161, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=110, target_loop_nid=161, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=108, target_loop_nid=161, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=106, target_loop_nid=161, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=161, index=1)),
+    (Fuse(), FuseOption(target_nids=(168, 15), target_axis="d4", operation_batch=False)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=104, index=0)),
+    (Reorder(), ReorderOption(outer_nid=162, inner_nid=104)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=162, index=0)),
+    (Fuse(), FuseOption(target_nids=(169, 9), target_axis="d4", operation_batch=False)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_down_proj_weights_tensor", axis=0, anchor_loop_nid=162, program_loop_nids=()
+        ),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_down_proj_weights_tensor", axis=1, anchor_loop_nid=161, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="psum_matmul_2", axis=1, anchor_loop_nid=161, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="psum_matmul_2", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_result_6", axis=1, anchor_loop_nid=161, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_6", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_down_w_scale", axis=1, anchor_loop_nid=161, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_w_scale", axis=1)),
     (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=105, column_size=32)),
+    (ProgramShard(), ProgramShardOption(loop_nid=161, axis="d4", programs=2, reduction_tensor=None, stage_drain=False)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=18, consumer_block_nid=44, consumer_operand="data")),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=88, consumer_block_nid=90)),
 )
 
 BEST_NKIGYM_LADDERS["mlp_tkg_3"] = (
@@ -19210,11 +17741,6 @@ BEST_NKIGYM_LADDERS["mlp_tkg_3"] = (
     (Split(), SplitOption(target_nid=151, factors=(16, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=150, target_loop_nid=147, index=2)),
     (BufferPlacement(), BufferPlacementOption(tensor="psum_matmul_2", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="psum_matmul_2", axis=1, anchor_loop_nid=147, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_matmul_2", axis=1)),
     (Split(), SplitOption(target_nid=101, factors=(8, 8), target_axis=None)),
     (Split(), SplitOption(target_nid=2, factors=(8, 8), target_axis=None)),
     (CodeMotion(), CodeMotionOption(block_nid=1, target_loop_nid=0, index=1)),
@@ -19331,17 +17857,6 @@ BEST_NKIGYM_LADDERS["mlp_tkg_3"] = (
     (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=49)),
     (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=50)),
     (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=51)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=111, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=164, index=0)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_up_proj_weights_tensor", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_up_proj_weights_tensor", axis=0, anchor_loop_nid=164, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=0)),
-    (Fuse(), FuseOption(target_nids=(167, 6), target_axis=None, operation_batch=True)),
     (Split(), SplitOption(target_nid=9, factors=(16, 512), target_axis="d4")),
     (Reorder(), ReorderOption(outer_nid=8, inner_nid=168)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=1)),
@@ -19409,6 +17924,7 @@ BEST_NKIGYM_LADDERS["mlp_tkg_3"] = (
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=63)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=64)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=65)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=0, index=66)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=146, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=147, index=0)),
     (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=147, index=1)),
@@ -19416,63 +17932,20 @@ BEST_NKIGYM_LADDERS["mlp_tkg_3"] = (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_down_proj_weights_tensor", scope_nid=None, reuse_tensor=None),
     ),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(
-            tensor="sbuf_down_proj_weights_tensor", axis=1, anchor_loop_nid=147, program_loop_nids=()
-        ),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=1)),
-    (Fuse(), FuseOption(target_nids=(168, 9), target_axis=None, operation_batch=True)),
     (Split(), SplitOption(target_nid=153, factors=(16, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=152, target_loop_nid=146, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=152, target_loop_nid=147, index=4)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_matmul_2", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_matmul_2", axis=1, anchor_loop_nid=147, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_matmul_2", axis=1)),
     (Split(), SplitOption(target_nid=155, factors=(16, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=154, target_loop_nid=146, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=154, target_loop_nid=147, index=5)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_5", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_result_5", axis=1, anchor_loop_nid=147, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_5", axis=1)),
     (Split(), SplitOption(target_nid=157, factors=(16, 512), target_axis="d4")),
     (CodeMotion(), CodeMotionOption(block_nid=156, target_loop_nid=146, index=1)),
     (CodeMotion(), CodeMotionOption(block_nid=156, target_loop_nid=147, index=6)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_6", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="sbuf_result_6", axis=1, anchor_loop_nid=147, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_6", axis=1)),
-    (ProgramShard(), ProgramShardOption(loop_nid=147, axis="d4", programs=2, reduction_tensor=None, stage_drain=False)),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=24, consumer_block_nid=26)),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_square", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(
-            tensor="sbuf_gate_w_scale", scope_nid=None, reuse_tensor="sbuf_matmul_2_stationary_float32"
-        ),
-    ),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_hidden", scope_nid=None, reuse_tensor="sbuf_norm")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_intermediate", scope_nid=None, reuse_tensor="sbuf_matmul")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_matmul_1", scope_nid=None, reuse_tensor="sbuf_result")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_matmul_2", scope_nid=None, reuse_tensor="sbuf_result_5")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_norm", scope_nid=None, reuse_tensor="sbuf_norm_1")),
-    (
-        BufferPlacement(),
-        BufferPlacementOption(tensor="sbuf_norm_1", scope_nid=None, reuse_tensor="sbuf_projection_input"),
-    ),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result", scope_nid=None, reuse_tensor="sbuf_result_2")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_1", scope_nid=None, reuse_tensor="sbuf_result_4")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_2", scope_nid=None, reuse_tensor="sbuf_result_3")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_result_5", scope_nid=None, reuse_tensor="sbuf_result_6")),
     (
         ProgramShard(),
         ProgramShardOption(loop_nid=160, axis="d2", programs=1, reduction_tensor="psum_matmul", stage_drain=True),
@@ -19506,6 +17979,77 @@ BEST_NKIGYM_LADDERS["mlp_tkg_3"] = (
     (Split(), SplitOption(target_nid=115, factors=(2, 256), target_axis="d3")),
     (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=102, column_size=32)),
     (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=113, column_size=32)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=22, consumer_block_nid=54, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=22)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=10, consumer_block_nid=54, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=10)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=54, consumer_block_nid=56, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=54)),
+    (CodeMotion(), CodeMotionOption(block_nid=109, target_loop_nid=0, index=44)),
+    (CodeMotion(), CodeMotionOption(block_nid=109, target_loop_nid=0, index=43)),
+    (CodeMotion(), CodeMotionOption(block_nid=109, target_loop_nid=0, index=42)),
+    (CodeMotion(), CodeMotionOption(block_nid=109, target_loop_nid=0, index=41)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=45)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=44)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=43)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=0, index=42)),
+    (CodeMotion(), CodeMotionOption(block_nid=111, target_loop_nid=0, index=46)),
+    (CodeMotion(), CodeMotionOption(block_nid=111, target_loop_nid=0, index=45)),
+    (CodeMotion(), CodeMotionOption(block_nid=111, target_loop_nid=0, index=44)),
+    (CodeMotion(), CodeMotionOption(block_nid=111, target_loop_nid=100, index=1)),
+    (CodeMotion(), CodeMotionOption(block_nid=111, target_loop_nid=160, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=111, target_loop_nid=161, index=1)),
+    (ProgramShard(), ProgramShardOption(loop_nid=166, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=100, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=4, target_loop_nid=160, index=0)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_up_proj_weights_tensor", scope_nid=None, reuse_tensor=None)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_up_proj_weights_tensor", axis=0, anchor_loop_nid=160, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_up_proj_weights_tensor", axis=0)),
+    (Fuse(), FuseOption(target_nids=(167, 6), target_axis=None, operation_batch=True)),
+    (Split(), SplitOption(target_nid=147, factors=(2, 8), target_axis=None)),
+    (CodeMotion(), CodeMotionOption(block_nid=144, target_loop_nid=190, index=0)),
+    (CodeMotion(), CodeMotionOption(block_nid=156, target_loop_nid=190, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=154, target_loop_nid=190, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=152, target_loop_nid=190, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=150, target_loop_nid=190, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=148, index=0)),
+    (Reorder(), ReorderOption(outer_nid=191, inner_nid=148)),
+    (CodeMotion(), CodeMotionOption(block_nid=7, target_loop_nid=191, index=0)),
+    (Fuse(), FuseOption(target_nids=(197, 9), target_axis="d4", operation_batch=False)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_down_proj_weights_tensor", axis=0, anchor_loop_nid=191, program_loop_nids=()
+        ),
+    ),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(
+            tensor="sbuf_down_proj_weights_tensor", axis=1, anchor_loop_nid=190, program_loop_nids=()
+        ),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=0)),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_down_proj_weights_tensor", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="psum_matmul_2", axis=1, anchor_loop_nid=190, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="psum_matmul_2", axis=1)),
+    (
+        BufferRegionNormalization(),
+        BufferRegionNormalizationOption(tensor="sbuf_result_6", axis=1, anchor_loop_nid=190, program_loop_nids=()),
+    ),
+    (BufferCompaction(), BufferCompactionOption(tensor="sbuf_result_6", axis=1)),
+    (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=149, column_size=32)),
+    (ProgramShard(), ProgramShardOption(loop_nid=190, axis="d4", programs=2, reduction_tensor=None, stage_drain=False)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=20, consumer_block_nid=52, consumer_operand="data")),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=43, engine="vector")),
+    (SetCopyEngine(), SetCopyEngineOption(isa_nid=75, engine="vector")),
 )
 
 
@@ -20550,322 +19094,443 @@ BEST_NKIGYM_LADDERS["rotational_topk_10"] = (
 
 
 BEST_NKIGYM_LADDERS["rotational_topk_11"] = (
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=93)),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=27, consumer_block_nid=31, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=29, consumer_block_nid=31, consumer_operand="data2")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=665, consumer_block_nid=671, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=667, consumer_block_nid=669, consumer_operand="src")),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=27)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=29)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=665)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=667)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_355", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_356", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_84", scope_nid=None, reuse_tensor="sbuf_topk_96")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_85", scope_nid=None, reuse_tensor="sbuf_topk_104")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_87", scope_nid=None, reuse_tensor="sbuf_topk_94")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_88", scope_nid=None, reuse_tensor="sbuf_topk_90")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_89", scope_nid=None, reuse_tensor="sbuf_topk_92")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_90", scope_nid=None, reuse_tensor="sbuf_topk_93")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_91", scope_nid=None, reuse_tensor="sbuf_topk_95")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_92", scope_nid=None, reuse_tensor="sbuf_topk_98")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_93", scope_nid=None, reuse_tensor="sbuf_topk_141")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_94", scope_nid=None, reuse_tensor="sbuf_topk_145")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_95", scope_nid=None, reuse_tensor="sbuf_topk_148")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_96", scope_nid=None, reuse_tensor="sbuf_topk_99")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_98", scope_nid=None, reuse_tensor="sbuf_topk_27")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_99", scope_nid=None, reuse_tensor="sbuf_topk_102")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_102", scope_nid=None, reuse_tensor="sbuf_topk_105")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_104", scope_nid=None, reuse_tensor="sbuf_topk_254")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_105", scope_nid=None, reuse_tensor="sbuf_topk_111")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_108", scope_nid=None, reuse_tensor="sbuf_topk_142")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_111", scope_nid=None, reuse_tensor="sbuf_topk_146")),
+    (OnChipReshape(), OnChipReshapeOption(load_block_nid=69)),
+    (BatchPermutation(), BatchPermutationOption(loop_nid=844)),
+    (OnChipReshape(), OnChipReshapeOption(load_block_nid=73)),
+    (BatchPermutation(), BatchPermutationOption(loop_nid=851)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=3)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=67)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=71)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=205)),
+    (
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=157, redundant_block_nid=159, consumer_nid=162, consumer_operand="data"
+        ),
+    ),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=159)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=15, consumer_block_nid=17, consumer_operand="data")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=15, consumer_block_nid=23, consumer_operand="on_true")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=15)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=43, consumer_block_nid=47, consumer_operand="data1")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=43)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=45, consumer_block_nid=47, consumer_operand="data2")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=45)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=51, consumer_block_nid=53, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=51)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=57, consumer_block_nid=838, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=97, consumer_block_nid=101, consumer_operand="data1")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=97)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=99, consumer_block_nid=101, consumer_operand="data2")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=99)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=105, consumer_block_nid=107, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=105)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=111, consumer_block_nid=151, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=113, consumer_block_nid=115, consumer_operand="indices")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=113)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=119, consumer_block_nid=121, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=119)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=125, consumer_block_nid=127, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=125)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=57, consumer_block_nid=127, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=57)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=141, consumer_block_nid=143, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=141)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=111, consumer_block_nid=143, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=111)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=777, consumer_block_nid=783, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=777)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=779, consumer_block_nid=781, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=779)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=165, consumer_block_nid=167)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=209, consumer_block_nid=211)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=245, consumer_block_nid=247)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=325, consumer_block_nid=327)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=443, consumer_block_nid=445)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=523, consumer_block_nid=525)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=633, consumer_block_nid=635)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=713, consumer_block_nid=715)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_411", scope_nid=None, reuse_tensor=None)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_412", scope_nid=None, reuse_tensor=None)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_0", scope_nid=None, reuse_tensor="sbuf_topk_81")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_10", scope_nid=None, reuse_tensor="sbuf_topk_9")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_101", scope_nid=None, reuse_tensor="sbuf_topk_416")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_102", scope_nid=None, reuse_tensor="sbuf_topk_81")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_103", scope_nid=None, reuse_tensor="sbuf_topk_310")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_104", scope_nid=None, reuse_tensor="sbuf_topk_83")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_106", scope_nid=None, reuse_tensor="sbuf_topk_94")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_108", scope_nid=None, reuse_tensor="sbuf_topk_111")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_109", scope_nid=None, reuse_tensor="sbuf_topk_417")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_111", scope_nid=None, reuse_tensor="sbuf_topk_204")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_112", scope_nid=None, reuse_tensor="sbuf_topk_95")),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_114", scope_nid=None, reuse_tensor="sbuf_topk_115")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_115", scope_nid=None, reuse_tensor="sbuf_topk_118")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_116", scope_nid=None, reuse_tensor="sbuf_topk_121")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_117", scope_nid=None, reuse_tensor="sbuf_topk_133")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_118", scope_nid=None, reuse_tensor="sbuf_topk_360")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_119", scope_nid=None, reuse_tensor="sbuf_topk_120")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_120", scope_nid=None, reuse_tensor="sbuf_topk_122")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_121", scope_nid=None, reuse_tensor="sbuf_topk_139")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_122", scope_nid=None, reuse_tensor="sbuf_topk_38")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_124", scope_nid=None, reuse_tensor="sbuf_topk_131")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_125", scope_nid=None, reuse_tensor="sbuf_topk_127")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_126", scope_nid=None, reuse_tensor="sbuf_topk_129")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_127", scope_nid=None, reuse_tensor="sbuf_topk_130")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_128", scope_nid=None, reuse_tensor="sbuf_topk_132")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_129", scope_nid=None, reuse_tensor="sbuf_topk_39")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_130", scope_nid=None, reuse_tensor="sbuf_topk_51")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_131", scope_nid=None, reuse_tensor="sbuf_topk_52")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_132", scope_nid=None, reuse_tensor="sbuf_topk_55")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_136", scope_nid=None, reuse_tensor="sbuf_topk_361")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_139", scope_nid=None, reuse_tensor="sbuf_topk_53")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_141", scope_nid=None, reuse_tensor="sbuf_topk_58")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_150", scope_nid=None, reuse_tensor="sbuf_topk_152")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_151", scope_nid=None, reuse_tensor="sbuf_topk_155")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_152", scope_nid=None, reuse_tensor="sbuf_topk_251")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_154", scope_nid=None, reuse_tensor="sbuf_topk_156")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_155", scope_nid=None, reuse_tensor="sbuf_topk_167")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_156", scope_nid=None, reuse_tensor="sbuf_topk_56")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_158", scope_nid=None, reuse_tensor="sbuf_topk_159")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_160", scope_nid=None, reuse_tensor="sbuf_topk_162")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_161", scope_nid=None, reuse_tensor="sbuf_topk_164")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_162", scope_nid=None, reuse_tensor="sbuf_topk_165")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_163", scope_nid=None, reuse_tensor="sbuf_topk_166")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_167", scope_nid=None, reuse_tensor="sbuf_topk_252")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_170", scope_nid=None, reuse_tensor="sbuf_topk_248")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_173", scope_nid=None, reuse_tensor="sbuf_topk_54")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_176", scope_nid=None, reuse_tensor="sbuf_topk_159")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_178", scope_nid=None, reuse_tensor="sbuf_topk_164")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_179", scope_nid=None, reuse_tensor="sbuf_topk_165")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_180", scope_nid=None, reuse_tensor="sbuf_topk_166")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_181", scope_nid=None, reuse_tensor="sbuf_topk_247")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_182", scope_nid=None, reuse_tensor="sbuf_topk_193")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_183", scope_nid=None, reuse_tensor="sbuf_topk_184")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_184", scope_nid=None, reuse_tensor="sbuf_topk_186")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_185", scope_nid=None, reuse_tensor="sbuf_topk_190")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_186", scope_nid=None, reuse_tensor="sbuf_topk_210")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_187", scope_nid=None, reuse_tensor="sbuf_topk_157")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_188", scope_nid=None, reuse_tensor="sbuf_topk_189")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_189", scope_nid=None, reuse_tensor="sbuf_topk_191")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_190", scope_nid=None, reuse_tensor="sbuf_topk_202")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_191", scope_nid=None, reuse_tensor="sbuf_topk_56")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_193", scope_nid=None, reuse_tensor="sbuf_topk_200")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_194", scope_nid=None, reuse_tensor="sbuf_topk_196")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_195", scope_nid=None, reuse_tensor="sbuf_topk_198")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_196", scope_nid=None, reuse_tensor="sbuf_topk_199")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_197", scope_nid=None, reuse_tensor="sbuf_topk_201")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_198", scope_nid=None, reuse_tensor="sbuf_topk_204")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_202", scope_nid=None, reuse_tensor="sbuf_topk_205")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_205", scope_nid=None, reuse_tensor="sbuf_topk_208")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_208", scope_nid=None, reuse_tensor="sbuf_topk_211")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_211", scope_nid=None, reuse_tensor="sbuf_topk_217")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_220", scope_nid=None, reuse_tensor="sbuf_topk_221")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_221", scope_nid=None, reuse_tensor="sbuf_topk_224")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_222", scope_nid=None, reuse_tensor="sbuf_topk_227")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_223", scope_nid=None, reuse_tensor="sbuf_topk_239")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_225", scope_nid=None, reuse_tensor="sbuf_topk_226")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_226", scope_nid=None, reuse_tensor="sbuf_topk_228")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_227", scope_nid=None, reuse_tensor="sbuf_topk_245")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_230", scope_nid=None, reuse_tensor="sbuf_topk_237")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_231", scope_nid=None, reuse_tensor="sbuf_topk_233")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_232", scope_nid=None, reuse_tensor="sbuf_topk_235")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_233", scope_nid=None, reuse_tensor="sbuf_topk_236")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_234", scope_nid=None, reuse_tensor="sbuf_topk_238")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_256", scope_nid=None, reuse_tensor="sbuf_topk_257")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_257", scope_nid=None, reuse_tensor="sbuf_topk_259")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_258", scope_nid=None, reuse_tensor="sbuf_topk_47")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_259", scope_nid=None, reuse_tensor="sbuf_topk_48")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_260", scope_nid=None, reuse_tensor="sbuf_topk_353")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_263", scope_nid=None, reuse_tensor="sbuf_topk_265")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_264", scope_nid=None, reuse_tensor="sbuf_topk_268")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_265", scope_nid=None, reuse_tensor="sbuf_topk_50")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_267", scope_nid=None, reuse_tensor="sbuf_topk_269")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_268", scope_nid=None, reuse_tensor="sbuf_topk_271")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_269", scope_nid=None, reuse_tensor="sbuf_topk_277")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_271", scope_nid=None, reuse_tensor="sbuf_topk_350")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_277", scope_nid=None, reuse_tensor="sbuf_topk_349")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_280", scope_nid=None, reuse_tensor="sbuf_topk_281")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_281", scope_nid=None, reuse_tensor="sbuf_topk_306")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_282", scope_nid=None, reuse_tensor="sbuf_topk_303")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_284", scope_nid=None, reuse_tensor="sbuf_topk_295")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_285", scope_nid=None, reuse_tensor="sbuf_topk_286")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_286", scope_nid=None, reuse_tensor="sbuf_topk_288")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_287", scope_nid=None, reuse_tensor="sbuf_topk_292")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_288", scope_nid=None, reuse_tensor="sbuf_topk_312")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_289", scope_nid=None, reuse_tensor="sbuf_topk_270")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_290", scope_nid=None, reuse_tensor="sbuf_topk_291")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_291", scope_nid=None, reuse_tensor="sbuf_topk_293")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_292", scope_nid=None, reuse_tensor="sbuf_topk_304")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_295", scope_nid=None, reuse_tensor="sbuf_topk_302")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_296", scope_nid=None, reuse_tensor="sbuf_topk_298")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_297", scope_nid=None, reuse_tensor="sbuf_topk_300")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_298", scope_nid=None, reuse_tensor="sbuf_topk_301")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_304", scope_nid=None, reuse_tensor="sbuf_topk_307")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_307", scope_nid=None, reuse_tensor="sbuf_topk_310")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_310", scope_nid=None, reuse_tensor="sbuf_topk_313")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_313", scope_nid=None, reuse_tensor="sbuf_topk_319")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_322", scope_nid=None, reuse_tensor="sbuf_topk_323")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_323", scope_nid=None, reuse_tensor="sbuf_topk_326")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_324", scope_nid=None, reuse_tensor="sbuf_topk_329")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_325", scope_nid=None, reuse_tensor="sbuf_topk_341")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_327", scope_nid=None, reuse_tensor="sbuf_topk_328")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_328", scope_nid=None, reuse_tensor="sbuf_topk_330")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_329", scope_nid=None, reuse_tensor="sbuf_topk_347")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_331", scope_nid=None, reuse_tensor="sbuf_topk_270")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_332", scope_nid=None, reuse_tensor="sbuf_topk_339")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_333", scope_nid=None, reuse_tensor="sbuf_topk_335")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_334", scope_nid=None, reuse_tensor="sbuf_topk_337")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_335", scope_nid=None, reuse_tensor="sbuf_topk_338")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_336", scope_nid=None, reuse_tensor="sbuf_topk_340")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_25", scope_nid=None, reuse_tensor="sbuf_topk_26")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_59", scope_nid=None, reuse_tensor="sbuf_topk_61")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_65", scope_nid=None, reuse_tensor="sbuf_topk_60")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_66", scope_nid=None, reuse_tensor="sbuf_topk_61")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_72", scope_nid=None, reuse_tensor="sbuf_topk_73")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_77", scope_nid=None, reuse_tensor="sbuf_topk_78")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_78", scope_nid=None, reuse_tensor="sbuf_topk_80")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_79", scope_nid=None, reuse_tensor="sbuf_topk_67")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_115", scope_nid=None, reuse_tensor="sbuf_topk_117")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_116", scope_nid=None, reuse_tensor="sbuf_topk_201")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_118", scope_nid=None, reuse_tensor="sbuf_topk_110")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_121", scope_nid=None, reuse_tensor="sbuf_topk_117")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_122", scope_nid=None, reuse_tensor="sbuf_topk_124")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_123", scope_nid=None, reuse_tensor="sbuf_topk_198")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_126", scope_nid=None, reuse_tensor="sbuf_topk_197")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_129", scope_nid=None, reuse_tensor="sbuf_topk_154")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_130", scope_nid=None, reuse_tensor="sbuf_topk_151")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_132", scope_nid=None, reuse_tensor="sbuf_topk_143")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_133", scope_nid=None, reuse_tensor="sbuf_topk_134")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_134", scope_nid=None, reuse_tensor="sbuf_topk_136")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_135", scope_nid=None, reuse_tensor="sbuf_topk_140")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_136", scope_nid=None, reuse_tensor="sbuf_topk_160")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_138", scope_nid=None, reuse_tensor="sbuf_topk_139")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_139", scope_nid=None, reuse_tensor="sbuf_topk_141")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_140", scope_nid=None, reuse_tensor="sbuf_topk_152")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_143", scope_nid=None, reuse_tensor="sbuf_topk_150")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_144", scope_nid=None, reuse_tensor="sbuf_topk_146")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_145", scope_nid=None, reuse_tensor="sbuf_topk_148")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_146", scope_nid=None, reuse_tensor="sbuf_topk_149")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_152", scope_nid=None, reuse_tensor="sbuf_topk_155")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_155", scope_nid=None, reuse_tensor="sbuf_topk_158")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_158", scope_nid=None, reuse_tensor="sbuf_topk_161")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_161", scope_nid=None, reuse_tensor="sbuf_topk_167")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_164", scope_nid=None, reuse_tensor="sbuf_topk_202")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_171", scope_nid=None, reuse_tensor="sbuf_topk_174")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_172", scope_nid=None, reuse_tensor="sbuf_topk_177")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_173", scope_nid=None, reuse_tensor="sbuf_topk_189")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_175", scope_nid=None, reuse_tensor="sbuf_topk_176")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_176", scope_nid=None, reuse_tensor="sbuf_topk_178")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_177", scope_nid=None, reuse_tensor="sbuf_topk_195")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_180", scope_nid=None, reuse_tensor="sbuf_topk_187")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_181", scope_nid=None, reuse_tensor="sbuf_topk_183")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_182", scope_nid=None, reuse_tensor="sbuf_topk_185")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_183", scope_nid=None, reuse_tensor="sbuf_topk_186")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_184", scope_nid=None, reuse_tensor="sbuf_topk_188")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_2", scope_nid=None, reuse_tensor="sbuf_topk_50")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_206", scope_nid=None, reuse_tensor="sbuf_topk_208")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_207", scope_nid=None, reuse_tensor="sbuf_topk_110")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_208", scope_nid=None, reuse_tensor="sbuf_topk_307")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_210", scope_nid=None, reuse_tensor="sbuf_topk_212")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_211", scope_nid=None, reuse_tensor="sbuf_topk_110")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_214", scope_nid=None, reuse_tensor="sbuf_topk_215")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_216", scope_nid=None, reuse_tensor="sbuf_topk_218")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_217", scope_nid=None, reuse_tensor="sbuf_topk_220")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_218", scope_nid=None, reuse_tensor="sbuf_topk_221")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_219", scope_nid=None, reuse_tensor="sbuf_topk_222")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_223", scope_nid=None, reuse_tensor="sbuf_topk_110")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_226", scope_nid=None, reuse_tensor="sbuf_topk_304")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_229", scope_nid=None, reuse_tensor="sbuf_topk_308")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_23", scope_nid=None, reuse_tensor="sbuf_topk_31")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_232", scope_nid=None, reuse_tensor="sbuf_topk_212")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_235", scope_nid=None, reuse_tensor="sbuf_topk_215")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_236", scope_nid=None, reuse_tensor="sbuf_topk_220")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_237", scope_nid=None, reuse_tensor="sbuf_topk_221")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_238", scope_nid=None, reuse_tensor="sbuf_topk_222")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_239", scope_nid=None, reuse_tensor="sbuf_topk_240")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_24", scope_nid=None, reuse_tensor="sbuf_topk_32")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_240", scope_nid=None, reuse_tensor="sbuf_topk_242")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_241", scope_nid=None, reuse_tensor="sbuf_topk_246")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_242", scope_nid=None, reuse_tensor="sbuf_topk_266")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_243", scope_nid=None, reuse_tensor="sbuf_topk_213")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_244", scope_nid=None, reuse_tensor="sbuf_topk_245")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_245", scope_nid=None, reuse_tensor="sbuf_topk_247")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_246", scope_nid=None, reuse_tensor="sbuf_topk_258")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_247", scope_nid=None, reuse_tensor="sbuf_topk_303")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_249", scope_nid=None, reuse_tensor="sbuf_topk_256")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_250", scope_nid=None, reuse_tensor="sbuf_topk_252")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_251", scope_nid=None, reuse_tensor="sbuf_topk_254")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_252", scope_nid=None, reuse_tensor="sbuf_topk_255")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_253", scope_nid=None, reuse_tensor="sbuf_topk_257")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_254", scope_nid=None, reuse_tensor="sbuf_topk_260")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_258", scope_nid=None, reuse_tensor="sbuf_topk_261")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_26", scope_nid=None, reuse_tensor="sbuf_topk_27")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_261", scope_nid=None, reuse_tensor="sbuf_topk_264")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_264", scope_nid=None, reuse_tensor="sbuf_topk_267")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_267", scope_nid=None, reuse_tensor="sbuf_topk_273")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_277", scope_nid=None, reuse_tensor="sbuf_topk_280")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_278", scope_nid=None, reuse_tensor="sbuf_topk_283")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_279", scope_nid=None, reuse_tensor="sbuf_topk_295")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_281", scope_nid=None, reuse_tensor="sbuf_topk_282")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_282", scope_nid=None, reuse_tensor="sbuf_topk_284")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_283", scope_nid=None, reuse_tensor="sbuf_topk_301")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_286", scope_nid=None, reuse_tensor="sbuf_topk_293")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_287", scope_nid=None, reuse_tensor="sbuf_topk_289")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_288", scope_nid=None, reuse_tensor="sbuf_topk_291")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_289", scope_nid=None, reuse_tensor="sbuf_topk_292")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_290", scope_nid=None, reuse_tensor="sbuf_topk_294")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_312", scope_nid=None, reuse_tensor="sbuf_topk_204")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_313", scope_nid=None, reuse_tensor="sbuf_topk_315")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_314", scope_nid=None, reuse_tensor="sbuf_topk_204")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_316", scope_nid=None, reuse_tensor="sbuf_topk_110")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_319", scope_nid=None, reuse_tensor="sbuf_topk_321")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_320", scope_nid=None, reuse_tensor="sbuf_topk_324")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_323", scope_nid=None, reuse_tensor="sbuf_topk_325")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_324", scope_nid=None, reuse_tensor="sbuf_topk_327")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_325", scope_nid=None, reuse_tensor="sbuf_topk_333")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_327", scope_nid=None, reuse_tensor="sbuf_topk_406")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_330", scope_nid=None, reuse_tensor="sbuf_topk_409")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_333", scope_nid=None, reuse_tensor="sbuf_topk_405")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_337", scope_nid=None, reuse_tensor="sbuf_topk_362")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_338", scope_nid=None, reuse_tensor="sbuf_topk_359")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_340", scope_nid=None, reuse_tensor="sbuf_topk_351")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_341", scope_nid=None, reuse_tensor="sbuf_topk_342")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_342", scope_nid=None, reuse_tensor="sbuf_topk_344")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_343", scope_nid=None, reuse_tensor="sbuf_topk_348")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_344", scope_nid=None, reuse_tensor="sbuf_topk_368")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_345", scope_nid=None, reuse_tensor="sbuf_topk_326")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_346", scope_nid=None, reuse_tensor="sbuf_topk_347")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_347", scope_nid=None, reuse_tensor="sbuf_topk_349")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_348", scope_nid=None, reuse_tensor="sbuf_topk_360")),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_topk_34_transposed", scope_nid=None, reuse_tensor="sbuf_topk_36_transposed"),
+    ),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_351", scope_nid=None, reuse_tensor="sbuf_topk_358")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_352", scope_nid=None, reuse_tensor="sbuf_topk_354")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_353", scope_nid=None, reuse_tensor="sbuf_topk_356")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_354", scope_nid=None, reuse_tensor="sbuf_topk_357")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_360", scope_nid=None, reuse_tensor="sbuf_topk_363")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_363", scope_nid=None, reuse_tensor="sbuf_topk_366")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_366", scope_nid=None, reuse_tensor="sbuf_topk_369")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_369", scope_nid=None, reuse_tensor="sbuf_topk_375")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_379", scope_nid=None, reuse_tensor="sbuf_topk_382")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_38", scope_nid=None, reuse_tensor="sbuf_topk_39")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_380", scope_nid=None, reuse_tensor="sbuf_topk_385")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_381", scope_nid=None, reuse_tensor="sbuf_topk_397")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_383", scope_nid=None, reuse_tensor="sbuf_topk_384")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_384", scope_nid=None, reuse_tensor="sbuf_topk_386")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_385", scope_nid=None, reuse_tensor="sbuf_topk_403")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_387", scope_nid=None, reuse_tensor="sbuf_topk_326")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_388", scope_nid=None, reuse_tensor="sbuf_topk_395")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_389", scope_nid=None, reuse_tensor="sbuf_topk_391")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_390", scope_nid=None, reuse_tensor="sbuf_topk_393")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_391", scope_nid=None, reuse_tensor="sbuf_topk_394")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_392", scope_nid=None, reuse_tensor="sbuf_topk_396")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_419", scope_nid=None, reuse_tensor="sbuf_topk_50")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_421", scope_nid=None, reuse_tensor="sbuf_topk_61")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_51", scope_nid=None, reuse_tensor="sbuf_topk_57")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_53", scope_nid=None, reuse_tensor="sbuf_topk_54")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_54", scope_nid=None, reuse_tensor="sbuf_topk_72")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_57", scope_nid=None, reuse_tensor="sbuf_topk_60")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_58", scope_nid=None, reuse_tensor="sbuf_topk_65")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_65", scope_nid=None, reuse_tensor="sbuf_topk_73")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_68", scope_nid=None, reuse_tensor="sbuf_topk_69")),
 )
 
 
 BEST_NKIGYM_LADDERS["rotational_topk_12"] = (
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=97)),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=31, consumer_block_nid=35, consumer_operand="data1")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=33, consumer_block_nid=35, consumer_operand="data2")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=669, consumer_block_nid=675, consumer_operand="src")),
-    (CopyPropagation(), CopyPropagationOption(copy_block_nid=671, consumer_block_nid=673, consumer_operand="src")),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=31)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=33)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=669)),
-    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=671)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_357", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_358", scope_nid=None, reuse_tensor=None)),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_81", scope_nid=None, reuse_tensor="sbuf_topk_86")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_85", scope_nid=None, reuse_tensor="sbuf_topk_87")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_86", scope_nid=None, reuse_tensor="sbuf_topk_98")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_87", scope_nid=None, reuse_tensor="sbuf_topk_106")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_89", scope_nid=None, reuse_tensor="sbuf_topk_96")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_90", scope_nid=None, reuse_tensor="sbuf_topk_92")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_91", scope_nid=None, reuse_tensor="sbuf_topk_94")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_92", scope_nid=None, reuse_tensor="sbuf_topk_95")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_93", scope_nid=None, reuse_tensor="sbuf_topk_97")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_94", scope_nid=None, reuse_tensor="sbuf_topk_100")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_95", scope_nid=None, reuse_tensor="sbuf_topk_143")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_96", scope_nid=None, reuse_tensor="sbuf_topk_147")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_97", scope_nid=None, reuse_tensor="sbuf_topk_150")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_98", scope_nid=None, reuse_tensor="sbuf_topk_101")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_100", scope_nid=None, reuse_tensor="sbuf_topk_29")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_101", scope_nid=None, reuse_tensor="sbuf_topk_104")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_104", scope_nid=None, reuse_tensor="sbuf_topk_107")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_106", scope_nid=None, reuse_tensor="sbuf_topk_256")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_107", scope_nid=None, reuse_tensor="sbuf_topk_113")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_110", scope_nid=None, reuse_tensor="sbuf_topk_144")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_113", scope_nid=None, reuse_tensor="sbuf_topk_148")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_116", scope_nid=None, reuse_tensor="sbuf_topk_117")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_117", scope_nid=None, reuse_tensor="sbuf_topk_120")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_118", scope_nid=None, reuse_tensor="sbuf_topk_123")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_119", scope_nid=None, reuse_tensor="sbuf_topk_135")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_120", scope_nid=None, reuse_tensor="sbuf_topk_362")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_121", scope_nid=None, reuse_tensor="sbuf_topk_122")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_122", scope_nid=None, reuse_tensor="sbuf_topk_124")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_123", scope_nid=None, reuse_tensor="sbuf_topk_141")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_124", scope_nid=None, reuse_tensor="sbuf_topk_40")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_126", scope_nid=None, reuse_tensor="sbuf_topk_133")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_127", scope_nid=None, reuse_tensor="sbuf_topk_129")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_128", scope_nid=None, reuse_tensor="sbuf_topk_131")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_129", scope_nid=None, reuse_tensor="sbuf_topk_132")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_130", scope_nid=None, reuse_tensor="sbuf_topk_134")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_131", scope_nid=None, reuse_tensor="sbuf_topk_41")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_132", scope_nid=None, reuse_tensor="sbuf_topk_53")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_133", scope_nid=None, reuse_tensor="sbuf_topk_54")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_134", scope_nid=None, reuse_tensor="sbuf_topk_57")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_138", scope_nid=None, reuse_tensor="sbuf_topk_363")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_141", scope_nid=None, reuse_tensor="sbuf_topk_55")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_143", scope_nid=None, reuse_tensor="sbuf_topk_60")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_152", scope_nid=None, reuse_tensor="sbuf_topk_154")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_153", scope_nid=None, reuse_tensor="sbuf_topk_157")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_154", scope_nid=None, reuse_tensor="sbuf_topk_253")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_156", scope_nid=None, reuse_tensor="sbuf_topk_158")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_157", scope_nid=None, reuse_tensor="sbuf_topk_169")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_158", scope_nid=None, reuse_tensor="sbuf_topk_58")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_160", scope_nid=None, reuse_tensor="sbuf_topk_161")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_162", scope_nid=None, reuse_tensor="sbuf_topk_164")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_163", scope_nid=None, reuse_tensor="sbuf_topk_166")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_164", scope_nid=None, reuse_tensor="sbuf_topk_167")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_165", scope_nid=None, reuse_tensor="sbuf_topk_168")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_169", scope_nid=None, reuse_tensor="sbuf_topk_254")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_172", scope_nid=None, reuse_tensor="sbuf_topk_250")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_175", scope_nid=None, reuse_tensor="sbuf_topk_56")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_178", scope_nid=None, reuse_tensor="sbuf_topk_161")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_180", scope_nid=None, reuse_tensor="sbuf_topk_166")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_181", scope_nid=None, reuse_tensor="sbuf_topk_167")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_182", scope_nid=None, reuse_tensor="sbuf_topk_168")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_183", scope_nid=None, reuse_tensor="sbuf_topk_249")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_184", scope_nid=None, reuse_tensor="sbuf_topk_195")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_185", scope_nid=None, reuse_tensor="sbuf_topk_186")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_186", scope_nid=None, reuse_tensor="sbuf_topk_188")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_187", scope_nid=None, reuse_tensor="sbuf_topk_192")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_188", scope_nid=None, reuse_tensor="sbuf_topk_212")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_189", scope_nid=None, reuse_tensor="sbuf_topk_159")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_190", scope_nid=None, reuse_tensor="sbuf_topk_191")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_191", scope_nid=None, reuse_tensor="sbuf_topk_193")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_192", scope_nid=None, reuse_tensor="sbuf_topk_204")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_193", scope_nid=None, reuse_tensor="sbuf_topk_58")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_195", scope_nid=None, reuse_tensor="sbuf_topk_202")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_196", scope_nid=None, reuse_tensor="sbuf_topk_198")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_197", scope_nid=None, reuse_tensor="sbuf_topk_200")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_198", scope_nid=None, reuse_tensor="sbuf_topk_201")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_199", scope_nid=None, reuse_tensor="sbuf_topk_203")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_200", scope_nid=None, reuse_tensor="sbuf_topk_206")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_204", scope_nid=None, reuse_tensor="sbuf_topk_207")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_207", scope_nid=None, reuse_tensor="sbuf_topk_210")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_210", scope_nid=None, reuse_tensor="sbuf_topk_213")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_213", scope_nid=None, reuse_tensor="sbuf_topk_219")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_222", scope_nid=None, reuse_tensor="sbuf_topk_223")),
+    (OnChipReshape(), OnChipReshapeOption(load_block_nid=73)),
+    (BatchPermutation(), BatchPermutationOption(loop_nid=852)),
+    (OnChipReshape(), OnChipReshapeOption(load_block_nid=77)),
+    (BatchPermutation(), BatchPermutationOption(loop_nid=859)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=3)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=71)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=75)),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=213)),
+    (
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=165, redundant_block_nid=167, consumer_nid=170, consumer_operand="data"
+        ),
+    ),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=167)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=15, consumer_block_nid=17, consumer_operand="data")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=15, consumer_block_nid=23, consumer_operand="on_true")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=15)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=47, consumer_block_nid=51, consumer_operand="data1")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=47)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=49, consumer_block_nid=51, consumer_operand="data2")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=49)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=55, consumer_block_nid=57, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=55)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=61, consumer_block_nid=846, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=105, consumer_block_nid=109, consumer_operand="data1")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=105)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=107, consumer_block_nid=109, consumer_operand="data2")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=107)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=113, consumer_block_nid=115, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=113)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=119, consumer_block_nid=159, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=121, consumer_block_nid=123, consumer_operand="indices")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=121)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=127, consumer_block_nid=129, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=127)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=133, consumer_block_nid=135, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=133)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=61, consumer_block_nid=135, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=61)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=149, consumer_block_nid=151, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=149)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=119, consumer_block_nid=151, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=119)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=785, consumer_block_nid=791, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=785)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=787, consumer_block_nid=789, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=787)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=173, consumer_block_nid=175)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=217, consumer_block_nid=219)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=253, consumer_block_nid=255)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=333, consumer_block_nid=335)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=451, consumer_block_nid=453)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=531, consumer_block_nid=533)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=641, consumer_block_nid=643)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=721, consumer_block_nid=723)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_415", scope_nid=None, reuse_tensor=None)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_416", scope_nid=None, reuse_tensor=None)),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_0", scope_nid=None, reuse_tensor="sbuf_topk_85")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_10", scope_nid=None, reuse_tensor="sbuf_topk_9")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_100", scope_nid=None, reuse_tensor="sbuf_topk_421")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_105", scope_nid=None, reuse_tensor="sbuf_topk_420")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_106", scope_nid=None, reuse_tensor="sbuf_topk_85")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_107", scope_nid=None, reuse_tensor="sbuf_topk_314")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_108", scope_nid=None, reuse_tensor="sbuf_topk_87")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_110", scope_nid=None, reuse_tensor="sbuf_topk_98")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_112", scope_nid=None, reuse_tensor="sbuf_topk_115")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_115", scope_nid=None, reuse_tensor="sbuf_topk_208")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_116", scope_nid=None, reuse_tensor="sbuf_topk_99")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_118", scope_nid=None, reuse_tensor="sbuf_topk_119")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_119", scope_nid=None, reuse_tensor="sbuf_topk_121")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_120", scope_nid=None, reuse_tensor="sbuf_topk_205")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_122", scope_nid=None, reuse_tensor="sbuf_topk_113")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_125", scope_nid=None, reuse_tensor="sbuf_topk_121")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_126", scope_nid=None, reuse_tensor="sbuf_topk_128")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_127", scope_nid=None, reuse_tensor="sbuf_topk_114")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_130", scope_nid=None, reuse_tensor="sbuf_topk_201")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_133", scope_nid=None, reuse_tensor="sbuf_topk_158")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_134", scope_nid=None, reuse_tensor="sbuf_topk_155")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_136", scope_nid=None, reuse_tensor="sbuf_topk_147")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_137", scope_nid=None, reuse_tensor="sbuf_topk_138")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_138", scope_nid=None, reuse_tensor="sbuf_topk_140")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_139", scope_nid=None, reuse_tensor="sbuf_topk_144")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_140", scope_nid=None, reuse_tensor="sbuf_topk_164")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_142", scope_nid=None, reuse_tensor="sbuf_topk_143")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_143", scope_nid=None, reuse_tensor="sbuf_topk_145")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_144", scope_nid=None, reuse_tensor="sbuf_topk_156")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_147", scope_nid=None, reuse_tensor="sbuf_topk_154")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_148", scope_nid=None, reuse_tensor="sbuf_topk_150")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_149", scope_nid=None, reuse_tensor="sbuf_topk_152")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_150", scope_nid=None, reuse_tensor="sbuf_topk_153")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_156", scope_nid=None, reuse_tensor="sbuf_topk_159")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_159", scope_nid=None, reuse_tensor="sbuf_topk_162")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_162", scope_nid=None, reuse_tensor="sbuf_topk_165")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_165", scope_nid=None, reuse_tensor="sbuf_topk_171")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_168", scope_nid=None, reuse_tensor="sbuf_topk_202")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_171", scope_nid=None, reuse_tensor="sbuf_topk_206")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_175", scope_nid=None, reuse_tensor="sbuf_topk_178")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_176", scope_nid=None, reuse_tensor="sbuf_topk_181")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_177", scope_nid=None, reuse_tensor="sbuf_topk_193")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_179", scope_nid=None, reuse_tensor="sbuf_topk_180")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_180", scope_nid=None, reuse_tensor="sbuf_topk_182")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_181", scope_nid=None, reuse_tensor="sbuf_topk_199")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_184", scope_nid=None, reuse_tensor="sbuf_topk_191")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_185", scope_nid=None, reuse_tensor="sbuf_topk_187")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_186", scope_nid=None, reuse_tensor="sbuf_topk_189")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_187", scope_nid=None, reuse_tensor="sbuf_topk_190")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_188", scope_nid=None, reuse_tensor="sbuf_topk_192")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_2", scope_nid=None, reuse_tensor="sbuf_topk_54")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_210", scope_nid=None, reuse_tensor="sbuf_topk_212")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_211", scope_nid=None, reuse_tensor="sbuf_topk_113")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_212", scope_nid=None, reuse_tensor="sbuf_topk_311")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_214", scope_nid=None, reuse_tensor="sbuf_topk_216")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_215", scope_nid=None, reuse_tensor="sbuf_topk_113")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_218", scope_nid=None, reuse_tensor="sbuf_topk_219")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_220", scope_nid=None, reuse_tensor="sbuf_topk_222")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_221", scope_nid=None, reuse_tensor="sbuf_topk_224")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_222", scope_nid=None, reuse_tensor="sbuf_topk_225")),
     (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_223", scope_nid=None, reuse_tensor="sbuf_topk_226")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_224", scope_nid=None, reuse_tensor="sbuf_topk_229")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_225", scope_nid=None, reuse_tensor="sbuf_topk_241")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_227", scope_nid=None, reuse_tensor="sbuf_topk_228")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_228", scope_nid=None, reuse_tensor="sbuf_topk_230")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_229", scope_nid=None, reuse_tensor="sbuf_topk_247")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_232", scope_nid=None, reuse_tensor="sbuf_topk_239")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_233", scope_nid=None, reuse_tensor="sbuf_topk_235")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_234", scope_nid=None, reuse_tensor="sbuf_topk_237")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_235", scope_nid=None, reuse_tensor="sbuf_topk_238")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_236", scope_nid=None, reuse_tensor="sbuf_topk_240")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_258", scope_nid=None, reuse_tensor="sbuf_topk_259")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_259", scope_nid=None, reuse_tensor="sbuf_topk_261")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_260", scope_nid=None, reuse_tensor="sbuf_topk_49")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_261", scope_nid=None, reuse_tensor="sbuf_topk_50")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_262", scope_nid=None, reuse_tensor="sbuf_topk_355")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_265", scope_nid=None, reuse_tensor="sbuf_topk_267")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_266", scope_nid=None, reuse_tensor="sbuf_topk_270")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_267", scope_nid=None, reuse_tensor="sbuf_topk_52")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_269", scope_nid=None, reuse_tensor="sbuf_topk_271")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_270", scope_nid=None, reuse_tensor="sbuf_topk_273")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_271", scope_nid=None, reuse_tensor="sbuf_topk_279")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_273", scope_nid=None, reuse_tensor="sbuf_topk_352")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_279", scope_nid=None, reuse_tensor="sbuf_topk_351")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_282", scope_nid=None, reuse_tensor="sbuf_topk_283")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_283", scope_nid=None, reuse_tensor="sbuf_topk_308")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_284", scope_nid=None, reuse_tensor="sbuf_topk_305")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_286", scope_nid=None, reuse_tensor="sbuf_topk_297")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_287", scope_nid=None, reuse_tensor="sbuf_topk_288")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_288", scope_nid=None, reuse_tensor="sbuf_topk_290")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_289", scope_nid=None, reuse_tensor="sbuf_topk_294")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_290", scope_nid=None, reuse_tensor="sbuf_topk_314")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_291", scope_nid=None, reuse_tensor="sbuf_topk_272")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_292", scope_nid=None, reuse_tensor="sbuf_topk_293")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_293", scope_nid=None, reuse_tensor="sbuf_topk_295")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_294", scope_nid=None, reuse_tensor="sbuf_topk_306")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_297", scope_nid=None, reuse_tensor="sbuf_topk_304")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_298", scope_nid=None, reuse_tensor="sbuf_topk_300")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_299", scope_nid=None, reuse_tensor="sbuf_topk_302")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_300", scope_nid=None, reuse_tensor="sbuf_topk_303")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_306", scope_nid=None, reuse_tensor="sbuf_topk_309")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_309", scope_nid=None, reuse_tensor="sbuf_topk_312")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_312", scope_nid=None, reuse_tensor="sbuf_topk_315")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_315", scope_nid=None, reuse_tensor="sbuf_topk_321")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_324", scope_nid=None, reuse_tensor="sbuf_topk_325")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_325", scope_nid=None, reuse_tensor="sbuf_topk_328")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_326", scope_nid=None, reuse_tensor="sbuf_topk_331")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_327", scope_nid=None, reuse_tensor="sbuf_topk_343")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_329", scope_nid=None, reuse_tensor="sbuf_topk_330")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_330", scope_nid=None, reuse_tensor="sbuf_topk_332")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_331", scope_nid=None, reuse_tensor="sbuf_topk_349")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_333", scope_nid=None, reuse_tensor="sbuf_topk_272")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_334", scope_nid=None, reuse_tensor="sbuf_topk_341")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_335", scope_nid=None, reuse_tensor="sbuf_topk_337")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_336", scope_nid=None, reuse_tensor="sbuf_topk_339")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_337", scope_nid=None, reuse_tensor="sbuf_topk_340")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_338", scope_nid=None, reuse_tensor="sbuf_topk_342")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_27", scope_nid=None, reuse_tensor="sbuf_topk_28")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_61", scope_nid=None, reuse_tensor="sbuf_topk_63")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_67", scope_nid=None, reuse_tensor="sbuf_topk_62")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_68", scope_nid=None, reuse_tensor="sbuf_topk_63")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_74", scope_nid=None, reuse_tensor="sbuf_topk_75")),
-    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_79", scope_nid=None, reuse_tensor="sbuf_topk_80")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_227", scope_nid=None, reuse_tensor="sbuf_topk_113")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_230", scope_nid=None, reuse_tensor="sbuf_topk_308")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_233", scope_nid=None, reuse_tensor="sbuf_topk_312")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_236", scope_nid=None, reuse_tensor="sbuf_topk_216")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_239", scope_nid=None, reuse_tensor="sbuf_topk_219")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_240", scope_nid=None, reuse_tensor="sbuf_topk_224")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_241", scope_nid=None, reuse_tensor="sbuf_topk_225")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_242", scope_nid=None, reuse_tensor="sbuf_topk_226")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_243", scope_nid=None, reuse_tensor="sbuf_topk_244")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_244", scope_nid=None, reuse_tensor="sbuf_topk_246")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_245", scope_nid=None, reuse_tensor="sbuf_topk_250")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_246", scope_nid=None, reuse_tensor="sbuf_topk_270")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_247", scope_nid=None, reuse_tensor="sbuf_topk_217")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_248", scope_nid=None, reuse_tensor="sbuf_topk_249")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_249", scope_nid=None, reuse_tensor="sbuf_topk_251")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_25", scope_nid=None, reuse_tensor="sbuf_topk_33")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_250", scope_nid=None, reuse_tensor="sbuf_topk_262")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_251", scope_nid=None, reuse_tensor="sbuf_topk_307")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_253", scope_nid=None, reuse_tensor="sbuf_topk_260")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_254", scope_nid=None, reuse_tensor="sbuf_topk_256")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_255", scope_nid=None, reuse_tensor="sbuf_topk_258")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_256", scope_nid=None, reuse_tensor="sbuf_topk_259")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_257", scope_nid=None, reuse_tensor="sbuf_topk_261")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_258", scope_nid=None, reuse_tensor="sbuf_topk_264")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_26", scope_nid=None, reuse_tensor="sbuf_topk_34")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_262", scope_nid=None, reuse_tensor="sbuf_topk_265")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_265", scope_nid=None, reuse_tensor="sbuf_topk_268")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_268", scope_nid=None, reuse_tensor="sbuf_topk_271")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_271", scope_nid=None, reuse_tensor="sbuf_topk_277")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_28", scope_nid=None, reuse_tensor="sbuf_topk_29")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_281", scope_nid=None, reuse_tensor="sbuf_topk_284")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_282", scope_nid=None, reuse_tensor="sbuf_topk_287")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_283", scope_nid=None, reuse_tensor="sbuf_topk_299")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_285", scope_nid=None, reuse_tensor="sbuf_topk_286")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_286", scope_nid=None, reuse_tensor="sbuf_topk_288")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_287", scope_nid=None, reuse_tensor="sbuf_topk_305")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_290", scope_nid=None, reuse_tensor="sbuf_topk_297")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_291", scope_nid=None, reuse_tensor="sbuf_topk_293")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_292", scope_nid=None, reuse_tensor="sbuf_topk_295")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_293", scope_nid=None, reuse_tensor="sbuf_topk_296")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_294", scope_nid=None, reuse_tensor="sbuf_topk_298")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_316", scope_nid=None, reuse_tensor="sbuf_topk_208")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_317", scope_nid=None, reuse_tensor="sbuf_topk_319")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_318", scope_nid=None, reuse_tensor="sbuf_topk_208")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_320", scope_nid=None, reuse_tensor="sbuf_topk_113")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_323", scope_nid=None, reuse_tensor="sbuf_topk_325")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_324", scope_nid=None, reuse_tensor="sbuf_topk_328")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_327", scope_nid=None, reuse_tensor="sbuf_topk_329")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_328", scope_nid=None, reuse_tensor="sbuf_topk_331")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_329", scope_nid=None, reuse_tensor="sbuf_topk_337")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_331", scope_nid=None, reuse_tensor="sbuf_topk_410")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_334", scope_nid=None, reuse_tensor="sbuf_topk_413")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_337", scope_nid=None, reuse_tensor="sbuf_topk_409")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_341", scope_nid=None, reuse_tensor="sbuf_topk_366")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_342", scope_nid=None, reuse_tensor="sbuf_topk_363")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_344", scope_nid=None, reuse_tensor="sbuf_topk_355")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_345", scope_nid=None, reuse_tensor="sbuf_topk_346")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_346", scope_nid=None, reuse_tensor="sbuf_topk_348")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_347", scope_nid=None, reuse_tensor="sbuf_topk_352")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_348", scope_nid=None, reuse_tensor="sbuf_topk_372")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_349", scope_nid=None, reuse_tensor="sbuf_topk_330")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_350", scope_nid=None, reuse_tensor="sbuf_topk_351")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_351", scope_nid=None, reuse_tensor="sbuf_topk_353")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_352", scope_nid=None, reuse_tensor="sbuf_topk_364")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_355", scope_nid=None, reuse_tensor="sbuf_topk_362")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_356", scope_nid=None, reuse_tensor="sbuf_topk_358")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_357", scope_nid=None, reuse_tensor="sbuf_topk_360")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_358", scope_nid=None, reuse_tensor="sbuf_topk_361")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_364", scope_nid=None, reuse_tensor="sbuf_topk_367")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_367", scope_nid=None, reuse_tensor="sbuf_topk_370")),
+    (
+        BufferPlacement(),
+        BufferPlacementOption(tensor="sbuf_topk_36_transposed", scope_nid=None, reuse_tensor="sbuf_topk_38_transposed"),
+    ),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_370", scope_nid=None, reuse_tensor="sbuf_topk_373")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_373", scope_nid=None, reuse_tensor="sbuf_topk_379")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_383", scope_nid=None, reuse_tensor="sbuf_topk_386")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_384", scope_nid=None, reuse_tensor="sbuf_topk_389")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_385", scope_nid=None, reuse_tensor="sbuf_topk_401")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_387", scope_nid=None, reuse_tensor="sbuf_topk_388")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_388", scope_nid=None, reuse_tensor="sbuf_topk_390")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_389", scope_nid=None, reuse_tensor="sbuf_topk_407")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_391", scope_nid=None, reuse_tensor="sbuf_topk_330")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_392", scope_nid=None, reuse_tensor="sbuf_topk_399")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_393", scope_nid=None, reuse_tensor="sbuf_topk_395")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_394", scope_nid=None, reuse_tensor="sbuf_topk_397")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_395", scope_nid=None, reuse_tensor="sbuf_topk_398")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_396", scope_nid=None, reuse_tensor="sbuf_topk_400")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_40", scope_nid=None, reuse_tensor="sbuf_topk_41")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_423", scope_nid=None, reuse_tensor="sbuf_topk_54")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_425", scope_nid=None, reuse_tensor="sbuf_topk_65")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_55", scope_nid=None, reuse_tensor="sbuf_topk_61")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_57", scope_nid=None, reuse_tensor="sbuf_topk_58")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_58", scope_nid=None, reuse_tensor="sbuf_topk_76")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_61", scope_nid=None, reuse_tensor="sbuf_topk_64")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_62", scope_nid=None, reuse_tensor="sbuf_topk_69")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_69", scope_nid=None, reuse_tensor="sbuf_topk_77")),
+    (BufferPlacement(), BufferPlacementOption(tensor="sbuf_topk_72", scope_nid=None, reuse_tensor="sbuf_topk_73")),
 )
 
 
@@ -20887,6 +19552,9 @@ BEST_NKIGYM_LADDERS["rotational_topk_13"] = (
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=81)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=653)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=655)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=11, consumer_block_nid=13, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=11, consumer_block_nid=15, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=11)),
 )
 
 
@@ -22145,14 +20813,6 @@ BEST_NKIGYM_LADDERS["router_topk_1"] = (
             reuse_tensor="sbuf_sparse_topk_affinity_selected_674",
         ),
     ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=14, axis="d1", programs=1, reduction_tensor="psum_matmul", stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=14, axis="d1", programs=2, reduction_tensor="psum_matmul", stage_drain=False),
-    ),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=24, consumer_block_nid=26, consumer_operand="src")),
     (
         BufferPlacement(),
@@ -23403,14 +22063,6 @@ BEST_NKIGYM_LADDERS["router_topk_2"] = (
             reuse_tensor="sbuf_sparse_topk_affinity_selected_669",
         ),
     ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=12, axis="d1", programs=1, reduction_tensor="psum_matmul", stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=12, axis="d1", programs=2, reduction_tensor="psum_matmul", stage_drain=False),
-    ),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=16, consumer_block_nid=18, consumer_operand="src")),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=62, consumer_block_nid=64, consumer_operand="operand0")),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=70, consumer_block_nid=72)),
@@ -24569,14 +23221,6 @@ BEST_NKIGYM_LADDERS["router_topk_4"] = (
         BufferPlacement(),
         BufferPlacementOption(tensor="sbuf_sorted_prefix_597", scope_nid=None, reuse_tensor="sbuf_sorted_prefix_601"),
     ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=12, axis="d1", programs=1, reduction_tensor="psum_matmul", stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=12, axis="d1", programs=2, reduction_tensor="psum_matmul", stage_drain=False),
-    ),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=16, consumer_block_nid=18, consumer_operand="src")),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=50, consumer_block_nid=52, consumer_operand="operand0")),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=58, consumer_block_nid=60)),
@@ -24584,6 +23228,9 @@ BEST_NKIGYM_LADDERS["router_topk_4"] = (
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=348, consumer_block_nid=350)),
     (Fuse(), FuseOption(target_nids=(4, 5), target_axis=None, operation_batch=True)),
     (BatchPermutation(), BatchPermutationOption(loop_nid=7)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=28, consumer_block_nid=30, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=28, consumer_block_nid=32, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=28)),
 )
 
 
@@ -25914,14 +24561,6 @@ BEST_NKIGYM_LADDERS["router_topk_8"] = (
             reuse_tensor="sbuf_sparse_topk_affinity_selected_686",
         ),
     ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=14, axis="d1", programs=1, reduction_tensor="psum_matmul", stage_drain=False),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(loop_nid=14, axis="d1", programs=2, reduction_tensor="psum_matmul", stage_drain=False),
-    ),
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=24, consumer_block_nid=26, consumer_operand="src")),
     (
         BufferPlacement(),
@@ -26000,31 +24639,19 @@ BEST_NKIGYM_LADDERS["qkv_tkg_0"] = (
     (Split(), SplitOption(target_nid=258, factors=(2, 64), target_axis="d2")),
     (Fuse(), FuseOption(target_nids=(257, 274), target_axis=None, operation_batch=False)),
     (Split(), SplitOption(target_nid=275, factors=(2, 5), target_axis=None)),
-    (Reorder(), ReorderOption(outer_nid=256, inner_nid=276)),
-    (CodeMotion(), CodeMotionOption(block_nid=253, target_loop_nid=255, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=253, target_loop_nid=256, index=0)),
-    (CodeMotion(), CodeMotionOption(block_nid=259, target_loop_nid=256, index=2)),
-    (BufferPlacement(), BufferPlacementOption(tensor="psum_qkv_out", scope_nid=None, reuse_tensor=None)),
-    (
-        BufferRegionNormalization(),
-        BufferRegionNormalizationOption(tensor="psum_qkv_out", axis=1, anchor_loop_nid=256, program_loop_nids=()),
-    ),
-    (BufferCompaction(), BufferCompactionOption(tensor="psum_qkv_out", axis=1)),
     (Fuse(), FuseOption(target_nids=(277, 258), target_axis="d2", operation_batch=False)),
     (
         ProgramShard(),
-        ProgramShardOption(loop_nid=276, axis="d1", programs=1, reduction_tensor="psum_qkv_out", stage_drain=False),
+        ProgramShardOption(loop_nid=256, axis="d1", programs=1, reduction_tensor="psum_qkv_out", stage_drain=False),
     ),
     (
         ProgramShard(),
-        ProgramShardOption(loop_nid=276, axis="d1", programs=2, reduction_tensor="psum_qkv_out", stage_drain=False),
+        ProgramShardOption(loop_nid=256, axis="d1", programs=2, reduction_tensor="psum_qkv_out", stage_drain=False),
     ),
     (ProgramShard(), ProgramShardOption(loop_nid=248, axis="d1", programs=2, reduction_tensor=None, stage_drain=False)),
     (ProgramShard(), ProgramShardOption(loop_nid=15, axis="d1", programs=2, reduction_tensor=None, stage_drain=False)),
     (ProgramShard(), ProgramShardOption(loop_nid=7, axis="d1", programs=2, reduction_tensor=None, stage_drain=False)),
     (ProgramShard(), ProgramShardOption(loop_nid=245, axis="d1", programs=2, reduction_tensor=None, stage_drain=False)),
-    (ProgramShard(), ProgramShardOption(loop_nid=251, axis="d1", programs=2, reduction_tensor=None, stage_drain=False)),
-    (ProgramShard(), ProgramShardOption(loop_nid=4, axis="d1", programs=2, reduction_tensor=None, stage_drain=False)),
     (
         CommonSubexpressionElimination(),
         CommonSubexpressionEliminationOption(
@@ -26095,11 +24722,106 @@ BEST_NKIGYM_LADDERS["qkv_tkg_0"] = (
     (CopyPropagation(), CopyPropagationOption(copy_block_nid=116, consumer_block_nid=118, consumer_operand="data2")),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=12)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=116)),
-    (Split(), SplitOption(target_nid=254, factors=(2, 160), target_axis="d2")),
-    (Split(), SplitOption(target_nid=258, factors=(2, 160), target_axis="d2")),
-    (Split(), SplitOption(target_nid=260, factors=(2, 160), target_axis="d2")),
     (MatmulColumnTiling(), MatmulColumnTilingOption(isa_nid=258, column_size=64)),
     (FusePointwise(), FusePointwiseOption(pointwise_block_nid=154, consumer_block_nid=156)),
+    (CodeMotion(), CodeMotionOption(block_nid=14, target_loop_nid=0, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=6, target_loop_nid=15, index=0)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=6, consumer_block_nid=14)),
+    (CodeMotion(), CodeMotionOption(block_nid=9, target_loop_nid=18, index=0)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=9, consumer_block_nid=17)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=87)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=86)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=85)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=84)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=83)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=82)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=81)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=80)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=79)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=78)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=77)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=76)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=75)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=74)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=73)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=72)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=71)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=70)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=69)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=68)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=67)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=66)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=65)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=64)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=63)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=62)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=61)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=60)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=59)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=58)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=57)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=56)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=55)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=54)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=53)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=52)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=51)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=50)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=49)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=48)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=47)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=46)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=45)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=44)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=43)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=42)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=41)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=40)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=39)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=38)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=37)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=36)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=35)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=34)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=33)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=32)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=31)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=30)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=29)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=28)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=27)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=26)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=25)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=24)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=23)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=22)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=21)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=20)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=19)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=18)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=17)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=16)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=15)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=14)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=13)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=12)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=11)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=10)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=9)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=8)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=7)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=6)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=5)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=4)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=3)),
+    (CodeMotion(), CodeMotionOption(block_nid=250, target_loop_nid=0, index=2)),
+    (CodeMotion(), CodeMotionOption(block_nid=3, target_loop_nid=251, index=0)),
+    (FusePointwise(), FusePointwiseOption(pointwise_block_nid=3, consumer_block_nid=250)),
+    (Split(), SplitOption(target_nid=271, factors=(2, 320), target_axis="d2")),
+    (ProgramShard(), ProgramShardOption(loop_nid=282, axis="d2", programs=2, reduction_tensor=None, stage_drain=False)),
+    (Split(), SplitOption(target_nid=251, factors=(2, 12), target_axis=None)),
+    (Fuse(), FuseOption(target_nids=(284, 252), target_axis=None, operation_batch=True)),
+    (ProgramShard(), ProgramShardOption(loop_nid=283, axis="d1", programs=2, reduction_tensor=None, stage_drain=False)),
 )
 
 BEST_NKIGYM_LADDERS["qkv_tkg_1"] = (
@@ -26140,18 +24862,6 @@ BEST_NKIGYM_LADDERS["qkv_tkg_1"] = (
 
 
 BEST_NKIGYM_LADDERS["router_topk_0"] = (
-    (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=14, axis="d1", programs=1, reduction_tensor="psum_router_logits_out", stage_drain=False
-        ),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=14, axis="d1", programs=2, reduction_tensor="psum_router_logits_out", stage_drain=False
-        ),
-    ),
     (
         CommonSubexpressionElimination(),
         CommonSubexpressionEliminationOption(
@@ -26280,22 +24990,23 @@ BEST_NKIGYM_LADDERS["router_topk_0"] = (
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=1226)),
     (Fuse(), FuseOption(target_nids=(4, 5), target_axis=None, operation_batch=True)),
     (BatchPermutation(), BatchPermutationOption(loop_nid=9)),
+    (
+        CommonSubexpressionElimination(),
+        CommonSubexpressionEliminationOption(
+            canonical_block_nid=98, redundant_block_nid=100, consumer_nid=103, consumer_operand="data"
+        ),
+    ),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=100)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=28, consumer_block_nid=32, consumer_operand="data")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=28, consumer_block_nid=38, consumer_operand="src")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=28)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=38, consumer_block_nid=40, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=38, consumer_block_nid=42, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=38)),
 )
 
 
 BEST_NKIGYM_LADDERS["router_topk_3"] = (
-    (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=12, axis="d1", programs=1, reduction_tensor="psum_router_logits_out", stage_drain=False
-        ),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=12, axis="d1", programs=2, reduction_tensor="psum_router_logits_out", stage_drain=False
-        ),
-    ),
     (
         CommonSubexpressionElimination(),
         CommonSubexpressionEliminationOption(
@@ -26425,18 +25136,6 @@ BEST_NKIGYM_LADDERS["router_topk_3"] = (
 
 BEST_NKIGYM_LADDERS["router_topk_6"] = (
     (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=12, axis="d1", programs=1, reduction_tensor="psum_router_logits_out", stage_drain=False
-        ),
-    ),
-    (
-        ProgramShard(),
-        ProgramShardOption(
-            loop_nid=12, axis="d1", programs=2, reduction_tensor="psum_router_logits_out", stage_drain=False
-        ),
-    ),
-    (
         CommonSubexpressionElimination(),
         CommonSubexpressionEliminationOption(
             canonical_block_nid=212, redundant_block_nid=224, consumer_nid=233, consumer_operand="data2"
@@ -26559,6 +25258,9 @@ BEST_NKIGYM_LADDERS["router_topk_6"] = (
     (SetBufferAlignment(), SetBufferAlignmentOption(tensor="sbuf_router_logits_out_stationary", alignment=16)),
     (BufferLayout(), BufferLayoutOption(tensor="sbuf_router_logits_out_stationary", list_len=1)),
     (BatchPermutation(), BatchPermutationOption(loop_nid=7)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=30, consumer_block_nid=32, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=30, consumer_block_nid=34, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=30)),
 )
 
 BEST_NKIGYM_LADDERS["output_projection_tkg_3"] = (
@@ -26657,6 +25359,9 @@ BEST_NKIGYM_LADDERS["rotational_topk_7"] = (
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=51)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=623)),
     (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=625)),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=9, consumer_block_nid=11, consumer_operand="src")),
+    (CopyPropagation(), CopyPropagationOption(copy_block_nid=9, consumer_block_nid=13, consumer_operand="data")),
+    (EliminateDeadProducer(), EliminateDeadProducerOption(producer_block_nid=9)),
 )
 
 

@@ -417,7 +417,7 @@ def _emit_isa_call(
                 offset = _substituted_view(node.operand_bindings["offset"], substitutions)
                 if ir.buffer(source.tensor).physical_dtype() != buf.physical_dtype():
                     raise ValueError("dynamic slice copies require matching source and destination storage")
-                partition, width = (_constant_width(source, axis) for axis in (0, 1))
+                partition, width = (_constant_extent(source.ranges[axis][1]) for axis in (0, 1))
                 stride = math.prod(buf.per_tile_physical_shape()[1:])
                 index = render_buffer_region(offset, ir.buffer(offset.tensor), rotations.get(offset.tensor))
                 rendered = f"{rendered}.ap(pattern=[[{stride}, {partition}], [1, {width}]], scalar_offset={index}, indirect_dim=1)"
@@ -428,7 +428,6 @@ def _emit_isa_call(
         isa_name, kwargs = native_parameters(kwargs, frozenset(node.operand_bindings))
     if op_cls.NAME == "nc_matmul":
         kwargs.setdefault("name", "matmul")
-        kwargs.setdefault("accumulate", True)
     for abstract, (offset_key, extent_key, multiplier_key) in op_cls.ITERATION_OFFSET_KWARGS.items():
         concrete = ir.tree.block(owning_block(ir, leaf_nid)).axis_map[abstract]
         base = int(kwargs.get(offset_key, 0))
@@ -481,7 +480,7 @@ def _emit_indirect_dma(node: ISANode, ir: KernelIR, rotations: dict[str, Expr], 
     mode = node.op_cls.INDIRECT_DMA_MODE
     gather = mode in {"column_gather", "gather", "scalar_gather"}
     data_region, hbm_region = (destination, source) if gather else (source, destination)
-    partition, free = (_constant_width(data_region, axis) for axis in (0, 1))
+    partition, free = (_constant_extent(data_region.ranges[axis][1]) for axis in (0, 1))
     scalar = mode in {"scalar_gather", "scalar_scatter"}
     if scalar:
         index = node.kwargs.get("index", 0)
@@ -493,8 +492,10 @@ def _emit_indirect_dma(node: ISANode, ir: KernelIR, rotations: dict[str, Expr], 
     batch = 1
     if pattern := node.access_patterns.get("dst" if gather else "src"):
         data_buffer = ir.buffer(data_region.tensor)
-        batch = data_buffer.logical_tile_count()
         pattern = _substituted_view(pattern, substitutions)
+        batch, remainder = divmod(math.prod(_constant_extent(size) for _, size in pattern.pattern), partition * free)
+        if remainder or batch < 1:
+            raise ValueError("indirect DMA view does not contain complete partition tiles")
         data_text = render_access_pattern(data_region.tensor, pattern, data_buffer, rotations.get(data_region.tensor))
     row_stride = hbm_buffer.shape[1]
     if mode == "column_gather":
@@ -524,11 +525,11 @@ def _substituted_view(view: _View, substitutions: dict[str, Expr]) -> _View:
     return replace(view, pattern=tuple((rewrite(a), rewrite(b)) for a, b in view.pattern), offset=rewrite(view.offset))
 
 
-def _constant_width(region: BufferRegion, axis: int) -> int:
-    """Return one statically known region width."""
-    if not isinstance(width := region.ranges[axis][1], Const):
-        raise AssertionError(f"{region.tensor}: indirect DMA requires a constant tile width")
-    return width.value
+def _constant_extent(extent: Expr) -> int:
+    """Return one statically known region or access-pattern extent."""
+    if not isinstance(extent, Const) or extent.value < 1:
+        raise AssertionError(f"indirect DMA requires a positive constant tile extent: {extent}")
+    return extent.value
 
 
 _NL_OP_KWARGS = frozenset({"comp_op0", "comp_op1", "dtype", "op", "op0", "op1", "reduce_op"})
@@ -542,8 +543,8 @@ def _render_kwarg(key: str, value: Any) -> str:
     value = "maximum" if key in {"op", "reduce_op"} and value == "max" else value
     if key == "reduce_cmd" or (key in {"send_to_rank", "recv_from_rank"} and value == "program_peer"):
         return f"nisa.reduce_cmd.{value}" if key == "reduce_cmd" else "1 - nl.program_id(0)"
-    if key in _NL_OP_KWARGS | {"engine"} and isinstance(value, str):
-        return f"{'nisa.engine' if key == 'engine' else 'nl'}.{value}"
+    if key in _NL_OP_KWARGS | {"engine", "dge_mode"} and isinstance(value, str):
+        return f"{'nisa.' + key if key in {'engine', 'dge_mode'} else 'nl'}.{value}"
     if isinstance(value, float) and (math.isinf(value) or math.isnan(value)):
         return f"float('{value}')"
     return format_expr(value) if isinstance(value, Expr) else repr(value)

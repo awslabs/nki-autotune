@@ -48,7 +48,7 @@ _OP_MODULES: dict[str, str] = {
         "NKIRegisterLoad=register_load NKIReshapeStore=reshape_store "
         "NKIRowLoad=row_load NKIRowMemset=row_memset "
         "NKIPartitionSliceLoad=partition_slice_load "
-        "NKIVectorDMATranspose=vector_dma_transpose "
+        "NKIVectorDMATranspose=vector_dma_transpose NKIVectorTranspose=vector_transpose "
         "NKIScalarTensorTensor=scalar_tensor_tensor "
         "NKISendRecv=sendrecv NKISelectReduce=select_reduce "
         "NKIStreamShuffle=stream_shuffle NKIStreamShuffleBroadcast=stream_shuffle_broadcast NKIStridedCopy=strided_copy "

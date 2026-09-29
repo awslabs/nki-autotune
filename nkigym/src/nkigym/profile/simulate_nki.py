@@ -233,9 +233,9 @@ def _write_requests(
 def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_s: int) -> _HostResult:
     """Upload and execute one host partition, then parse its result."""
     remote_run = f".cache/nkigym-simulate/runs/{time.time_ns()}-{os.getpid()}-{secrets.token_hex(4)}"
-    rsync_shell = shlex.join(("ssh", *_SSH_OPTIONS))
+    rsync_command = ["rsync", "-a", "-e", shlex.join(("ssh", *_SSH_OPTIONS))]
     runner = _CommandRunner(timeout_s)
-    if request_path.stat().st_size >= 1 << 30:
+    if request_path.stat().st_size >= 1 << 28:
         subprocess.run(("pigz", "-1", "-f", str(request_path)), check=True)
         request_path = Path(f"{request_path}.gz")
     try:
@@ -256,10 +256,7 @@ def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_
         runner.run(
             "Uploading simulation batch",
             [
-                "rsync",
-                "-a",
-                "-e",
-                rsync_shell,
+                *rsync_command,
                 str(Path(__file__).with_name("simulate_nki_worker.py").resolve()),
                 str(request_path),
                 f"{host}:{remote_run}/",
@@ -270,7 +267,7 @@ def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_
         _wait_for_remote_result(host, remote_run, runner)
         runner.run(
             "Downloading simulation result",
-            ["rsync", "-a", "-e", rsync_shell, f"{host}:{remote_run}/result.json", str(result_path)],
+            [*rsync_command, f"{host}:{remote_run}/result.json", str(result_path)],
             None,
         )
     except SSHTransportError as error:

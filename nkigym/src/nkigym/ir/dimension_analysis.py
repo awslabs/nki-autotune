@@ -8,7 +8,7 @@ import ast
 import inspect
 import textwrap
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import prod
 from threading import RLock
 from typing import Any
@@ -76,6 +76,7 @@ class _AnalysisResult:
         tensors: All named tensors, keyed by name.
         ops: Compute ops in source order.
         repetitions: Half-open operation intervals and their static repeat counts.
+        partition_tile_limits: Shared canonical widths for on-chip partition axes.
     """
 
     func_name: str
@@ -85,6 +86,7 @@ class _AnalysisResult:
     tensors: dict[str, TensorDims]
     ops: list[_OpRecord]
     repetitions: list[tuple[int, int, int | tuple[str, bool]]]
+    partition_tile_limits: dict[str, int] = field(default_factory=dict)
 
 
 def analyze_dimensions(
