@@ -1,10 +1,26 @@
 """Load one dynamically selected HBM matrix with ``nisa.dma_copy``."""
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.codegen.torch_arithmetic import TorchArithmetic
+from nkigym.codegen.torch_values import TorchValue
+from nkigym.ops.base import NKIOp, PartitionTileBatchingContract, _operand_role
+
+
+def emit_fp32_row(emit: TorchArithmetic, source: TorchValue, register: str | None) -> str:
+    """Load one HBM matrix row and preserve explicit low-precision promotion."""
+    rows, width = source.shape
+    if rows != 1 and register is None:
+        raise ValueError("multiple HBM rows require an explicit row selector")
+    loaded = emit.emit(
+        "NKILoad" if rows == 1 else "NKIHBMScalarRowSlice",
+        f"src={source.name}" + (f", indices={register}, index=0" if rows != 1 else ""),
+        "" if rows == 1 else f"rows=1, width={width}",
+    )
+    return loaded if source.storage_dtype == "float32" else emit.cast("NKIFloat32Cast", loaded)
 
 
 class NKIHBMScalarRowSlice(NKIOp):
@@ -31,6 +47,12 @@ class NKIHBMScalarRowSlice(NKIOp):
     }
     CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"index", "rows", "width", "row_offset", "column_offset"})
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+
+    @classmethod
+    def partition_tile_batching_contract(cls, kwargs: Mapping[str, Any]) -> PartitionTileBatchingContract:
+        """Batch contiguous rows while retaining the same scalar matrix selector."""
+        _ = kwargs
+        return PartitionTileBatchingContract(operands=("dst",))
 
     def _check_roles(self, **kwargs: Any) -> None:
         """Require one flattened HBM matrix and one scalar SBUF index."""

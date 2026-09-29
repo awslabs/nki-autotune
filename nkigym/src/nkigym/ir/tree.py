@@ -131,6 +131,8 @@ class Buffer:
     location: str
     storage_dtype: str | None = None
     partition_size: int | None = None
+    free_alignment: int = 1
+    """Physical free-axis pitch alignment in elements; logical shape is unchanged."""
     versions: int = 1
     """Pipeline buffer-version count. 1 = single instance (renders
     byte-identically to today). >1 multiplies the tile (middle) dim of
@@ -167,8 +169,7 @@ class Buffer:
 
     def logical_tile_count(self) -> int:
         """Return the number of logical partition tiles before versioning."""
-        leading, _free = self._on_chip_shape()
-        return leading // self.partition_extent()
+        return self._on_chip_shape()[0] // self.partition_extent()
 
     def tiles_per_list(self) -> int:
         """Return logical partition tiles stored in each list entry."""
@@ -193,6 +194,8 @@ class Buffer:
         if self.location == "shared_hbm":
             return self.shape
         _leading, free = self._on_chip_shape()
+        assert self.free_alignment > 0, "physical free-axis alignment must be positive"
+        free = (free + self.free_alignment - 1) // self.free_alignment * self.free_alignment
         return (self.partition_extent(), self.logical_tile_count() * self.versions, free)
 
     def per_tile_physical_shape(self) -> tuple[int, ...]:
@@ -203,12 +206,10 @@ class Buffer:
         list entry's logical tiles for every pipeline version:
         ``tiles_per_list * versions``. Identity when ``list_len == 1``.
         """
-        if self.list_len == 1:
-            return self.physical_shape()
-        if self.location == "shared_hbm":
+        if self.location == "shared_hbm" and self.list_len != 1:
             raise AssertionError(f"{self.name}: shared_hbm has no tile axis to split (list_len must be 1)")
-        partition, _total_tiles, free = self.physical_shape()
-        return (partition, self.tiles_per_list() * self.versions, free)
+        physical = self.physical_shape()
+        return physical if self.list_len == 1 else (physical[0], self.tiles_per_list() * self.versions, physical[2])
 
     def physical_dtype(self) -> str:
         """Return the dtype ``nl.ndarray`` actually allocates for this buffer.

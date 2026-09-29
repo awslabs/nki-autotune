@@ -559,7 +559,7 @@ def _axis_pattern(
     """Translate only one logical axis contribution to a flattened physical address."""
     lower = region.ranges[axis][0]
     removed = Add(left=lower, right=Mul(left=Const(value=-1), right=substitute(lower, substitutions)))
-    stride = prod(buffer.shape[axis + 1 :])
+    stride = buffer.per_tile_physical_shape()[2] if axis == 0 else prod(buffer.shape[axis + 1 :])
     offset = Add(left=pattern.offset, right=Mul(left=removed, right=Const(value=-stride)))
     return replace(pattern, offset=Analyzer().simplify(offset))
 

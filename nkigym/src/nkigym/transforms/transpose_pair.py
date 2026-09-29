@@ -181,7 +181,7 @@ def _match_insert(
                 source_axes = (axis_map[axes[0]], axis_map[axes[1]])
                 extents = facts.extents if facts is not None else axis_extents(ir)
                 shape_matches = source_buffer.shape == tuple(extents[axis] for axis in source_axes)
-                tileable = all(extent >= 128 and extent % 128 == 0 for extent in source_buffer.shape)
+                tileable = all(extent > 0 and (extent <= 128 or extent % 128 == 0) for extent in source_buffer.shape)
                 physical_dtype = source_buffer.physical_dtype() == source_buffer.dtype
                 if (
                     source_buffer.location == "sbuf"

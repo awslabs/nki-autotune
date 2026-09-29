@@ -7,14 +7,18 @@ import numpy as np
 
 from nkigym.codegen.torch_values import TorchValue, emit_activation
 from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
+from nkigym.ops.float32_load import lossless_matmul_input
 from nkigym.ops.reinterpret_uint32 import emit_binary32_sqrt
 
 
 def align_matmul(
     stationary: TorchValue, moving: TorchValue, body: list[str], imports: set[str]
 ) -> tuple[TorchValue, TorchValue]:
-    """Promote either input when its peer requires the FP32 matmul format."""
-    operands = [stationary, moving]
+    """Choose exact operand representations and match the FP32 matmul format."""
+    operands = [
+        lossless_matmul_input(stationary, moving, body, imports),
+        lossless_matmul_input(moving, stationary, body, imports),
+    ]
     fp32 = {"float32", "tfloat32"}
     if any(value.storage_dtype in fp32 for value in operands):
         for index, value in enumerate(operands):
@@ -81,6 +85,7 @@ class NKIReciprocal(NKIOp):
     """Compute an elementwise fp32 reciprocal using ``nisa.reciprocal``."""
 
     NAME: ClassVar[str] = "reciprocal"
+    PARTITION_BATCH_OPERANDS: ClassVar[tuple[str, ...]] = ("data", "dst")
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data"})
     INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"data": frozenset({"sbuf", "psum"})}

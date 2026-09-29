@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
+from nkigym.ir.arith import Const
 from nkigym.ir.program_sharding import PROGRAM_SHARDS_ANNOTATION, configured_program_shards
-from nkigym.ir.tree import BlockNode, ISANode
-from nkigym.ops.base import CopyContract, PermutationContract, PointwiseContract, SliceContract
+from nkigym.ir.tree import BlockNode, BufferRegion, ISANode
+from nkigym.ops.base import CopyContract, PermutationContract, PointwiseContract, ReductionContract, SliceContract
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -40,12 +41,13 @@ class EliminateDeadProducer(Transform[EliminateDeadProducerOption]):
     """Delete one unused pure producer."""
 
     def analyze(self, ir: KernelIR) -> list[EliminateDeadProducerOption]:
-        """Return every isolated pure block with an unread private output."""
+        """Return isolated pure blocks whose output values cannot be observed."""
         block_nids = tuple(ir.tree.blocks())
         options = [EliminateDeadProducerOption(producer_block_nid=block_nid) for block_nid in block_nids]
         overlap_nodes = software_pipeline_overlap_nodes(ir)
         owners = self._buffer_owners(ir, block_nids)
-        return [option for option in options if self._resolve(ir, option, overlap_nodes, owners) is not None]
+        positions = {nid: index for index, nid in enumerate(ir.tree.preorder())}
+        return [option for option in options if self._resolve(ir, option, overlap_nodes, owners, positions) is not None]
 
     def apply(self, ir: KernelIR, option: EliminateDeadProducerOption) -> KernelIR:
         """Recheck, copy, and remove one dead producer block."""
@@ -79,6 +81,7 @@ class EliminateDeadProducer(Transform[EliminateDeadProducerOption]):
         option: EliminateDeadProducerOption,
         overlap_nodes: frozenset[int] | None = None,
         owners: dict[str, int | None] | None = None,
+        positions: dict[int, int] | None = None,
     ) -> _DeadProducerMatch | None:
         """Resolve an isolated pure producer with one private unread output."""
         result: _DeadProducerMatch | None = None
@@ -93,8 +96,14 @@ class EliminateDeadProducer(Transform[EliminateDeadProducerOption]):
             return result
         leaf = ir.tree.isa(leaf_nid)
         contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
-        if not isinstance(contract, (CopyContract, PermutationContract, PointwiseContract, SliceContract)):
+        if not isinstance(
+            contract, (CopyContract, PermutationContract, PointwiseContract, SliceContract, ReductionContract)
+        ):
             return result
+        if isinstance(contract, ReductionContract):
+            outputs = frozenset(leaf.operand_bindings) - leaf.op_cls.INPUT_OPERANDS
+            if outputs != {contract.output_operand} or leaf.op_cls.rmw_operands(leaf.kwargs):
+                return result
         output = leaf.operand_bindings.get(contract.output_operand)
         if output is None or output.tensor in ir.param_buffers or output.tensor in ir.return_names:
             return result
@@ -104,7 +113,7 @@ class EliminateDeadProducer(Transform[EliminateDeadProducerOption]):
         touches = ir.dependency.touches_by_tensor.get(output.tensor, ())
         readers = {nid for nid in touches if output.tensor in ir.dependency.info(nid).reads}
         writers = {nid for nid in touches if output.tensor in ir.dependency.info(nid).writes}
-        if not readers and writers == {leaf_nid}:
+        if (not readers and writers == {leaf_nid}) or _unobserved_write(ir, block_nid, leaf_nid, output, positions):
             result = _DeadProducerMatch(block_nid, leaf_nid, output.tensor)
         return result
 
@@ -116,6 +125,58 @@ class EliminateDeadProducer(Transform[EliminateDeadProducerOption]):
             for buffer in ir.tree.block(block_nid).alloc_buffers:
                 owners[buffer.name] = block_nid if buffer.name not in owners else None
         return owners
+
+
+def _plain_full_write(ir: KernelIR, leaf_nid: int, region: BufferRegion) -> bool:
+    """Require one unconditional root-level instruction writing an exact region."""
+    leaf = ir.tree.isa(leaf_nid)
+    block_nid = ir.tree.parent(leaf_nid)
+    if block_nid is None or not isinstance(ir.tree.data(block_nid), BlockNode):
+        return False
+    if (
+        ir.tree.parent(block_nid) != ir.tree.root
+        or ir.tree.children(block_nid) != [leaf_nid]
+        or ir.tree.block(block_nid).annotations
+        or leaf.op_cls.rmw_operands(leaf.kwargs)
+        or any(not isinstance(expr, Const) for pair in region.ranges for expr in pair)
+    ):
+        return False
+    contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
+    return (
+        isinstance(contract, (CopyContract, PermutationContract, PointwiseContract, SliceContract))
+        and leaf.operand_bindings.get(contract.output_operand) == region
+        and contract.output_operand not in leaf.access_patterns
+    )
+
+
+def _unobserved_write(
+    ir: KernelIR, block_nid: int, leaf_nid: int, output: BufferRegion, positions: dict[int, int] | None
+) -> bool:
+    """Prove a reused on-chip value is overwritten before any subsequent read.
+
+    The candidate owns no allocations, so deleting its block cannot move or
+    remove live storage. A later read of any part of the tensor rejects the
+    match. The first later write must unconditionally cover the exact same
+    region; uncertain control flow and partial writes remain ineligible.
+    """
+    if (
+        ir.tree.block(block_nid).alloc_buffers
+        or ir.buffer(output.tensor).location not in {"sbuf", "psum"}
+        or not _plain_full_write(ir, leaf_nid, output)
+    ):
+        return False
+    if positions is None:
+        positions = {nid: index for index, nid in enumerate(ir.tree.preorder())}
+    touches = sorted(ir.dependency.touches_by_tensor.get(output.tensor, ()), key=positions.__getitem__)
+    for nid in touches:
+        if positions[nid] <= positions[leaf_nid]:
+            continue
+        access = ir.dependency.info(nid)
+        if output.tensor in access.reads:
+            return False
+        if output.tensor in access.writes:
+            return _plain_full_write(ir, nid, output)
+    return True
 
 
 __all__ = ["EliminateDeadProducer", "EliminateDeadProducerOption"]

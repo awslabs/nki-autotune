@@ -1,9 +1,12 @@
 """Integer bit-pattern operations through native ``tensor_scalar``."""
 
-from collections.abc import Mapping
+import operator
+from collections.abc import Callable, Mapping
 from typing import Any, ClassVar
 
 import numpy as np
+import torch
+from torch.fx import Node
 
 from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
 
@@ -14,6 +17,25 @@ _BITWISE = {
     "left_shift": np.left_shift,
     "right_shift": np.right_shift,
 }
+
+
+def bounded_index_quotient(
+    call: Callable[..., Node], cast_op: Callable[..., object], indices: Node, width: int, divisor: int
+) -> tuple[Node, Node]:
+    """Compute unsigned quotient and exact FP32 values for bounded indices."""
+    if not 0 < divisor <= width <= 2**24:
+        raise ValueError("index quotient requires an exact FP32 index bound")
+    shape = (1, width)
+    if divisor & (divisor - 1) == 0:
+        quotient = call(operator.rshift, (indices, divisor.bit_length() - 1), shape)
+        return quotient, call(cast_op, (quotient, "float32"), shape)
+    positions = call(cast_op, (indices, "float32"), shape)
+    scaled = call(operator.mul, (positions, 1.0 / divisor), shape)
+    rounded = call(cast_op, (call(cast_op, (scaled, "uint32"), shape), "float32"), shape)
+    excess = call(operator.sub, (call(operator.mul, (rounded, divisor), shape), positions), shape)
+    correction = call(torch.clamp, (excess,), shape, min=0.0, max=1.0)
+    values = call(operator.sub, (rounded, correction), shape)
+    return call(cast_op, (values, "uint32"), shape), values
 
 
 class NKIBitwiseScalar(NKIOp):

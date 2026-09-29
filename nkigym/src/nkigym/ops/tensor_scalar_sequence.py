@@ -5,14 +5,16 @@ from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import NKIOp, PointwiseSequenceContract, _operand_role
-from nkigym.ops.tensor_scalar import _OPS
+from nkigym.ops.activation import NKIActivation
+from nkigym.ops.base import NKIOp, PointwiseContract, PointwiseSequenceContract, _operand_role
+from nkigym.ops.tensor_scalar import _OPS, NKITensorScalar
 
 
 class NKITensorScalarSequence(NKIOp):
     """Apply two scalar or per-partition operators in one Vector Engine instruction."""
 
     NAME: ClassVar[str] = "tensor_scalar"
+    PARTITION_BATCH_OPERANDS: ClassVar[tuple[str, ...]] = ("data", "dst")
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {
         "data": ("P", "F"),
         "operand0": ("P", "B"),
@@ -63,6 +65,55 @@ class NKITensorScalarSequence(NKIOp):
             operands = (operand, result) if kwargs.get(f"reverse{index}", False) else (result, operand)
             result = _OPS[kwargs[f"op{index}"]](*operands)
         return result
+
+
+def _affine_scalar(contract: PointwiseContract) -> tuple[str, float, bool] | None:
+    """Represent one affine copy as a single scalar operation."""
+    result: tuple[str, float, bool] | None = None
+    if contract.scale == 1.0 and contract.bias != 0.0:
+        result = ("add", contract.bias, False)
+    elif contract.scale == -1.0:
+        result = ("subtract", contract.bias, True)
+    elif contract.bias == 0.0 and contract.scale != 1.0:
+        result = ("multiply", contract.scale, False)
+    return result
+
+
+def supports_scalar_literal(value: object) -> bool:
+    """Accept floats and integer constants represented exactly in FP32."""
+    return isinstance(value, float) or type(value) is int and abs(value) <= 1 << 24
+
+
+def native_scalar_sequence_kwargs(
+    producer_cls: type[NKIOp],
+    producer_kwargs: Mapping[str, Any],
+    producer: PointwiseContract,
+    consumer_operator: str,
+    has_operand: bool,
+) -> dict[str, Any] | None:
+    """Return native sequence parameters for one affine pointwise producer."""
+    kwargs: dict[str, Any] | None = None
+    if producer_cls is NKIActivation and producer.operator == "copy":
+        scalar = _affine_scalar(producer)
+        if scalar is not None:
+            op0, literal, reverse0 = scalar
+            kwargs = {"op0": op0, "operand0": literal, "op1": consumer_operator}
+            if reverse0:
+                kwargs["reverse0"] = True
+    elif (
+        producer_cls is NKITensorScalar
+        and producer.operator in _OPS.keys() - {"divide"}
+        and producer.input_operands == ("data", "operand0")
+        and producer.broadcast_operands == frozenset({"operand0"})
+    ):
+        literal = producer_kwargs.get("operand0")
+        if (not has_operand) == supports_scalar_literal(literal):
+            kwargs = {"op0": producer.operator, "op1": consumer_operator}
+            if not has_operand:
+                kwargs["operand0"] = float(literal) if isinstance(literal, int) else literal
+            if producer.reverse:
+                kwargs["reverse0"] = True
+    return kwargs
 
 
 __all__ = ["NKITensorScalarSequence"]

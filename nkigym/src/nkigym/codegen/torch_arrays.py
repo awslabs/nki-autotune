@@ -5,6 +5,23 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from nkigym.profile.types import _physical_numpy_dtype
+
+ArrayResult = np.ndarray | tuple[np.ndarray, ...]
+
+
+def _cast_output(array: np.ndarray, name: str) -> np.ndarray:
+    """Cast one output through its physical ABI dtype."""
+    value = np.asarray(array).astype(_physical_numpy_dtype(name), copy=False)
+    return value.astype(np.float32, copy=False) if "float" in name else value
+
+
+def _cast_output_dtypes(result: ArrayResult, output_dtypes: tuple[str, ...]) -> ArrayResult:
+    """Cast adapted outputs to the dtypes allocated by the generated kernel."""
+    arrays = result if isinstance(result, tuple) else (result,)
+    casted = tuple(_cast_output(array, name) for array, name in zip(arrays, output_dtypes, strict=True))
+    return casted[0] if len(casted) == 1 else casted
+
 
 def as_numpy(value: object) -> np.ndarray:
     """Convert one Torch or array-like value to a CPU NumPy array."""

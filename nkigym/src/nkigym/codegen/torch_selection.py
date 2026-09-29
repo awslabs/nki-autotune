@@ -1,13 +1,14 @@
 """Emit exact comparator-based selection from native operations."""
 
 from contextlib import nullcontext
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import dataclass, field, replace
+from typing import Literal, cast
 
 from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.dynamic_slice_copy import emit_window_updates
 from nkigym.ops.dynamic_slice_load import emit_adaptive_window, emit_window_pair
 from nkigym.ops.flatten_store import emit_parallel_partition
+from nkigym.ops.hbm_scalar_row_slice import emit_fp32_row
 from nkigym.ops.inplace_max8 import emit_native_prefix, native_prefix_chunk
 from nkigym.ops.inplace_tensor_copy import emit_parallel_sort_partitions
 from nkigym.ops.max8 import emit_batched_topk
@@ -28,6 +29,21 @@ class SelectionEmitter(ControlEmitter):
     values: str
     indices: str
     index_cast: Literal["NKIUInt16Cast", "NKIUInt32Cast"] = field(default="NKIUInt32Cast", kw_only=True)
+
+    def select_row(self, loaded: str, k: int, sorted_output: bool, native: bool) -> tuple[str, str]:
+        """Select one loaded row, retaining the exact comparator fallback."""
+        self.values = loaded
+        if native and sorted_output and native_prefix_chunk(self.width, k) is not None:
+            values, indices, accepted = emit_native_prefix(self, self.values, self.width, k)
+            zero = self.cast("NKIUInt32Cast", self.iota(1))
+            with self.guard(self.inverse(accepted)):
+                self.indices = emit_indices(self, self.width)
+                self.copy_windows((values, indices), select_topk(self, k, sorted_output), zero)
+            selected = values, indices
+        else:
+            self.indices = emit_indices(self, self.width)
+            selected = select_topk(self, k, sorted_output)
+        return selected
 
     def gather_index(self, position: str) -> str:
         """Clamp speculative positions and encode the native unsigned indices."""
@@ -143,7 +159,7 @@ def _partition(
     emitter: ControlEmitter, sources: tuple[str, str], bounds: tuple[str, str], enabled: str, width: int
 ) -> str:
     """Choose a pivot and partition one materialized interval."""
-    emit = SelectionEmitter(emitter.stem, emitter.body, emitter.imports, width, *sources, depth=emitter.depth)
+    emit = replace(cast(SelectionEmitter, emitter), width=width, values=sources[0], indices=sources[1])
     first, last = bounds
     cut = emit.copy(first)
     with emit.guard(enabled):
@@ -223,7 +239,13 @@ def insertion(emit: SelectionEmitter, first: str, last: str) -> None:
             values, item = emit.gather(emit.values, positions), emit.gather(emit.values, cursor)
             finite, item_finite = emit.binary("equal", values, values), emit.binary("equal", item, item)
             before = emit.binary(
-                "maximum", emit.scalar("less", values, item), emit.scalar("multiply", finite, emit.inverse(item_finite))
+                "maximum",
+                emit.scalar("less", values, item),
+                emit.scalar(
+                    "multiply",
+                    finite if emit.nan_first else emit.inverse(finite),
+                    emit.inverse(item_finite) if emit.nan_first else item_finite,
+                ),
             )
             inside = emit.binary(
                 "multiply", emit.scalar("greater_equal", positions, first), emit.scalar("less", positions, cursor)
@@ -266,16 +288,8 @@ def push_frame(
 
 def sort_prefix(emit: SelectionEmitter, stop: int, zero: str, one: str) -> None:
     """Partition bounded prefixes in parallel, then apply exact local finishing."""
-    prefix = SelectionEmitter(
-        emit.stem,
-        emit.body,
-        emit.imports,
-        stop,
-        emit.slice(emit.values, 0, stop),
-        emit.slice(emit.indices, 0, stop),
-        depth=emit.depth,
-        index_cast=emit.index_cast,
-    )
+    prefix = replace(emit, width=stop)
+    prefix.values, prefix.indices = (emit.slice(value, 0, stop) for value in (emit.values, emit.indices))
     if 16 < stop <= 256 and emit.width <= 1 << 24:
         shape = (max(1, stop // 17), stop)
         bounds, remaining = emit_parallel_sort_partitions(
@@ -333,9 +347,7 @@ def select_topk(emit: SelectionEmitter, k: int, sorted_output: bool) -> tuple[st
         raise ValueError(f"top-k {k} is outside the input width {emit.width}")
     zero = emit.iota(1)
     one = emit.scalar("add", zero, 1.0)
-    selected = emit.scalar("add", zero, float(k))
-    limit = emit.scalar("add", zero, float(emit.width))
-    nth = emit.scalar("add", zero, float(k - 1))
+    selected, limit, nth = (emit.scalar("add", zero, float(value)) for value in (k, emit.width, k - 1))
     if emit.full_sort:
         with emit.guard(one):
             sort_prefix(emit, emit.width, zero, one)
@@ -365,10 +377,13 @@ def select_topk(emit: SelectionEmitter, k: int, sorted_output: bool) -> tuple[st
 
 
 def select_rows(
-    emit: SelectionEmitter, source: str, rows: int, k: int, sorted_output: bool, initial: tuple[str, str, str] | None
-) -> tuple[str, str]:
-    """Select HBM rows, optionally preserving previously validated native results."""
+    emit: SelectionEmitter, source: TorchValue, k: int, sorted_output: bool, initial: tuple[str, str, str] | None
+) -> tuple[tuple[str, str], bool]:
+    """Select rows and report whether the result tensors reside in HBM."""
+    rows = source.shape[0]
     emit.index_cast = "NKIUInt16Cast" if emit.width <= 65536 else "NKIUInt32Cast"
+    if rows == 1 and initial is None:
+        return emit.select_row(emit_fp32_row(emit, source, None), k, sorted_output, True), False
     row = emit.iota(1)
     one = emit.scalar("add", row, 1.0)
     if initial is None:
@@ -379,31 +394,17 @@ def select_rows(
     emit.imports.add("NKIHBMScalarRowStore")
     with emit.repeat(rows):
         register = emit.emit("NKIRegisterLoad", f"src={emit.cast('NKIUInt32Cast', row)}", "index=0")
-        enabled = one
+        valid = one
         if initial is not None:
             valid = emit.emit(
                 "NKIHBMScalarRowSlice", f"src={initial[0]}, indices={register}, index=0", "rows=1, width=1"
             )
-            enabled = emit.inverse(valid)
-        with emit.guard(enabled) if initial is not None else nullcontext():
-            loaded = emit.emit(
-                "NKIHBMScalarRowSlice", f"src={source}, indices={register}, index=0", f"rows=1, width={emit.width}"
-            )
-            emit.values = emit.cast("NKIFloat32Cast", loaded)
-            if initial is None and sorted_output and native_prefix_chunk(emit.width, k) is not None:
-                values, indices, accepted = emit_native_prefix(emit, emit.values, emit.width, k)
-                zero = emit.cast("NKIUInt32Cast", emit.iota(1))
-                with emit.guard(emit.inverse(accepted)):
-                    emit.indices = emit_indices(emit, emit.width)
-                    emit.copy_windows((values, indices), select_topk(emit, k, sorted_output), zero)
-                selected = values, indices
-            else:
-                emit.indices = emit_indices(emit, emit.width)
-                selected = select_topk(emit, k, sorted_output)
+        with emit.guard(emit.inverse(valid)) if initial is not None else nullcontext():
+            selected = emit.select_row(emit_fp32_row(emit, source, register), k, sorted_output, initial is None)
             for destination, value in zip(outputs, selected, strict=True):
                 emit.line(f"{destination} = NKIHBMScalarRowStore()(src={value}, indices={register}, dst={destination})")
         emit.write(row, emit.scalar("add", row, 1.0), one)
-    return outputs[0], outputs[1]
+    return (outputs[0], outputs[1]), True
 
 
 def emit_torch_topk(
@@ -414,22 +415,19 @@ def emit_torch_topk(
     body: list[str],
     imports: set[str],
     full_sort: bool = False,
+    nan_first: bool = True,
 ) -> tuple[TorchValue, TorchValue]:
     """Lower a normalized Torch matrix with exact value and index ordering."""
     if source.transposed or len(source.shape) != 2:
         raise ValueError("top-k requires a materialized row-major matrix")
     sorted_output = sorted_output or k * 64 <= source.shape[1]
-    emit = SelectionEmitter(f"sbuf_{stem}", body, imports, source.shape[1], "", "")
-    emit.full_sort = full_sort
+    emit = SelectionEmitter(f"sbuf_{stem}", body, imports, source.shape[1], "", "", full_sort=full_sort)
+    emit.nan_first = nan_first
     data = source.name if source.is_hbm else emit.emit("NKIStore", f"src={source.name}")
-    selected = emit_batched_topk(
+    return emit_batched_topk(
         emit,
         data,
         (source.shape[0], source.shape[1]),
-        k,
-        sorted_output,
-        lambda initial: select_rows(emit, data, source.shape[0], k, sorted_output, initial),
+        (k, sorted_output, full_sort),
+        lambda initial: select_rows(emit, replace(source, name=data, is_hbm=True), k, sorted_output, initial),
     )
-    names = tuple(emit.emit("NKILoad", f"src={value}") for value in selected)
-    shape = (source.shape[0], k)
-    return (TorchValue(names[0], shape, storage_dtype="float32"), TorchValue(names[1], shape, storage_dtype="uint32"))

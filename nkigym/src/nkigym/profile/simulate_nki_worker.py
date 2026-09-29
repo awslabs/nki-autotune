@@ -15,19 +15,20 @@ import traceback
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager, nullcontext
+from ctypes import CDLL, CFUNCTYPE, c_float
 from functools import cache
 from math import erf
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import ml_dtypes
 import nki
 import numpy as np
 
-_FP_DTYPES_NON_FP32 = """
-bfloat16 float16 float8_e4m3 float8_e4m3fn float8_e4m3fn_x4
-float8_e5m2 float8_e5m2_x4 float4_e2m1fn_x4 tfloat32
-""".split()
+_FMA = np.frompyfunc(CFUNCTYPE(c_float, c_float, c_float, c_float)(("fmaf", CDLL("libm.so.6"))), 3, 1)
+
+_FP_DTYPES_NON_FP32 = "bfloat16 float16 float8_e4m3 float8_e4m3fn float8_e4m3fn_x4 float8_e5m2 float8_e5m2_x4 float4_e2m1fn_x4 tfloat32".split()
 ArrayResult = np.ndarray | tuple[np.ndarray, ...]
 _SerializedCase = tuple[int, str, str, str, dict[str, np.ndarray], ArrayResult, tuple[str, dict[str, object]] | None]
 _FailurePayload = dict[str, int | str]
@@ -42,7 +43,7 @@ _OUTPUT = re.compile(r"(?m)^\s+(\w+) = nl\.ndarray\([^\n]*dtype=nl\.(\w+), buffe
 
 def _fp32_source(source: str) -> str:
     """Rewrite reduced-precision NKI language dtypes to fp32."""
-    preserved = set(re.findall(r"\b(sbuf_semantic_\w+|\w+(?=\s*=.*float8_\w+.*shared_hbm))\s*=", source))
+    preserved = set(re.findall(r"\b(sbuf_semantic_\w+|\w+(?=\s*=.*float8_\w+.*(?:private|shared)_hbm))\s*=", source))
     pairs = re.findall(r"nisa\.(?:dma_transpose|nc_matmul)\((?:src|stationary)=(\w+).*?(?:dst|moving)=(\w+)", source)
     preserved.update(right for left, right in pairs if left in preserved)
     for name in preserved:
@@ -322,7 +323,8 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
     SimulatorTensorView = importlib.import_module("nki._backends.simulator.tensor_view").SimulatorTensorView
     language_ops = cast(Any, importlib.import_module("nki.language._ops"))
 
-    original_activation = simulator.activation
+    original_activation, original_match = simulator.activation, simulator.nc_match_replace8
+    original_find = simulator.nc_find_index8
     original_matmul, original_copy, original_sendrecv = simulator.nc_matmul, simulator.tensor_copy, simulator.sendrecv
     original_tensor_tensor, original_reduce_op = simulator.tensor_tensor_arith, language_ops.get_numpy_reduce_op
     original_get, original_set = SimulatorTensorView.get_data, SimulatorTensorView.set_data
@@ -355,10 +357,8 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
 
     def item_pages(item: dict[str, Any]) -> frozenset[int]:
         """Return and cache storage pages touched by one provenance view."""
-        pages = item.get("pages")
-        if pages is None:
-            pages = frozenset(item_indices(item) // (1 << 13))
-            item["pages"] = pages
+        if (pages := item.get("pages")) is None:
+            item["pages"] = pages = frozenset(item_indices(item) // (1 << 13))
         return cast(frozenset[int], pages)
 
     def remap_positions(view: Any, absolute: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -380,8 +380,7 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
                 return selected, np.where(selected, rows * counts[0] + columns, 0)
             coordinates = relative[:, None] // steps % counts
             selected = (relative >= 0) & (coordinates @ steps == relative)
-            positions = coordinates @ strides
-            return selected, np.where(selected, positions, 0)
+            return selected, np.where(selected, coordinates @ strides, 0)
         order = np.argsort(indices := view_indices(view), kind="stable")
         indices = indices[order]
         locations = np.searchsorted(indices, absolute, side="right") - 1
@@ -440,8 +439,7 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
 
     def flush_symbolic(view: Any) -> None:
         """Materialize only symbolic panels selected by one read."""
-        panels = take_symbolic(view)
-        if not panels:
+        if not (panels := take_symbolic(view)):
             return
         data = original_get(view).copy().reshape(-1)
         grouped: dict[bytes, list[dict[str, Any]]] = {}
@@ -566,8 +564,7 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
         else:
             original_copy(dst, src, engine, name)
         if panels:
-            key = _view_key(dst)
-            symbolic.setdefault(key[:2], {})[key] = {"dirty": True, "panels": panels, "view": dst}
+            symbolic.setdefault((key := _view_key(dst))[:2], {})[key] = {"dirty": True, "panels": panels, "view": dst}
 
     def sendrecv(src: Any, dst: Any, *arguments: object, **keywords: object) -> None:
         """Exchange peer data and exact symbolic matmul provenance."""
@@ -599,20 +596,22 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
         if panels:
             symbolic.setdefault(destination[:2], {})[destination] = {"dirty": True, "panels": panels, "view": dst}
 
-    def activation(**keywords: object) -> None:
-        """Evaluate erf-based activations in FP32 when simulator approximations are too coarse."""
+    def activation(**keywords: Any) -> None:
+        """Match affine FMA while preserving the existing erf/gelu evaluation."""
         operation = str(keywords["op"])
-        if operation not in {"erf", "gelu"} or keywords["reduce_op"] is not None:
+        if operation not in {"copy", "erf", "gelu"} or keywords["reduce_op"] is not None:
             original_activation(**keywords)
             return
-        values = get_data(keywords["data"]).astype(np.float32) * cast(float, keywords["scale"])
-        bias = keywords["bias"]
+        operands = [keywords[key] for key in ("data", "scale", "bias")]
+        data, scale, bias = (get_data(value) if hasattr(value, "tensor") else value for value in operands)
+        values = data.astype(np.float32) * scale
         if bias is not None:
-            values = values + (get_data(bias).astype(np.float32) if hasattr(bias, "tensor") else cast(float, bias))
-        transformed = values / np.sqrt(2.0) if operation == "gelu" else values
-        result = np.asarray(np.frompyfunc(erf, 1, 1)(transformed), dtype=np.float32)
-        result = 0.5 * values * (1.0 + result) if operation == "gelu" else result
-        set_data(keywords["dst"], result)
+            values = _FMA(data, scale, bias).astype(np.float32) if operation == "copy" else values + bias
+        if operation != "copy":
+            transformed = values / np.sqrt(2.0) if operation == "gelu" else values
+            result = np.asarray(np.frompyfunc(erf, 1, 1)(transformed), dtype=np.float32)
+            values = 0.5 * values * (1.0 + result) if operation == "gelu" else result
+        set_data(keywords["dst"], values)
 
     def matmul(**keywords: object) -> None:
         """Record one contraction tile or delegate unsupported matmul modes."""
@@ -629,14 +628,8 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
         should_accumulate = keywords["accumulate"] if keywords["accumulate"] is not None else key in written
         if keywords["accumulate"] is False or key not in bucket:
             invalidate_written_view(dst)
-            bucket[key] = {
-                "base": original_get(dst).copy() if should_accumulate else None,
-                "dirty": False,
-                "moving": [],
-                "name": [],
-                "stationary": [],
-                "view": dst,
-            }
+            base = original_get(dst).copy() if should_accumulate else None
+            bucket[key] = dict(base=base, dirty=False, moving=[], name=[], stationary=[], view=dst)
         bucket[key]["stationary"].append(left.copy())
         bucket[key]["moving"].append(right.copy())
         bucket[key]["name"].append(str(keywords["name"]))
@@ -658,8 +651,34 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
 
         return reduce
 
+    def find_index8(**keywords: Any) -> None:
+        """Reserve successive matches in forward query order, as observed on Trn2."""
+        destination = keywords["dst"]
+        data, values = (
+            keywords[name].get_data().reshape(destination.shape[0], -1).astype(np.float32) for name in ("data", "vals")
+        )
+        result = np.full(values.shape, np.iinfo(np.uint32).max, dtype=np.uint32)
+        for column in range(values.shape[1]):
+            matches = data == values[:, column, None]
+            rows = np.flatnonzero(matches.any(axis=1))
+            result[rows, column] = matches[rows].argmax(axis=1)
+            data[rows, result[rows, column]] = np.nan
+        destination.set_data(result.reshape(destination.shape).astype(to_numpy_dtype(destination.dtype)))
+
+    def match_replace8(**keywords: Any) -> None:
+        """Match the reverse-column order verified on Trn2."""
+        values, indices = keywords["vals"], keywords["dst_idx"]
+        flip = lambda value: value.reshape(value.shape[0], -1)[:, ::-1].reshape(value.shape)
+        keywords["vals"] = SimpleNamespace(get_data=lambda: flip(values.get_data()))
+        if indices is not None:
+            keywords["dst_idx"] = SimpleNamespace(
+                dtype=indices.dtype, shape=indices.shape, set_data=lambda value: indices.set_data(flip(value))
+            )
+        original_match(**keywords)
+
     language_ops.get_numpy_reduce_op = numpy_reduce_op
-    simulator.activation = activation
+    simulator.activation, simulator.nc_match_replace8 = activation, match_replace8
+    simulator.nc_find_index8 = find_index8
     simulator.nc_matmul, simulator.tensor_copy, simulator.tensor_tensor_arith = matmul, tensor_copy, tensor_tensor
     simulator.sendrecv = sendrecv
     SimulatorTensorView.get_data, SimulatorTensorView.set_data = get_data, set_data
@@ -667,7 +686,8 @@ def _grouped_matmul_accumulation() -> Iterator[None]:
         yield
     finally:
         language_ops.get_numpy_reduce_op = original_reduce_op
-        simulator.activation = original_activation
+        simulator.activation, simulator.nc_match_replace8 = original_activation, original_match
+        simulator.nc_find_index8 = original_find
         simulator.nc_matmul, simulator.tensor_copy = original_matmul, original_copy
         simulator.tensor_tensor_arith = original_tensor_tensor
         simulator.sendrecv = original_sendrecv
@@ -729,12 +749,8 @@ def _simulate_case(position: int) -> _FailurePayload | None:
         except AssertionError:
             _assert_outputs(_simulate_source_fp32(source, func_name, inputs, grouped=True), case)
     except Exception as error:
-        return {
-            "case_index": case_index,
-            "label": label,
-            "exception_type": type(error).__name__,
-            "traceback": traceback.format_exc(),
-        }
+        failure_type, detail = type(error).__name__, traceback.format_exc()
+        return dict(case_index=case_index, label=label, exception_type=failure_type, traceback=detail)
     return None
 
 

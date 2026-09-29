@@ -43,4 +43,62 @@ def emit_indices(emit: TorchArithmetic, width: int) -> str:
     )
 
 
+def uniform_order(width: int, count: int, sorted_output: bool, full_sort: bool) -> tuple[int, ...]:
+    """Specialize the existing sort/selection algorithm to an always-false comparator."""
+    if not 1 <= count <= width:
+        raise ValueError("selection count must be inside the input width")
+    indices = list(range(width))
+
+    def partition(first: int, last: int) -> int:
+        """Apply median-of-three selection and symmetric equal-key partitioning."""
+        middle = (first + last) // 2
+        indices[first], indices[middle] = indices[middle], indices[first]
+        left, right = first + 1, last - 1
+        while left < right:
+            indices[left], indices[right] = indices[right], indices[left]
+            left, right = left + 1, right - 1
+        return left
+
+    def sort(first: int, last: int) -> None:
+        """Apply introsort partitions; equal-key insertion cleanup leaves their order."""
+        pending = [(first, last)]
+        while pending:
+            first, last = pending.pop()
+            if last - first > 16:
+                split = partition(first, last)
+                pending.extend(((first, split), (split, last)))
+
+    def adjust(hole: int, length: int, value: int) -> None:
+        """Repair an equal-key heap by following its right child when available."""
+        child = 2 * hole + 2
+        while child < length:
+            indices[hole] = indices[child]
+            hole = child
+            child = 2 * hole + 2
+        if child - 1 < length:
+            indices[hole] = indices[child - 1]
+            hole = child - 1
+        indices[hole] = value
+
+    if full_sort:
+        sort(0, width)
+    elif count * 64 <= width:
+        for parent in range(count // 2 - 1, -1, -1):
+            adjust(parent, count, indices[parent])
+        for last in range(count - 1, 0, -1):
+            saved, indices[last] = indices[last], indices[0]
+            adjust(0, last, saved)
+    elif width > 3:
+        first, last = 0, width
+        while last - first > 3:
+            split = partition(first, last)
+            if split < count:
+                first = split
+            else:
+                last = split
+        if sorted_output:
+            sort(0, count - 1)
+    return tuple(indices[:count])
+
+
 __all__ = ["NKIUInt16Iota"]

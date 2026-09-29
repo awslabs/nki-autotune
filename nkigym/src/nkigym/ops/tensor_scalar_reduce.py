@@ -5,12 +5,14 @@ mapped tile and one per-partition reduction result.
 """
 
 from collections.abc import Mapping
+from functools import partial
 from numbers import Real
 from typing import Any, ClassVar, Literal
 
 import numpy as np
 
 from nkigym.ops.base import AxisRole, NKIOp, ReductionContract, _operand_role, reduction_combinator
+from nkigym.ops.tensor_reduce import _minimum_reduce
 from nkigym.ops.tensor_scalar import NKITensorScalar
 
 _OPS: dict[str, Any] = {
@@ -18,8 +20,14 @@ _OPS: dict[str, Any] = {
     "add": np.add,
     "multiply": np.multiply,
     "subtract": np.subtract,
+    "greater_equal": lambda left, right: np.greater_equal(left, right).astype(np.float32),
 }
-_REDUCE_FNS: dict[str, Any] = {"add": np.sum, "max": np.max, "maximum": np.max}
+_REDUCE_FNS: dict[str, Any] = {
+    "add": np.sum,
+    "max": np.max,
+    "maximum": np.max,
+    "minimum": partial(_minimum_reduce, reset=True),
+}
 
 
 class NKITensorScalarReduce(NKIOp):
@@ -40,11 +48,12 @@ class NKITensorScalarReduce(NKIOp):
     REQUIRED_INPUT_STORAGE_DTYPES: ClassVar[dict[str, str]] = {"operand0": "float32"}
     RFACTOR_RECIPE: ClassVar[Literal["rmw", "slot"] | None] = "slot"
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
-    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 1, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
     SUPPORTED_MAP_OPERATORS: ClassVar[frozenset[str]] = frozenset(_OPS)
     SUPPORTED_REDUCERS: ClassVar[frozenset[str]] = frozenset(_REDUCE_FNS)
+    FINITE_MAP_OPERATORS: ClassVar[frozenset[str]] = frozenset({"greater_equal"})
 
     @classmethod
     def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> ReductionContract:

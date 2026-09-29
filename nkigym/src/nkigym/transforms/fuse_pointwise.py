@@ -10,12 +10,18 @@ from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.activation_reduce import NKIActivationReduce
 from nkigym.ops.base import AxisRole, CopyContract, NKIOp, PointwiseContract, ReductionContract
+from nkigym.ops.float8_cast import supports_fused_rounding
+from nkigym.ops.float32_load import pointwise_copy_contracts
 from nkigym.ops.range_select import NKIRangeSelect
 from nkigym.ops.range_select_reduce import NKIRangeSelectReduce
 from nkigym.ops.scalar_tensor_tensor import NKIScalarTensorTensor
 from nkigym.ops.tensor_scalar import _OPS, NKITensorScalar
 from nkigym.ops.tensor_scalar_reduce import NKITensorScalarReduce
-from nkigym.ops.tensor_scalar_sequence import NKITensorScalarSequence
+from nkigym.ops.tensor_scalar_sequence import (
+    NKITensorScalarSequence,
+    native_scalar_sequence_kwargs,
+    supports_scalar_literal,
+)
 from nkigym.ops.tensor_tensor import NKITensorTensor
 from nkigym.transforms.base import (
     ActivationComposition,
@@ -32,7 +38,7 @@ from nkigym.transforms.helper.canonical_rewrite import block_chain, finalize_rew
 from nkigym.transforms.helper.tree_ops import _replace_in_parent_children
 
 _ACTIVATION_REDUCERS = frozenset({"add"})
-_TENSOR_SCALAR_REDUCERS = frozenset({"add", "maximum", "multiply"})
+_TENSOR_SCALAR_REDUCERS = frozenset({"add", "maximum", "minimum", "multiply"})
 
 
 @dataclass(frozen=True)
@@ -108,7 +114,7 @@ class _ReductionFusion:
 
 
 class FusePointwise(Transform[FusePointwiseOption]):
-    """Fuse one adjacent pointwise producer into its native consumer ISA."""
+    """Fuse an adjacent pair containing a pointwise operation into one native ISA."""
 
     def analyze(self, ir: KernelIR) -> list[FusePointwiseOption]:
         """Enumerate adjacent pointwise-consumer pairs with a native fused ISA."""
@@ -172,7 +178,7 @@ class FusePointwise(Transform[FusePointwiseOption]):
             return None
         node = ir.tree.isa(producer)
         if node.op_cls is not NKIRangeSelect and not isinstance(
-            node.op_cls.algebraic_contract(node.kwargs), PointwiseContract
+            node.op_cls.algebraic_contract(node.kwargs), (PointwiseContract, CopyContract)
         ):
             return None
         if adjacent is None:
@@ -204,6 +210,8 @@ class FusePointwise(Transform[FusePointwiseOption]):
         if loops[0] != loops[1]:
             return None
         fusion = self._resolve_copy(ir, option, buffers)
+        if isinstance(node.op_cls.algebraic_contract(node.kwargs), CopyContract):
+            return fusion
         if fusion is None:
             fusion = resolve_activation_composition(
                 ir, option.pointwise_block_nid, option.consumer_block_nid, self._has_unique_consumer, buffers
@@ -324,17 +332,25 @@ class FusePointwise(Transform[FusePointwiseOption]):
         if (left == intermediate) == (right == intermediate):
             return None
         other, reverse1 = (right, False) if left == intermediate else (left, True)
-        kwargs = self._sequence_kwargs(producer_leaf, producer, consumer.operator, operand0)
+        kwargs = native_scalar_sequence_kwargs(
+            producer_leaf.op_cls, producer_leaf.kwargs, producer, consumer.operator, operand0 is not None
+        )
         if kwargs is None or kwargs["op0"] not in operators:
             return None
+        if (
+            isinstance(producer_leaf.kwargs.get("operand0"), int)
+            and buffers[intermediate.tensor].physical_dtype() != "float32"
+        ):
+            return None
         if scalar:
-            if left != intermediate or (other is None) != isinstance(consumer_leaf.kwargs.get("operand0"), float):
+            literal = consumer_leaf.kwargs.get("operand0")
+            if left != intermediate or (other is None) != supports_scalar_literal(literal):
                 return None
             if any(buffers[region.tensor].physical_dtype() != "float32" for region in (intermediate, destination)):
                 return None
             kwargs["engine"], reverse1 = "vector", consumer.reverse
             if other is None:
-                kwargs["operand1"] = consumer_leaf.kwargs["operand0"]
+                kwargs["operand1"] = float(literal) if isinstance(literal, int) else literal
         legal = (
             data.ranges == intermediate.ranges == destination.ranges
             and (
@@ -376,33 +392,6 @@ class FusePointwise(Transform[FusePointwiseOption]):
             kwargs=kwargs,
         )
 
-    def _sequence_kwargs(
-        self, producer_leaf: ISANode, producer: PointwiseContract, consumer_operator: str, operand0: BufferRegion | None
-    ) -> dict[str, Any] | None:
-        """Return native sequence kwargs for one activation or tensor-scalar producer."""
-        kwargs: dict[str, Any] | None = None
-        if producer_leaf.op_cls is NKIActivation and producer.operator == "copy":
-            scalar = self._affine_scalar(producer)
-            if scalar is not None:
-                op0, literal, reverse0 = scalar
-                kwargs = {"op0": op0, "operand0": literal, "op1": consumer_operator}
-                if reverse0:
-                    kwargs["reverse0"] = True
-        elif (
-            producer_leaf.op_cls is NKITensorScalar
-            and producer.operator in _OPS.keys() - {"divide"}
-            and producer.input_operands == ("data", "operand0")
-            and producer.broadcast_operands == frozenset({"operand0"})
-        ):
-            literal = producer_leaf.kwargs.get("operand0")
-            if (operand0 is None) == isinstance(literal, float):
-                kwargs = {"op0": producer.operator, "op1": consumer_operator}
-                if operand0 is None:
-                    kwargs["operand0"] = literal
-                if producer.reverse:
-                    kwargs["reverse0"] = True
-        return kwargs
-
     def _sequence_axes(self, block: BlockNode) -> dict[str, tuple[str | None, tuple[int, int], AxisRole, Expr]]:
         """Compare scalar-operation axes without requiring identical broadcast dimension names."""
         bindings = {
@@ -413,17 +402,6 @@ class FusePointwise(Transform[FusePointwiseOption]):
             abstract: (None if abstract == "B" else concrete, *bindings[concrete])
             for abstract, concrete in block.axis_map.items()
         }
-
-    def _affine_scalar(self, contract: PointwiseContract) -> tuple[str, float, bool] | None:
-        """Represent one affine copy as a single scalar operation."""
-        result: tuple[str, float, bool] | None = None
-        if contract.scale == 1.0 and contract.bias != 0.0:
-            result = ("add", contract.bias, False)
-        elif contract.scale == -1.0:
-            result = ("subtract", contract.bias, True)
-        elif contract.bias == 0.0 and contract.scale != 1.0:
-            result = ("multiply", contract.scale, False)
-        return result
 
     def _rewrite_sequence(self, ir: KernelIR, match: _PointwiseSequenceMatch) -> None:
         """Replace two exact pointwise instructions by their native sequence ISA."""
@@ -448,10 +426,14 @@ class FusePointwise(Transform[FusePointwiseOption]):
     def _resolve_copy(
         self, ir: KernelIR, option: FusePointwiseOption, buffers: dict[str, Buffer]
     ) -> _PointwiseCopyMatch | None:
-        """Resolve a pointwise result followed by one value-preserving copy."""
+        """Fold a copy or FP32 result's final low-precision rounding into its producer.
+
+        Scalar and Vector Engine arithmetic computes in FP32 before converting
+        to the destination dtype. A narrower intermediate must remain when
+        widening would otherwise discard its already-observable rounding.
+        """
         result: _PointwiseCopyMatch | None = None
-        pointwise_nid = option.pointwise_block_nid
-        copy_nid = option.consumer_block_nid
+        pointwise_nid, copy_nid = option.pointwise_block_nid, option.consumer_block_nid
         if (
             pointwise_nid in ir.tree.graph
             and copy_nid in ir.tree.graph
@@ -459,22 +441,15 @@ class FusePointwise(Transform[FusePointwiseOption]):
             and isinstance(ir.tree.data(copy_nid), BlockNode)
         ):
             pointwise_leaf_nid = single_leaf(ir.tree, pointwise_nid)
-            copy_leaf_nid = single_leaf(ir.tree, copy_nid)
-            pointwise_chain = block_chain(ir.tree, pointwise_nid)
-            copy_chain = block_chain(ir.tree, copy_nid)
-            if (
-                pointwise_leaf_nid is not None
-                and copy_leaf_nid is not None
-                and pointwise_chain is not None
-                and copy_chain is not None
-                and pointwise_chain[1:-1] == copy_chain[1:-1]
-            ):
-                pointwise_leaf = ir.tree.isa(pointwise_leaf_nid)
-                copy_leaf = ir.tree.isa(copy_leaf_nid)
-                pointwise = pointwise_leaf.op_cls.algebraic_contract(pointwise_leaf.kwargs)
-                copy_contract = copy_leaf.op_cls.algebraic_contract(copy_leaf.kwargs)
-                pointwise_block = ir.tree.block(pointwise_nid)
-                copy_block = ir.tree.block(copy_nid)
+            copy_leaf_nid = ir.dependency._leaf_of_block.get(copy_nid)
+            if pointwise_leaf_nid is not None and copy_leaf_nid is not None:
+                pointwise_leaf, copy_leaf = ir.tree.isa(pointwise_leaf_nid), ir.tree.isa(copy_leaf_nid)
+                pointwise, copy_contract = pointwise_copy_contracts(
+                    pointwise_leaf.op_cls.algebraic_contract(pointwise_leaf.kwargs),
+                    copy_leaf.op_cls.algebraic_contract(copy_leaf.kwargs),
+                    copy_leaf.op_cls,
+                )
+                pointwise_block, copy_block = ir.tree.block(pointwise_nid), ir.tree.block(copy_nid)
                 aligned = active_block_axes_align(pointwise_leaf, pointwise_block, copy_block)
                 if (
                     aligned
@@ -487,15 +462,32 @@ class FusePointwise(Transform[FusePointwiseOption]):
                     copied = copy_leaf.operand_bindings.get(copy_contract.input_operand)
                     destination = copy_leaf.operand_bindings.get(copy_contract.output_operand)
                     if intermediate is not None and intermediate == copied and destination is not None:
-                        source_buffer = buffers[intermediate.tensor]
-                        destination_buffer = buffers[destination.tensor]
+                        source_buffer, destination_buffer = buffers[intermediate.tensor], buffers[destination.tensor]
                         required_dtype = pointwise_leaf.op_cls.OUTPUT_STORAGE_DTYPE
                         legal = (
                             intermediate.tensor not in ir.param_buffers
                             and intermediate.tensor not in ir.return_names
                             and destination.tensor not in ir.param_buffers
                             and destination.tensor not in ir.return_names
-                            and source_buffer.dtype == destination_buffer.dtype
+                            and (
+                                source_buffer.physical_dtype() == destination_buffer.physical_dtype()
+                                or source_buffer.physical_dtype() == "float32"
+                                and supports_fused_rounding(
+                                    pointwise_leaf.op_cls,
+                                    pointwise,
+                                    pointwise_leaf.kwargs,
+                                    destination_buffer.physical_dtype(),
+                                )
+                                or pointwise_leaf.op_cls.NAME == "dma_copy"
+                                and len(pointwise.input_operands) == 1
+                                and (source := pointwise_leaf.operand_bindings.get(pointwise.input_operands[0]))
+                                is not None
+                                and buffers[source.tensor].location == "shared_hbm"
+                                and buffers[source.tensor].physical_dtype()
+                                == source_buffer.physical_dtype()
+                                in {"float16", "bfloat16"}
+                                and destination_buffer.physical_dtype() == "float32"
+                            )
                             and destination_buffer.location == pointwise_leaf.op_cls.OUTPUT_LOCATION
                             and (required_dtype is None or destination_buffer.physical_dtype() == required_dtype)
                             and tuple(width for _lower, width in intermediate.ranges)
@@ -516,11 +508,17 @@ class FusePointwise(Transform[FusePointwiseOption]):
         return result
 
     def _rewrite_copy(self, ir: KernelIR, match: _PointwiseCopyMatch) -> None:
-        """Write the pointwise result to the copy destination and remove the copy."""
+        """Fuse at the existing shared iteration scope and retain its carrier."""
+        producer, consumer = match.option.pointwise_block_nid, match.option.consumer_block_nid
+        retained, removed, leaf = (
+            (consumer, producer, match.copy_leaf_nid)
+            if self._nested_adjacent(ir, producer, consumer)
+            else (producer, consumer, match.pointwise_leaf_nid)
+        )
         pointwise = ir.tree.isa(match.pointwise_leaf_nid)
         bindings = dict(pointwise.operand_bindings)
         bindings[match.output_operand] = match.destination
-        ir.tree.graph.nodes[match.pointwise_leaf_nid]["data"] = replace(pointwise, operand_bindings=bindings)
+        ir.tree.graph.nodes[leaf]["data"] = replace(pointwise, operand_bindings=bindings)
 
         pointwise_block = ir.tree.block(match.option.pointwise_block_nid)
         copy_block = ir.tree.block(match.option.consumer_block_nid)
@@ -534,18 +532,14 @@ class FusePointwise(Transform[FusePointwiseOption]):
                 if buffer.name != match.intermediate.tensor
             }.values()
         )
-        ir.tree.graph.nodes[match.option.pointwise_block_nid]["data"] = replace(
-            pointwise_block, writes=writes, alloc_buffers=allocations
-        )
+        ir.tree.graph.nodes[retained]["data"] = replace(pointwise_block, writes=writes, alloc_buffers=allocations)
 
-        parent = ir.tree.parent(match.option.consumer_block_nid)
+        parent = ir.tree.parent(removed)
         if parent is None:
-            raise AssertionError(f"copy block {match.option.consumer_block_nid} has no parent")
+            raise AssertionError(f"fused block {removed} has no parent")
         remove_buffers(ir, {match.intermediate.tensor})
-        _replace_in_parent_children(ir.tree, parent, [match.option.consumer_block_nid], [])
-        ir.tree.graph.remove_nodes_from(
-            {match.option.consumer_block_nid, *ir.tree.descendants(match.option.consumer_block_nid)}
-        )
+        _replace_in_parent_children(ir.tree, parent, [removed], [])
+        ir.tree.graph.remove_nodes_from({removed, *ir.tree.descendants(removed)})
         finalize_rewrite(ir)
 
     def _resolve_activation(
@@ -1038,6 +1032,10 @@ class FusePointwise(Transform[FusePointwiseOption]):
             and pointwise.operator in NKITensorScalarReduce.SUPPORTED_MAP_OPERATORS
             and reduction.combinator.combiner in _TENSOR_SCALAR_REDUCERS
             and reduction.combinator.combiner in NKITensorScalarReduce.SUPPORTED_REDUCERS
+            and (
+                reduction.combinator.combiner != "minimum"
+                or pointwise.operator in NKITensorScalarReduce.FINITE_MAP_OPERATORS
+            )
         ):
             scalar_slot = next(iter(pointwise.broadcast_operands))
             data_slots = [slot for slot in pointwise.input_operands if slot != scalar_slot]

@@ -663,7 +663,7 @@ def _lower_prefix(ir: KernelIR, match: _Match, complete: _Match, chunk_size: int
 
 
 def _extend_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Prefix, chunk_size: int) -> _Prefix:
-    """Append one non-final recurrence stage while retaining the suffix."""
+    """Append one non-final stage, preserving its storage dtype and suffix."""
     index = len(prefix.plans)
     if not match.incremental_prefix or len(match.stages) != index + 1:
         raise ValueError("incremental extension requires exactly one stage")
@@ -671,13 +671,13 @@ def _extend_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pref
     names = NameSupply(set(original))
     stage = match.stages[index]
     state = stage.state_tensor
-    state_buffer = replace(ir.buffer(state), location="sbuf", storage_dtype="float32")
+    state_buffer = ir.buffer(state)
     contribution_leaf = match.stages[index].reducer_leaf
     contribution_source = ir.buffer(graph.outputs[contribution_leaf])
     if contribution_source.location != "sbuf":
         raise ValueError("online fusion requires an explicitly materialized SBUF contribution")
     contribution = names.fresh(f"{state}_online_chunk")
-    contribution_buffer = replace(contribution_source, name=contribution, storage_dtype="float32")
+    contribution_buffer = replace(contribution_source, name=contribution)
     current = names.fresh(f"{state}_online_current")
     plan = _Plan(state, contribution, current, None)
     plans = (*prefix.plans, plan)
@@ -732,7 +732,7 @@ def _extend_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pref
 
 
 def _complete_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Prefix, chunk_size: int) -> None:
-    """Append the final stage to one retained recurrence prefix."""
+    """Append the final stage while preserving its output and reduction dtypes."""
     if len(match.stages) != len(prefix.plans) + 1:
         raise ValueError("incremental completion requires exactly one stage")
     all_buffers = ir.all_buffers()
@@ -740,20 +740,19 @@ def _complete_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pr
     final_stage = match.stages[-1]
     source = ir.buffer(match.external_outputs[0])
     state = match.external_outputs[0]
-    state_buffer = replace(source, name=state, location="sbuf", storage_dtype="float32")
+    state_buffer = source
     contribution_leaf = match.stages[-1].reducer_leaf
     contribution_source = ir.buffer(graph.outputs[contribution_leaf])
     if contribution_source.location != "sbuf":
         raise ValueError("online fusion requires an explicitly materialized SBUF contribution")
     contribution = names.fresh(f"{final_stage.state_tensor}_online_chunk")
-    contribution_buffer = replace(contribution_source, name=contribution, storage_dtype="float32")
+    contribution_buffer = replace(contribution_source, name=contribution)
     final_plan = _Plan(state, contribution, state, None)
     plans = (*prefix.plans, final_plan)
     buffers = dict(all_buffers)
     buffers[state] = state_buffer
     buffers[contribution] = contribution_buffer
     mapped = _mapped(match, ir)
-    buffers[match.external_outputs[0]] = replace(source, location="sbuf", storage_dtype="float32")
     regions = _stage_regions(plans, prefix.regions) if mapped else {}
     init = OperationBuilder(ir.tree, None, buffers, names, regions, prefix.scopes[-1] if mapped else None)
     init_roots = [_emit_initializer(init, state, final_stage.combinator.identity)]
@@ -969,7 +968,11 @@ def _prepared_suffix_intact(ir: KernelIR, state: _Incremental) -> bool:
 
 
 def _prepared_stage_loop(ir: KernelIR, state: _Incremental) -> int | None:
-    """Require the next stage's producers and reducer to share an explicit progress loop."""
+    """Permit sharing only the stage's explicit progress loop.
+
+    State-only producers may lack a progress binding, but their enclosing
+    loops still need checking to avoid implicitly distributing shared work.
+    """
     match = state.remaining[0]
     leaves = set(match.derivation_leaves) - set(state.prefix.derivation_leaves)
     progress = []
@@ -988,16 +991,17 @@ def _prepared_stage_loop(ir: KernelIR, state: _Incremental) -> int | None:
         ]
         if len(loops) != 1:
             return None
-        if any(
-            isinstance(ir.tree.data(ancestor), ForNode)
-            and ancestor != loops[0]
-            and len(set(ir.tree.leaves(ancestor)) & leaves) > 1
-            for ancestor in ir.tree.ancestors(nid)
-        ):
-            return None
         progress.append(loops[0])
     loop = progress[0] if progress and len(set(progress)) == 1 else None
     if loop is not None and not set(ir.tree.leaves(loop)).issubset(leaves):
+        return None
+    if any(
+        isinstance(ir.tree.data(ancestor), ForNode)
+        and ancestor != loop
+        and len(set(ir.tree.leaves(ancestor)) & leaves) > 1
+        for nid in leaves
+        for ancestor in ir.tree.ancestors(nid)
+    ):
         return None
     return loop
 

@@ -1,4 +1,4 @@
-"""HBM → SBUF ``nisa.dma_copy`` operation."""
+"""HBM or SBUF → SBUF ``nisa.dma_copy`` operation."""
 
 from collections.abc import Mapping
 from typing import Any, ClassVar
@@ -10,11 +10,12 @@ from nkigym.ops.base import CopyContract, NKIOp, PartitionTileBatchingContract, 
 
 
 class NKILoad(NKIOp):
-    """Copy an HBM tensor into an SBUF buffer with identical logical layout."""
+    """Copy an HBM or SBUF tensor into SBUF with identical logical layout."""
 
     NAME: ClassVar[str] = "dma_copy"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"src": ("P", "F"), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"src": frozenset({"shared_hbm", "sbuf"})}
     """``nisa.dma_copy`` has no tile-size constraint beyond
     ``src.size == dst.size`` and partition-dim validation. Only the
     partition axis is capped by the NeuronCore's 128-partition SBUF
@@ -37,10 +38,10 @@ class NKILoad(NKIOp):
         return PartitionTileBatchingContract(operands=("src", "dst"))
 
     def _check_roles(self, **kwargs: Any) -> None:
-        """``src`` must be HBM-resident (``param``)."""
+        """Require an HBM or SBUF source."""
         role = _operand_role(kwargs["src"])
-        if role is not None and role not in {"param", "shared_hbm", "stored"}:
-            raise TypeError(f"NKILoad(src=<role={role}>) expects an HBM tensor")
+        if role is not None and role not in {"param", "shared_hbm", "stored", "sbuf"}:
+            raise TypeError(f"NKILoad(src=<role={role}>) expects an HBM or SBUF tensor")
 
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: allocate and return a copy of ``src``."""

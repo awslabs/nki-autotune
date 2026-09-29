@@ -23,6 +23,7 @@ from nkigym.codegen.torch_abi import (
     token_attention_graph,
     trace_function,
 )
+from nkigym.codegen.torch_arithmetic import TorchArithmetic
 from nkigym.codegen.torch_layout import Layouts as _Layouts
 from nkigym.codegen.torch_layout import input_layouts as discover_input_layouts
 from nkigym.codegen.torch_layout import layout_graph
@@ -30,29 +31,39 @@ from nkigym.codegen.torch_moe import emit_moe
 from nkigym.codegen.torch_selection import emit_torch_topk
 from nkigym.codegen.torch_values import TorchSegments as _Segments
 from nkigym.codegen.torch_values import TorchValue as _Value
-from nkigym.codegen.torch_values import emit_cast, emit_cumsum, emit_reduce, emit_slice, emit_topk
+from nkigym.codegen.torch_values import emit_cast, emit_cumsum, emit_reduce, emit_slice
 from nkigym.ir import build_initial_ir
 from nkigym.ir.dimension_analysis import _DIMENSION_TRACE_LOCK, analyze_dimensions
 from nkigym.ir.operand_layout import CanonicalTileError
 from nkigym.ops import _OP_MODULES
 from nkigym.ops.bfloat16_cast import cast_matmul_producer, emit_activation_with_storage
+from nkigym.ops.broadcast_load import emit_free_broadcast
 from nkigym.ops.find_index8 import emit_max_with_indices
 from nkigym.ops.float32_cast import emit_torch_cast
 from nkigym.ops.float32_scale import emit_tensor_scalar_or_divide
+from nkigym.ops.folded_load import PACKING_MARKER
 from nkigym.ops.gather import emit_routed_gather
 from nkigym.ops.grouped_counts_copy import emit_bincount_source, emit_grouped_bincount
 from nkigym.ops.grouped_int32_cast import emit_rotational_selection
 from nkigym.ops.grouped_load import configure_topk_layout, emit_output_stores
+from nkigym.ops.grouped_tensor_copy import emit_packed_reshape
+from nkigym.ops.grouped_tensor_scalar_reduce import emit_interval_counts
 from nkigym.ops.grouped_vector_store import emit_grouped_cross_entropy
 from nkigym.ops.index_iota import emit_packed_topk_indices
 from nkigym.ops.load import emit_loaded_oriented_value
 from nkigym.ops.matmul import emit_product
-from nkigym.ops.max8 import emit_native_topk, static_prefix_width
+from nkigym.ops.max8 import emit_native_topk
+from nkigym.ops.partition_slice_load import prepare_packed_binary
 from nkigym.ops.reciprocal import emit_activation_or_reciprocal
-from nkigym.ops.stream_shuffle_broadcast import _stream_shuffle_source, _supports_free_broadcast
+from nkigym.ops.reshape_store import reshape_view as _reshape_view
+from nkigym.ops.row_load import pack_pointwise_graph
+from nkigym.ops.tensor_copy_predicated import emit_sparse_values
 from nkigym.ops.tensor_reduce import emit_reference_sum
 from nkigym.ops.tensor_scalar import _tensor_scalar_operands, _vector_broadcast
+from nkigym.ops.tensor_slice import emit_clip, static_prefix_width, validate_argsort_options
+from nkigym.ops.tensor_tensor import emit_packed_variance
 from nkigym.ops.tiled_grouped_matmul import lower_grouped_attention
+from nkigym.ops.vector_dma_transpose import emit_packed_reduction
 from nkigym.profile import InputSpecs
 from nkigym.profile.abi import adapt_inputs, adapt_output, kernel_adapters, reference_graph
 from nkigym.synthesis.artifact import ArrayResult, SynthesizedKernel, _exec_nkigym_source, _results_match
@@ -61,7 +72,7 @@ _UNARY_OPERATIONS = {name: name for name in "exp log reciprocal rsqrt sqrt squar
 _BINARY_OPERATIONS = {
     item.split("=")[0]: item.split("=")[1]
     for item in "add=add iadd=add mul=multiply imul=multiply sub=subtract matmul=matmul "
-    "maximum=maximum truediv=divide".split()
+    "maximum=maximum truediv=divide rshift=right_shift".split()
 }
 _DIRECT_LOWERINGS = frozenset(
     "argsort bincount cat cross_entropy cross_entropy_backward cumsum logsumexp moe_experts nonzero_compact "
@@ -138,7 +149,11 @@ class _Lowerer:
         name, direct = str(node.target), direct_hbm_placeholder(node)
         shape, dtype = self.input_specs[name]
         self.values[node] = value = _Value(
-            name if direct else f"sbuf_{name}", shape, is_hbm=direct, storage_dtype=dtype
+            name if direct else f"sbuf_{name}",
+            shape,
+            is_hbm=direct,
+            storage_dtype=dtype,
+            hbm_source=name if len(shape) == 1 and dtype in {"bfloat16", "float16", "float32"} else None,
         )
         if not direct:
             self.body.append(f"{value.name} = NKILoad()(src={name})")
@@ -210,7 +225,11 @@ class _Lowerer:
             self.values[node] = _transpose_view(source)
         elif node.target == "reshape":
             shape = _node_shape(node)
-            self.values[node] = source if len(shape) > 2 else _reshape_view(source, shape)
+            self.values[node] = (
+                emit_packed_reshape(source, shape, node, self.body, self.imports)
+                if node.meta.get(PACKING_MARKER)
+                else source if len(shape) > 2 else _reshape_view(source, shape)
+            )
         else:
             raise ValueError(f"Torch synthesis does not support method {node.target!r}")
 
@@ -299,9 +318,16 @@ class _Lowerer:
         reduced = target if reduction != "add" else _Value(f"{target.name}_sum", target.shape)
         if reduction == "add":
             reduced = emit_reference_sum(source, node, reduced.name, self.body, self.imports)
-            target = self._activate(reduced, "copy", target.name, 1.0 / source.shape[1])
+            shape = node.meta.get(PACKING_MARKER)
+            target = self._activate(
+                reduced, "copy", target.name, 1.0 / (shape[-1] if isinstance(shape, tuple) else source.shape[1])
+            )
         else:
             self.body.append(f"{reduced.name} = {class_name}({arguments})(data={source.name})")
+            if isinstance(shape := node.meta.get(PACKING_MARKER), tuple):
+                emit = TorchArithmetic(target.name, self.body, self.imports)
+                target = emit_packed_reduction(reduced.name, int(np.prod(shape[:-1])), source.shape[0], emit, "max")
+                target = self._orient(target, False, node, "_rows")
         self.values[node] = (target,) if node.target == "max" else target
 
     def _lower_max_with_indices(self, node: Node) -> None:
@@ -311,7 +337,8 @@ class _Lowerer:
         keepdim = node.kwargs.get("keepdim", node.kwargs.get("keepdims"))
         if len(source.shape) != 2 or dimension not in {-1, 1} or not keepdim:
             raise ValueError("Torch max with indices requires rank two, dim=-1, and keepdim=True")
-        source = self._orient(source, False, node, "_data")
+        if source.transposed:
+            source = self._orient(source, False, node, "_data")
         self.values[cast(Node, node.args[0])] = source
         self.values[node] = emit_max_with_indices(source, node.name, self.body, self.imports)
 
@@ -323,24 +350,13 @@ class _Lowerer:
             source = self._cast(
                 source, class_name, f"sbuf_{'semantic_' if dtype != 'physical_bfloat16' else ''}{node.name}"
             )
-        elif dtype != "float32":
+        elif dtype not in {"float32", "uint32"}:
             raise ValueError(f"Torch synthesis does not support cast dtype {dtype!r}")
         self.values[node] = emit_torch_cast(source, node, self.body, self.imports)
 
     def _lower_clip(self, node: Node) -> None:
-        """Lower scalar lower and upper clipping bounds."""
-        source = self._value(cast(Node, node.args[0]))
-        self.imports.add("NKITensorScalar")
-        minimum = node.kwargs.get("min", node.args[1] if len(node.args) > 1 else None)
-        maximum = node.kwargs.get("max", node.args[2] if len(node.args) > 2 else None)
-        for operation, bound in (("maximum", minimum), ("minimum", maximum)):
-            if bound is not None:
-                target = _Value(f"sbuf_{node.name}_{operation}", source.shape, source.transposed)
-                self.body.append(
-                    f'{target.name} = NKITensorScalar(op0="{operation}")(data={source.name}, operand0={bound!r})'
-                )
-                source = target
-        self.values[node] = source
+        """Lower scalar clipping without losing its source dtype."""
+        self.values[node] = emit_clip(self._value(cast(Node, node.args[0])), node, self.body, self.imports)
 
     def _lower_var(self, node: Node) -> None:
         """Lower a rank-two population variance."""
@@ -348,6 +364,11 @@ class _Lowerer:
         if len(source.shape) != 2 or node.kwargs.get("dim") not in {-1, 1} or node.kwargs.get("correction") != 0:
             raise ValueError(f"Torch var requires rank two, dim=-1, and correction=0, got {source.shape}")
         source = self._orient(source, False, node, "_data")
+        if isinstance(node.meta.get(PACKING_MARKER), tuple):
+            self.values[node] = emit_packed_variance(
+                source, node, TorchArithmetic(f"sbuf_{node.name}", self.body, self.imports)
+            )
+            return
         mean, centered = f"sbuf_{node.name}_mean", f"sbuf_{node.name}_centered"
         target = _Value(f"sbuf_{node.name}", (source.shape[0],))
         self.imports.update(("NKIActivationReduce", "NKITensorScalar"))
@@ -412,6 +433,7 @@ class _Lowerer:
         self, left: _Value | float, right: _Value | float, operation: str, target_name: str, node: Node
     ) -> _Value:
         """Emit one non-segmented tensor binary operation."""
+        left, right = prepare_packed_binary(left, right, node, TorchArithmetic(target_name, self.body, self.imports))
         if operation == "divide" and isinstance(right, _Value):
             if not isinstance(left, _Value):
                 raise ValueError("Torch division requires a tensor numerator")
@@ -432,13 +454,11 @@ class _Lowerer:
                 if broadcast is None:
                     raise ValueError(f"Torch {operation} tensor broadcast is unsupported: {left.shape}, {right.shape}")
                 matrix, vector, reverse, transposed = broadcast
-                if transposed and _supports_free_broadcast(matrix.shape, vector.shape, operation):
-                    matrix, vector = self._orient(matrix, False, node, "_data"), self._orient(
-                        vector, False, node, "_operand"
-                    )
-                    broadcasted = _Value(f"{target_name}_broadcast", matrix.shape)
-                    self.imports.add("NKIStreamShuffleBroadcast")
-                    self.body.append(_stream_shuffle_source(broadcasted.name, vector.name, matrix.shape[0]))
+                emit = TorchArithmetic(target_name, self.body, self.imports)
+                orient = lambda value, suffix: self._orient(value, False, node, suffix)
+                prepared = emit_free_broadcast(matrix, vector, operation, emit, orient) if transposed else None
+                if prepared is not None:
+                    matrix, broadcasted = prepared
                     operands = (broadcasted, matrix) if reverse else (matrix, broadcasted)
                     return self._emit_binary(*operands, operation, target_name, node)
                 tensor = self._orient(matrix, transposed, node, "_data")
@@ -446,8 +466,6 @@ class _Lowerer:
             else:
                 tensor, scalar, reverse = _tensor_scalar_operands(left, right)
                 transposed, operand = tensor.transposed, repr(scalar)
-            if operation not in {"add", "divide", "greater_equal", "less", "maximum", "subtract", "multiply"}:
-                raise ValueError(f"NKITensorScalar does not support {operation}")
             native = node.meta.get("arithmetic") == "native"
             target = emit_tensor_scalar_or_divide(
                 tensor, operation, operand, reverse, target_name, self.body, self.imports, native
@@ -635,12 +653,9 @@ class _Lowerer:
                 )
                 thresholds.append(threshold)
             lower, upper = thresholds
-            minimum = self._emit_binary(source, lower, "greater_equal", f"sbuf_{node.name}_minimum_{start}", node)
-            maximum = self._emit_binary(source, upper, "less", f"sbuf_{node.name}_maximum_{start}", node)
-            mask = self._emit_binary(minimum, maximum, "multiply", f"sbuf_{node.name}_mask_{start}", node)
-            before = self._emit_binary(source, lower, "less", f"sbuf_{node.name}_before_{start}", node)
-            counts = self._reduce(mask, f"sbuf_{node.name}_counts_{start}", "copy", "add")
-            displacements = self._reduce(before, f"sbuf_{node.name}_displacements_{start}", "copy", "add")
+            counts, displacements = emit_interval_counts(
+                source, (lower, upper), f"sbuf_{node.name}_{start}", self.body, self.imports
+            )
             zeros = self._activate(counts, "copy", f"sbuf_{node.name}_zeros_{start}", 0.0)
             for values, value in zip(outputs, (counts, displacements, zeros), strict=True):
                 values.append(self._cast(value, "NKIInt32Cast", f"{value.name}_int32"))
@@ -654,8 +669,7 @@ class _Lowerer:
         valid_k = len(source.shape) == 2 and isinstance(k, int) and 1 <= k <= source.shape[1]
         if not valid_k or dimension not in {-1, 1} or not largest:
             raise ValueError("Torch topk requires rank two, valid k, dim=-1, and largest=True")
-        if source.transposed:
-            source = self._orient(source, False, node, "_data")
+        source = self._orient(source, False, node, "_data") if source.transposed else source
         self.sort_topk_output = False
         if config := node.meta.get("rotational_topk"):
             self.values[node] = emit_rotational_selection(
@@ -673,6 +687,7 @@ class _Lowerer:
             self.body,
             self.imports,
             full_sort=_operation_name(node.target) == "sorted_prefix",
+            nan_first=bool(node.kwargs.get("nan_first", True)),
         )
 
     def _lower_sparse_topk_affinity(self, node: Node) -> None:
@@ -682,38 +697,31 @@ class _Lowerer:
         count, activation = values.shape[1], node.args[3]
         if count not in {1, 8} or activation not in {"sigmoid", "softmax"}:
             raise ValueError("sparse affinity requires sigmoid or softmax and one or eight indices")
-        source = logits
+        compact = activation == "softmax" and not bool(node.args[4])
+        source = values if compact else logits
         if activation == "softmax":
             maximum = self._reduce(values, f"sbuf_{node.name}_maximum", "copy", "max")
-            source = self._emit_binary(logits, maximum, "subtract", f"sbuf_{node.name}_centered", node)
+            source = self._emit_binary(source, maximum, "subtract", f"sbuf_{node.name}_centered", node)
         transformed = self._activate(
             source, "exp" if activation == "softmax" else "sigmoid", f"sbuf_{node.name}_activated"
         )
-        selected = []
-        self.imports.add("NKIRangeSelect")
-        for position in range(count):
-            index = self._slice_value(indices, position, 1, node, f"_index_{position}")
-            bounds = self._cast(index, "NKIFloat32Cast", f"sbuf_{node.name}_bounds_{position}")
-            value = _Value(f"sbuf_{node.name}_selected_{position}", logits.shape, storage_dtype="float32")
-            self.body.append(
-                f'{value.name} = NKIRangeSelect(width={logits.shape[1]}, comp_op0="equal", comp_op1="equal")'
-                f"(on_true_tile={transformed.name}, bound0={bounds.name}, bound1={bounds.name})"
-            )
-            self.imports.add("NKITensorScalar")
-            nonnegative = _Value(f"{value.name}_nonnegative", value.shape, storage_dtype="float32")
-            self.body.append(f'{nonnegative.name} = NKITensorScalar(op0="maximum")(data={value.name}, operand0=0.0)')
-            selected.append(nonnegative)
-        target = selected[0]
-        for position, value in enumerate(selected[1:], 1):
-            target = self._emit_binary(target, value, "add", f"sbuf_{node.name}_sum_{position}", node)
+        target = (
+            transformed
+            if compact
+            else emit_sparse_values(transformed, indices, f"sbuf_{node.name}_selected", self.body, self.imports)
+        )
         if bool(node.args[4]) or activation == "softmax":
             total = self._reduce(target, f"sbuf_{node.name}_total", "copy", "add")
             reciprocal = self._activate(total, "reciprocal", f"sbuf_{node.name}_reciprocal")
             target = self._emit_binary(target, reciprocal, "multiply", f"{target.name}_normalized", node)
+        if compact:
+            target = emit_sparse_values(
+                target, indices, f"sbuf_{node.name}_selected", self.body, self.imports, output_width=logits.shape[1]
+            )
         self.values[node] = target
 
     def _lower_argsort(self, node: Node) -> None:
-        """Lower a descending argsort prefix through exact top-k selection."""
+        """Preserve native index ordering or lower an exact Torch sort prefix."""
         source_node = cast(Node, node.args[0])
         descending = bool(node.kwargs.get("descending", False))
         if _operation_name(source_node.target) == "neg" and not descending and len(source_node.users) == 1:
@@ -727,16 +735,16 @@ class _Lowerer:
             raise ValueError("Torch argsort requires one static prefix width")
         if not isinstance(width := widths.pop(), int) or width < 1 or width > source.shape[1]:
             raise ValueError("Torch argsort prefix width is invalid")
+        if not node.meta.get("native_index_order"):
+            validate_argsort_options(source, node.kwargs)
+        source = self._orient(source, False, node, "_data")
         self.values[node] = (
             emit_packed_topk_indices(source, width, node.name, self.body, self.imports)
-            if len(source_node.users) == 1 and source.shape[0] <= 128 and width % 8 == 0
-            else self._emit_topk(source, width, node)[1]
+            if node.meta.get("native_index_order")
+            else _Segments(
+                (emit_torch_topk(source, width, True, node.name, self.body, self.imports, True, descending)[1],)
+            )
         )
-
-    def _emit_topk(self, source: _Value, k: int, node: Node) -> tuple[_Segments, _Segments]:
-        """Emit repeated native top-eight selection rounds."""
-        source = self._orient(source, False, node, "_data")
-        return emit_topk(source, k, node.name, self.body, self.imports)
 
     def _slice_value(self, value: _Value, start: int, width: int, node: Node | None, suffix: str = "") -> _Value:
         """Copy one contiguous free-axis interval."""
@@ -752,19 +760,19 @@ class _Lowerer:
         return target
 
     def _lower_output(self, node: Node) -> None:
-        """Record tensor leaves returned by the FX graph."""
-        leaves = _flatten_output(node.args[0])
+        """Record outputs, retaining correctly oriented HBM storage owned by the kernel."""
         outputs: list[_Value] = []
         groups: list[int] = []
-        for item in leaves:
+        for item in _flatten_output(node.args[0]):
             value = self.values[item]
             shape = tuple(getattr(item.meta.get("tensor_meta", item.meta.get("example_value")), "shape", ()))
             segments = value.values if isinstance(value, _Segments) else (self._value(item),)
             preserve_orientation = len(shape) == 4 and shape[0] == 128 and np.prod(segments[0].shape) == np.prod(shape)
-            outputs.extend(
-                (segment if preserve_orientation else self._orient(segment, False, item, f"_output_{index}"))
-                for index, segment in enumerate(segments)
-            )
+            for index, segment in enumerate(segments):
+                copied = segment.name in self.input_specs or segment.name in [prior.name for prior in outputs]
+                keep = preserve_orientation or segment.is_hbm and not segment.transposed and not copied
+                keep |= len(segments) == 1 and segment.shape[-1] == 1 and not segment.is_hbm
+                outputs.append(segment if keep else self._orient(segment, False, item, f"_output_{index}"))
             groups.append(-len(segments) if isinstance(value, _Segments) and value.axis == 0 else len(segments))
         self.outputs, self.output_groups = tuple(outputs), tuple(groups)
 
@@ -908,6 +916,10 @@ def _lower_program(graph_module: GraphModule, input_specs: InputSpecs) -> _Progr
             if not changed:
                 raise
             continue
+        packed_graph = pack_pointwise_graph(graph_module)
+        if packed_graph is not graph_module:
+            function = _exec_nkigym_source(source := (lowerer := _Lowerer(packed_graph, normalized)).build())
+            initial_ir = build_initial_ir(function, normalized)
         return _Program(
             source,
             function,
@@ -1028,20 +1040,6 @@ def _transpose_view(value: _Value) -> _Value:
     if len(value.shape) != 2:
         raise ValueError(f"Torch transpose requires rank two, got {value.shape}")
     return _Value(value.name, tuple(reversed(value.shape)), not value.transposed, value.is_hbm, value.storage_dtype)
-
-
-def _reshape_view(value: _Value, shape: tuple[int, ...]) -> _Value:
-    """Return a no-copy rank-two singleton reshape."""
-    if len(shape) != 2 or int(np.prod(value.shape)) != int(np.prod(shape)):
-        raise ValueError(f"Torch reshape {value.shape} -> {shape} is unsupported")
-    if len(value.shape) == 1 and shape == (1, value.shape[0]):
-        return _Value(value.name, shape, transposed=True, is_hbm=value.is_hbm, storage_dtype=value.storage_dtype)
-    physical_shape = tuple(reversed(value.shape)) if value.transposed else value.shape
-    if physical_shape == shape:
-        return _Value(value.name, shape, is_hbm=value.is_hbm, storage_dtype=value.storage_dtype)
-    if physical_shape == tuple(reversed(shape)):
-        return _Value(value.name, shape, transposed=True, is_hbm=value.is_hbm, storage_dtype=value.storage_dtype)
-    raise ValueError(f"Torch reshape {value.shape} -> {shape} changes non-singleton layout")
 
 
 def _torch_dtype(dtype: str) -> torch.dtype:

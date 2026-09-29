@@ -8,8 +8,10 @@ import numpy as np
 from nkigym.codegen.torch_values import TorchValue, emit_topk
 from nkigym.ops.base import AxisRole, NKIOp, _operand_role
 from nkigym.ops.index_iota import emit_packed_topk_indices, native_prefix
+from nkigym.ops.iota import emit_first_sorted_value
 from nkigym.ops.register_load import ControlEmitter
 from nkigym.ops.transpose import emit_partition_sum
+from nkigym.ops.uint32_cast import emit_uniform_prefix
 
 
 class NKIMax8(NKIOp):
@@ -41,29 +43,43 @@ def emit_batched_topk(
     emit: ControlEmitter,
     source: str,
     shape: tuple[int, int],
-    count: int,
-    sorted_output: bool,
-    fallback: Callable[[tuple[str, str, str] | None], tuple[str, str]],
-) -> tuple[str, str]:
+    selection: tuple[int, bool, bool],
+    fallback: Callable[[tuple[str, str, str] | None], tuple[tuple[str, str], bool]],
+) -> tuple[TorchValue, TorchValue]:
     """Select rows together and enter fallback only if at least one is invalid."""
     rows, width = shape
-    if not (sorted_output and 1 < rows <= 128 and (count // 8 + 1) * 8 <= width <= 16384):
-        return fallback(None)
-    zero = emit.emit("NKIIota", "", "partitions=1, width=1, pattern=[[0, 1]], channel_multiplier=0")
-    one = emit.scalar("add", zero, 1.0)
-    rejected = emit.copy(zero)
-    with emit.guard(one):
-        loaded = emit.emit("NKILoad", f"src={source}")
-        values, indices, valid = native_prefix(
-            emit, emit.cast("NKIFloat32Cast", loaded), width, count, rows, per_partition=True
-        )
-        outputs = tuple(emit.emit("NKIStore", f"src={value}") for value in (values, indices))
+    count, sorted_output, full_sort = selection
+    if full_sort and count == 1 and 1 <= rows <= 128 and 1 <= width <= 16:
+        loaded = emit.cast("NKIFloat32Cast", emit.emit("NKILoad", f"src={source}"))
+        return emit_first_sorted_value(emit, loaded, shape)
+    if not (sorted_output and 1 <= rows <= 128 and (rows > 1 or full_sort) and (count // 8 + 1) * 8 <= width <= 16384):
+        outputs, is_hbm = fallback(None)
+    else:
+        loaded = emit.cast("NKIFloat32Cast", emit.emit("NKILoad", f"src={source}"))
+        values, indices, valid = native_prefix(emit, loaded, width, count, rows, per_partition=True)
+        if full_sort:
+            values, indices, valid = emit_uniform_prefix(
+                emit, loaded, (rows, width, count, full_sort), (values, indices, valid)
+            )
+        outputs = (values, indices)
+        emit.imports.add("NKIInplaceTensorCopy")
+        copy_config = f"groups=1, partitions={rows}, start=0, width={count}, engine='vector'"
         flags = emit.emit("NKIStore", f"src={valid}")
         complete = emit_partition_sum(emit, valid)
-        emit.write(rejected, emit.scalar("less", complete, float(rows)), one)
-    with emit.guard(rejected):
-        outputs = fallback((flags, outputs[0], outputs[1]))
-    return outputs
+        rejected = emit.scalar("less", complete, float(rows))
+        with emit.guard(rejected):
+            tables = tuple(emit.emit("NKIStore", f"src={value}") for value in outputs)
+            recovered, _ = fallback((flags, tables[0], tables[1]))
+            for destination, table in zip(outputs, recovered, strict=True):
+                value = emit.emit("NKILoad", f"src={table}")
+                emit.line(f"{destination} = NKIInplaceTensorCopy({copy_config})(src={value}, dst={destination})")
+        is_hbm = False
+    names = tuple(emit.emit("NKILoad", f"src={value}") if is_hbm else value for value in outputs)
+    output_shape = (rows, count)
+    return (
+        TorchValue(names[0], output_shape, storage_dtype="float32"),
+        TorchValue(names[1], output_shape, storage_dtype="uint32"),
+    )
 
 
 def emit_native_topk(
@@ -91,13 +107,6 @@ def emit_native_topk(
     values = TorchValue(f"sbuf_{stem}_selected", positions.shape, storage_dtype=source.storage_dtype)
     body.append(f"{values.name} = NKINCGather()(data={source.name}, indices={positions.name})")
     return values, positions
-
-
-def static_prefix_width(index: object) -> int | None:
-    """Return the width of one ``[..., :k]`` index."""
-    selector = index[-1] if isinstance(index, tuple) and index else None
-    candidate = selector.stop if isinstance(selector, slice) and selector.start is selector.step is None else None
-    return candidate if isinstance(candidate, int) else None
 
 
 __all__ = ["NKIMax8"]

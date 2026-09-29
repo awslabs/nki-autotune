@@ -11,6 +11,7 @@ class TorchArithmetic:
     body: list[str]
     imports: set[str]
     depth: int = field(default=0, kw_only=True)
+    nan_first: bool = field(default=True, kw_only=True)
 
     def emit(self, operation: str, operands: str, configuration: str = "") -> str:
         """Emit one native-operation instance and return its SSA name."""
@@ -70,11 +71,13 @@ class TorchArithmetic:
         return self.emit("NKITensorCopy", f"src={value}", "engine='vector'")
 
     def before(self, left: str, right: str) -> str:
-        """Compare descending values with NaNs ordered first."""
+        """Compare descending values with the selected NaN ordering."""
         finite_left, finite_right = self.binary("equal", left, left), self.binary("equal", right, right)
-        missing = self.inverse(finite_left)
+        missing = self.inverse(finite_left if self.nan_first else finite_right)
         return self.binary(
-            "maximum", self.binary("greater", left, right), self.binary("multiply", missing, finite_right)
+            "maximum",
+            self.binary("greater", left, right),
+            self.binary("multiply", missing, finite_right if self.nan_first else finite_left),
         )
 
     def clamp(self, data: str, lower: str | float, upper: str | float) -> str:

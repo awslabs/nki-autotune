@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from functools import reduce
 from math import gcd, prod
 
 from nkigym.ir.arith.expr import Add, Const, Expr, FloorDiv, Mod, Mul, Var
@@ -50,12 +51,7 @@ def canonical_trip_count(rec: _OpRecord, abstract: str, analysis: _AnalysisResul
 
 def _sum(terms: list[Expr]) -> Expr:
     """Return an expression sum with a canonical zero identity."""
-    if not terms:
-        return Const(value=0)
-    result = terms[0]
-    for term in terms[1:]:
-        result = Add(left=result, right=term)
-    return result
+    return reduce(lambda left, right: Add(left=left, right=right), terms) if terms else Const(value=0)
 
 
 def _groups(rec: _OpRecord, slot: str, analysis: _AnalysisResult) -> tuple[tuple[str, ...], ...]:
@@ -149,18 +145,16 @@ def _row_major_strides(axes: tuple[str, ...], extents: dict[str, int], base: int
     return {axis: base * prod(extents[other] for other in axes[index + 1 :]) for index, axis in enumerate(axes)}
 
 
-def _storage_strides(rec: _OpRecord, slot: str, analysis: _AnalysisResult, tile_size: TileSize) -> dict[str, int]:
-    """Return flattened allocation strides for every operand axis."""
+def _storage_strides(
+    rec: _OpRecord, slot: str, analysis: _AnalysisResult, tile_size: TileSize
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Return view strides and divisors for loops crossing partition tiles."""
     tensor = analysis.tensors[rec.operand_names[slot]]
     groups = _groups(rec, slot, analysis)
     extents = {axis: _axis_extent(rec, axis, analysis) for group in groups for axis in group}
     if tensor.location == "shared_hbm":
-        bases = tuple(prod(tensor.shape[index + 1 :]) for index in range(len(tensor.shape)))
-        return {
-            axis: stride
-            for group, base in zip(groups, bases, strict=True)
-            for axis, stride in _row_major_strides(group, extents, base).items()
-        }
+        axes = tuple(axis for group in groups for axis in group)
+        return _row_major_strides(axes, extents, 1), {}
     if len(groups) not in {1, 2}:
         raise ValueError(f"{rec.op_cls.__name__}.{slot} on-chip views require rank one or two")
     leading, free = tensor.shape[0], tensor.shape[1] if len(tensor.shape) == 2 else 1
@@ -174,14 +168,14 @@ def _storage_strides(rec: _OpRecord, slot: str, analysis: _AnalysisResult, tile_
     while cut > 0 and suffix_product < partition:
         cut -= 1
         suffix_product *= extents[first[cut]]
-    if suffix_product != partition:
+    if suffix_product % partition:
         raise ValueError(f"{rec.op_cls.__name__}.{slot} cannot expose its partition axes")
     prefix, suffix = first[:cut], first[cut:]
-    strides = _row_major_strides(prefix, extents, free)
+    strides = _row_major_strides(prefix, extents, free * (suffix_product // partition))
     strides.update(_row_major_strides(suffix, extents, leading // partition * free))
     if len(groups) == 2:
         strides.update(_row_major_strides(groups[1], extents, 1))
-    return strides
+    return strides, {first[cut]: leading} if suffix_product != partition else {}
 
 
 def _view_dimension(
@@ -215,11 +209,16 @@ def build_access_patterns(
         view = rec.op_cls.operand_view_axis_groups(slot)
         if view is None or slot not in rec.operand_names:
             continue
-        strides = _storage_strides(rec, slot, analysis, tile_size)
+        strides, divisors = _storage_strides(rec, slot, analysis, tile_size)
         offset_terms = [
             term
             for axis, stride in strides.items()
-            if (term := _axis_offset(rec, axis, stride, 1, loop_vars, analysis, tile_size, trip_count)) is not None
+            if (
+                term := _axis_offset(
+                    rec, axis, stride, divisors.get(axis, 1), loop_vars, analysis, tile_size, trip_count
+                )
+            )
+            is not None
         ]
         patterns[slot] = AccessPattern(
             pattern=tuple(_view_dimension(rec, slot, group, strides, analysis, tile_size) for group in view),

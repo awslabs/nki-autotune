@@ -302,7 +302,16 @@ def _rewritten_psum_buffer(
     partition_width = rewrites[0].leaf.operand_bindings["dst"].ranges[0][1]
     shape = ir.buffer(target_output).shape
     result: Buffer | None = None
-    if isinstance(partition_width, Const):
+    if (
+        isinstance(partition_width, Const)
+        and partition_width.value == ir.buffer(target_output).partition_extent()
+        and all(
+            region.ranges[0][1] == partition_width
+            for rewrite in rewrites
+            for region in rewrite.leaf.operand_bindings.values()
+            if region.tensor in {target_psum, target_output}
+        )
+    ):
         candidate = replace(
             ir.buffer(target_psum),
             shape=shape,

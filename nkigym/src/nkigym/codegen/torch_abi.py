@@ -11,7 +11,8 @@ import numpy as np
 import torch
 from torch.fx import GraphModule, Node
 
-from nkigym.ops.folded_load import grouped_context_input
+from nkigym.ops.bitwise_scalar import bounded_index_quotient
+from nkigym.ops.folded_load import direct_hbm_user, grouped_context_input
 from nkigym.ops.folded_store import grouped_context_attention_graph
 from nkigym.ops.grouped_tensor_copy import grouped_attention
 
@@ -200,32 +201,6 @@ def normalize_topk_output(values: np.ndarray, indices: np.ndarray, sort_output: 
     return values, indices
 
 
-def routed_input(
-    kind: str, array: np.ndarray, expert_index: np.ndarray, top_k: int, shape: tuple[int, ...]
-) -> np.ndarray:
-    """Build one stable-sort or gathered-data routed-token input."""
-    routes = expert_index.reshape(-1).astype(np.int64)
-    tokens = np.repeat(np.arange(expert_index.shape[0]), top_k)
-    if kind == "routed_hidden":
-        result = np.repeat(array, top_k, axis=0)
-    elif kind == "routed_keys":
-        sorted_routes = np.sort(routes)[::-1]
-        positions = {int(expert): iter(np.flatnonzero(routes == expert)) for expert in np.unique(routes)}
-        order = np.empty(routes.size, dtype=np.int64)
-        for start in range(0, routes.size, 8):
-            for offset in range(min(8, routes.size - start) - 1, -1, -1):
-                order[start + offset] = next(positions[int(sorted_routes[start + offset])])
-        keys = np.empty(routes.size, dtype=np.float32)
-        keys[order] = np.arange(routes.size, 0, -1, dtype=np.float32)
-        result = keys.reshape(1, -1)
-    elif kind == "routed_data":
-        selected = array[tokens, routes]
-        result = np.stack((selected, tokens), axis=1)
-    else:
-        raise ValueError(f"unknown routed-token input layout {kind!r}")
-    return result.reshape(shape)
-
-
 def token_attention_input(
     kind: str,
     array: np.ndarray,
@@ -259,15 +234,13 @@ def token_attention_input(
 
 def direct_hbm_placeholder(node: Node) -> bool:
     """Return whether one routed placeholder is consumed directly from HBM."""
-    if str(node.target) == "expert_down_weights" or (
-        node.users and all(user.target in {torch.cumsum, torch.topk} for user in node.users)
-    ):
+    if str(node.target) == "expert_down_weights" or (node.users and all(direct_hbm_user(user) for user in node.users)):
         return True
     for user in node.users:
         operation = str(getattr(user.target, "__name__", user.target)).removeprefix("wrapped_")
         index = next(iter(user.args[1:]), None)
         routed = isinstance(index, tuple) and (
-            index[:2] in {("routed_tokens", "data"), ("routed_tokens", "hidden")}
+            index[:2] in {("routed_tokens", "data"), ("routed_tokens", "hidden"), ("routed_tokens", "keys")}
             or index[:1] in {("grouped_context",), ("metadata_groups",), ("moe_gate_up",), ("rotational_topk",)}
         )
         target = operation == "long" and any(getattr(c.target, "__name__", 0) == "cross_entropy" for c in user.users)
@@ -293,25 +266,38 @@ def synthetic_graph(input_specs: InputSpecs) -> tuple[torch.fx.Graph, dict[str, 
 
 
 def routed_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | None:
-    """Build a static stable-sort and gather graph for routed tokens."""
+    """Compute route order, token indices and affinity addresses on the device."""
     target = getattr(f_torch, "function", f_torch)
     if getattr(target, "__name__", "") != "permute_routed_tokens_torch_ref":
         return None
     graph, inputs, call = synthetic_graph(input_specs)
     tokens, top_k = input_specs["expert_index"][0]
     routes, hidden = tokens * top_k, input_specs["hidden_input"][0][1]
+    experts = input_specs["expert_affinities_masked"][0][1]
+    if routes % 8 or tokens * experts > 2**24:
+        raise ValueError("routed permutation requires complete top-eight groups and exact FP32 addresses")
     layouts = {
-        "hidden_input": (("routed_tokens", "hidden", top_k), (routes, hidden)),
-        "expert_index": (("routed_tokens", "keys", top_k), (1, routes)),
-        "expert_affinities_masked": (("routed_tokens", "data", top_k), (routes, 2)),
+        "hidden_input": (("routed_tokens", "hidden", top_k), (tokens, hidden)),
+        "expert_index": (("routed_tokens", "keys", top_k), (routes, 1)),
+        "expert_affinities_masked": (("routed_tokens", "data", top_k), (tokens * experts, 1)),
     }
     values = {
         name: call(operator.getitem, (inputs[name], transform), shape) for name, (transform, shape) in layouts.items()
     }
-    ordered = call(torch.argsort, (values["expert_index"],), (1, routes), dim=-1, descending=True)
+    keys = call(getattr, (values["expert_index"], "T"), (1, routes))
+    ordered = call(torch.argsort, (keys,), (1, routes), dim=-1, descending=True)
+    ordered.meta["native_index_order"] = True
     indices = call(operator.getitem, (ordered, (Ellipsis, slice(None, routes))), (1, routes))
-    hidden_sorted = call(routed_gather, (values["hidden_input"], indices), (routes, hidden))
-    data_sorted = call(routed_gather, (values["expert_affinities_masked"], indices), (routes, 2))
+    unsigned = call(astype, (indices, "uint32"), (1, routes))
+    token_indices, token_values = bounded_index_quotient(call, astype, unsigned, routes, top_k)
+    hidden_sorted = call(routed_gather, (values["hidden_input"], token_indices), (routes, hidden))
+    selected_experts = call(routed_gather, (values["expert_index"], unsigned), (routes, 1))
+    expert_rows = call(getattr, (selected_experts, "T"), (1, routes))
+    offset = call(operator.add, (call(operator.mul, (token_values, experts), (1, routes)), expert_rows), (1, routes))
+    affinity_indices = call(astype, (offset, "uint32"), (1, routes))
+    affinities = call(routed_gather, (values["expert_affinities_masked"], affinity_indices), (routes, 1))
+    token_column = call(getattr, (token_values, "T"), (routes, 1))
+    data_sorted = call(torch.cat, ((affinities, token_column),), (routes, 2), dim=-1)
     graph.output([hidden_sorted, data_sorted])
     return GraphModule(torch.nn.Module(), graph)
 

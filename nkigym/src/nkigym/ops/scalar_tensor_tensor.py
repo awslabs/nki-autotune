@@ -32,7 +32,9 @@ class NKIScalarTensorTensor(NKIOp):
     }
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 1}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+    TENSORIZE_MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"F": 1}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
+    INPLACE_OPERANDS: ClassVar[dict[str, frozenset[str]]] = {"dst": frozenset({"data", "operand1"})}
 
     @classmethod
     def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> PointwiseSequenceContract:

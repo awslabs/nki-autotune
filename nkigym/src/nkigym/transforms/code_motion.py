@@ -24,7 +24,7 @@ from nkigym.transforms.copy_propagation import independent_loop_accesses
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
 from nkigym.transforms.helper.normalize import _substitute_block_regions
 from nkigym.transforms.helper.tree_ops import _block_local_descendants, _replace_in_parent_children
-from nkigym.transforms.split import _tensorized_loop_element_stride
+from nkigym.transforms.split import _tensorized_loop_element_stride, _view_axis_width
 
 
 @dataclass(frozen=True)
@@ -348,10 +348,14 @@ def _loop_element_stride(tree: KernelTree, block_nid: int, loop_nid: int) -> Fra
             else None
         )
         leaf = tree.isa(_owned_leaf(tree, block_nid))
-        folded = abstract is not None and any(
-            len(group) > 1 and abstract in group
-            for slot in leaf.operand_bindings
-            for group in leaf.op_cls.operand_axis_groups(slot)
+        folded = (
+            abstract is not None
+            and any(
+                len(group) > 1 and abstract in group
+                for slot in leaf.operand_bindings
+                for group in leaf.op_cls.operand_axis_groups(slot)
+            )
+            and _view_axis_width(leaf, abstract) is None
         )
         cache[key] = Fraction(1) if folded else _tensorized_loop_element_stride(tree, block_nid, loop_nid)
     return cache[key]

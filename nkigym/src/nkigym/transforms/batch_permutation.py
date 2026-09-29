@@ -9,7 +9,7 @@ from nkigym.ir.arith.analyzer import Analyzer
 from nkigym.ir.arith.expr import affine_coefficient, expr_variables
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.program_sharding import PROGRAM_SHARDS_ANNOTATION, configured_program_shards
-from nkigym.ir.tree import PARTITION_DIM, BlockNode, Buffer, BufferRegion, ForNode, ISANode
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import AxisRole, BatchedPermutationContract, PermutationContract
 from nkigym.transforms.base import (
     Transform,
@@ -236,7 +236,7 @@ def _supported_buffer(buffer: Buffer) -> bool:
     if buffer.location == "shared_hbm":
         valid = valid and buffer.versions == 1
     else:
-        valid = valid and buffer.list_len == 1 and buffer.shape[0] % PARTITION_DIM == 0
+        valid = valid and buffer.list_len == 1 and buffer.shape[0] % buffer.partition_extent() == 0
     return valid
 
 
@@ -268,9 +268,9 @@ def _contiguous_batch_axis(
         axis = varying[0]
         expected = widths[axis]
         if axis == 0 and buffer.location != "shared_hbm":
-            if widths[axis] % PARTITION_DIM != 0:
+            if widths[axis] % buffer.partition_extent() != 0:
                 return result
-            expected = widths[axis] // PARTITION_DIM
+            expected = widths[axis] // buffer.partition_extent()
         if coefficients[axis] == expected:
             result = axis
     return result
@@ -457,7 +457,7 @@ def _batch_stride(region: BufferRegion, buffer: Buffer, loop_var: str, local_ext
     second_coefficient = affine_coefficient(_local_batch_expr(region.ranges[1][0], loop_var, local_extent), loop_var)
     if first_coefficient is None or second_coefficient is None:
         raise AssertionError(f"{region.tensor}: batch stride is not affine in {loop_var}")
-    first_base_stride = buffer.shape[1]
+    first_base_stride = buffer.shape[1] if buffer.location == "shared_hbm" else buffer.per_tile_physical_shape()[2]
     stride = first_coefficient * first_base_stride + second_coefficient
     if stride <= 0:
         raise AssertionError(f"{region.tensor}: batch stride must be positive, got {stride}")
@@ -468,7 +468,8 @@ def _linear_offset(region: BufferRegion, buffer: Buffer, substitutions: dict[str
     """Return the flattened base offset for one logical two-dimensional region."""
     first = substitute(region.ranges[0][0], substitutions)
     second = substitute(region.ranges[1][0], substitutions)
-    return Analyzer().simplify(Add(left=Mul(left=first, right=Const(value=buffer.shape[1])), right=second))
+    stride = buffer.shape[1] if buffer.location == "shared_hbm" else buffer.per_tile_physical_shape()[2]
+    return Analyzer().simplify(Add(left=Mul(left=first, right=Const(value=stride)), right=second))
 
 
 def _widen_region(

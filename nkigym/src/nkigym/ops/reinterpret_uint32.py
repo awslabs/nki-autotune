@@ -7,6 +7,7 @@ import numpy as np
 from nkigym.codegen.torch_arithmetic import TorchArithmetic
 from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.float32_fma import finish_binary32_sqrt
 
 
 class NKIReinterpretUInt32(NKIOp):
@@ -38,47 +39,49 @@ class NKIReinterpretUInt32(NKIOp):
         return np.asarray(kwargs["src"]).view(np.uint32).copy()
 
 
-def emit_binary32_parts(emit: TorchArithmetic, source: str) -> tuple[str, str, str, str]:
+def emit_binary32_parts(emit: TorchArithmetic, source: str, positive_normal: bool = False) -> tuple[str, str, str, str]:
     """Extract bits, normalized integer significand, exponent, and raw exponent.
 
-    Subnormal inputs are normalized using integer significands, so no
-    floating arithmetic consumes subnormal data. Zero uses a temporary
-    nonzero significand; final bit assembly restores its original sign.
+    Integer significands are positive normal FP32 values after zero is
+    replaced temporarily. Their own exponent determines the normalization
+    shift; replacing it with 150 produces an exact 24-bit integer significand.
+    No floating arithmetic consumes the original subnormal input.
     """
     op = emit.binary
     bits = emit.cast("NKIReinterpretUInt32", source)
     field = emit.cast("NKIFloat32Cast", op("right_shift", op("bitwise_and", bits, 0x7FFFFFFF), 23))
+    if positive_normal:
+        significand = emit.cast("NKIFloat32Cast", op("bitwise_or", op("bitwise_and", bits, 0x7FFFFF), 0x800000))
+        return bits, significand, op("subtract", field, 127), field
     fraction = emit.cast("NKIFloat32Cast", op("bitwise_and", bits, 0x7FFFFF))
     significand = op("add", fraction, op("multiply", op("greater_equal", field, 1), 8388608))
     significand = op("add", significand, op("multiply", op("equal", significand, 0), 8388608))
-    exponent = op("subtract", op("maximum", field, 1), 127)
-    for shift in (16, 8, 4, 2, 1):
-        take = op("less", significand, 2 ** (24 - shift))
-        significand = op("multiply", significand, op("add", op("multiply", take, 2**shift - 1), 1))
-        exponent = op("subtract", exponent, op("multiply", take, shift))
+    significand_bits = emit.cast("NKIReinterpretUInt32", significand)
+    significand_field = emit.cast("NKIFloat32Cast", op("right_shift", significand_bits, 23))
+    exponent = op("subtract", op("add", op("maximum", field, 1), significand_field), 277)
+    normalized = op("bitwise_or", op("bitwise_and", significand_bits, 0x7FFFFF), 150 << 23)
+    significand = emit.cast("NKIReinterpretFloat32", normalized)
     return bits, significand, exponent, field
 
 
-def emit_binary32_sqrt(source: TorchValue, name: str, body: list[str], imports: set[str]) -> TorchValue:
+def emit_binary32_sqrt(
+    source: TorchValue, name: str, body: list[str], imports: set[str], positive_normal: bool = False
+) -> TorchValue:
     """Emit correctly rounded square roots using a refined native estimate.
 
     One Newton iteration bounds the integer root estimate to one unit.
-    Twelve-bit factors give its exact square modulo 2**32; the signed
-    residual selects the correctly rounded root. Final bit assembly
+    Column inputs use a single-rounded FMA residual; other shapes retain
+    the exact modulo-word square. The residual selects the correctly rounded root. Final bit assembly
     preserves zero signs and NaN payloads.
     """
     emit = TorchArithmetic(name, body, imports)
     op, integer = emit.binary, emit.integer
     data = source.name if source.storage_dtype == "float32" else emit.cast("NKIFloat32Cast", source.name)
-    bits, significand, exponent, field = emit_binary32_parts(emit, data)
-    mantissa = emit.cast("NKIUInt32Cast", significand)
+    bits, significand, exponent, field = emit_binary32_parts(emit, data, positive_normal)
     biased = emit.cast("NKIUInt32Cast", op("add", exponent, 254))
     parity = op("bitwise_and", biased, 1)
     exponent_bits = op("left_shift", op("right_shift", biased, 1), 23)
-    low = op("left_shift", mantissa, 23)
-    low = emit.select(parity, op("left_shift", low, 1), low)
     zero = op("bitwise_and", bits, 0)
-    one = op("bitwise_or", zero, 1)
     parity_float = emit.cast("NKIFloat32Cast", parity)
     scaled = op("multiply", significand, op("add", parity_float, 1))
     estimate = emit.emit("NKIActivation", f"data={scaled}", "op='sqrt', scale=8388608.0")
@@ -88,32 +91,33 @@ def emit_binary32_sqrt(source: TorchValue, name: str, body: list[str], imports: 
     combined = op("add", estimate, quotient)
     refined = emit.emit("NKIActivation", f"data={combined}", "op='copy', scale=0.5")
     root = emit.cast("NKIUInt32Cast", refined)
-    upper = emit.cast("NKIFloat32Cast", op("right_shift", root, 12))
-    lower = emit.cast("NKIFloat32Cast", op("bitwise_and", root, 4095))
-    upper_square = emit.cast("NKIUInt32Cast", op("multiply", upper, upper))
-    lower_square = emit.cast("NKIUInt32Cast", op("multiply", lower, lower))
-    cross = emit.cast("NKIUInt32Cast", op("multiply", upper, lower))
-    square = integer("add", op("left_shift", upper_square, 24), op("left_shift", cross, 13))
-    square = integer("add", square, lower_square)
-    remainder = integer("subtract", low, square)
-    upward = integer("subtract", integer("subtract", remainder, root), one)
-    downward = integer("subtract", integer("add", remainder, root), one)
-    increment = op("bitwise_xor", op("right_shift", upward, 31), 1)
-    decrement = op("right_shift", downward, 31)
+    if len(source.shape) == 1 or source.shape[1] == 1:
+        rounded = emit.cast("NKIFloat32Cast", root)
+        negative_root = op("multiply", rounded, -1.0)
+        remainder = emit.emit("NKIFloat32FMA", f"data={rounded}, scale={negative_root}, bias={radicand}")
+        increment = emit.cast("NKIUInt32Cast", op("greater", remainder, rounded))
+        decrement = emit.cast("NKIUInt32Cast", emit.inverse(op("greater", remainder, negative_root)))
+    else:
+        mantissa = emit.cast("NKIUInt32Cast", significand)
+        low = op("left_shift", mantissa, 23)
+        low = emit.select(parity, op("left_shift", low, 1), low)
+        one = op("bitwise_or", zero, 1)
+        upper = emit.cast("NKIFloat32Cast", op("right_shift", root, 12))
+        lower = emit.cast("NKIFloat32Cast", op("bitwise_and", root, 4095))
+        upper_square = emit.cast("NKIUInt32Cast", op("multiply", upper, upper))
+        lower_square = emit.cast("NKIUInt32Cast", op("multiply", lower, lower))
+        cross = emit.cast("NKIUInt32Cast", op("multiply", upper, lower))
+        square = integer("add", op("left_shift", upper_square, 24), op("left_shift", cross, 13))
+        square = integer("add", square, lower_square)
+        remainder = integer("subtract", low, square)
+        upward = integer("subtract", integer("subtract", remainder, root), one)
+        downward = integer("subtract", integer("add", remainder, root), one)
+        increment = op("bitwise_xor", op("right_shift", upward, 31), 1)
+        decrement = op("right_shift", downward, 31)
     root = integer("subtract", integer("add", root, increment), decrement)
     fraction = integer("subtract", root, op("bitwise_or", zero, 0x800000))
     result = integer("add", exponent_bits, fraction)
-    negative = op("right_shift", bits, 31)
-    nan = op("bitwise_or", zero, 0xFFC00000)
-    result = emit.select(negative, nan, result)
-    absolute = op("bitwise_and", bits, 0x7FFFFFFF)
-    nonzero = op("right_shift", op("bitwise_or", absolute, integer("subtract", zero, absolute)), 31)
-    result = emit.select(op("bitwise_xor", nonzero, 1), bits, result)
-    payload = op("bitwise_and", bits, 0x7FFFFF)
-    nonfinite = emit.select(negative, nan, bits)
-    nonzero = op("right_shift", op("bitwise_or", payload, integer("subtract", zero, payload)), 31)
-    nonfinite = emit.select(nonzero, op("bitwise_or", bits, 0x400000), nonfinite)
-    result = emit.select(op("equal", field, 255), nonfinite, result)
+    result = finish_binary32_sqrt(emit, result, bits, field, zero, positive_normal)
     imports.add("NKIReinterpretFloat32")
     body.append(f"{name} = NKIReinterpretFloat32()(src={result})")
     return TorchValue(name, source.shape, source.transposed, storage_dtype="float32")

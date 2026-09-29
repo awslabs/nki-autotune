@@ -77,7 +77,7 @@ def grouped_context_attention_graph(
         node.meta["example_value"] = SimpleNamespace(shape=shape)
         return node
 
-    dimensions = (groups, sequence // 128, sequence // 128, reduction, 128, 128, output_width)
+    dimensions = (groups, sequence // 128, sequence // 512, reduction, 128, 512, output_width)
     g, q, t, r, p, w, h = dimensions
     layouts = {
         "q": (("grouped_context", q_kind, *dimensions), (r, g * q * p)),
