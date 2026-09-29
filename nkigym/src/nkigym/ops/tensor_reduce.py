@@ -9,9 +9,21 @@ from torch.fx import Node
 from nkigym.codegen.torch_arithmetic import TorchArithmetic
 from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import AxisRole, NKIOp, ReductionContract, _operand_role, reduction_combinator
+from nkigym.ops.folded_load import PACKING_MARKER, _operation
 from nkigym.ops.strided_tensor_copy import emit_torch_sum
+from nkigym.ops.vector_dma_transpose import emit_packed_reduction
+from nkigym.ops.vector_partition_load import correct_overflow_sum
 
-_REDUCE_FNS: dict[str, Any] = {"add": np.sum, "max": np.max, "maximum": np.max, "multiply": np.prod}
+
+def _minimum_reduce(data: np.ndarray, axis: int, reset: bool = False) -> np.ndarray:
+    """Mirror native minimum NaN handling and preference for negative zero."""
+    result = np.fmin.reduce(data, axis=axis, initial=np.inf) if reset else np.fmin.reduce(data, axis=axis)
+    negative_zero = np.any((data == 0) & np.signbit(data), axis=axis)
+    return np.where((result == 0) & negative_zero, -np.zeros_like(result), result)
+
+
+_REDUCE_FNS: dict[str, Any] = dict(add=np.sum, max=np.max, maximum=np.max, minimum=_minimum_reduce, multiply=np.prod)
+_SHAPE_VIEWS = frozenset("reshape view permute transpose contiguous detach unsqueeze squeeze".split())
 
 
 class NKITensorReduce(NKIOp):
@@ -19,7 +31,7 @@ class NKITensorReduce(NKIOp):
 
     kwargs:
         axis: ``int`` — the axis of ``data`` to reduce over.
-        op: ``"add"`` or ``"max"``.
+        op: Sum, product, maximum, or minimum.
     operands:
         data: source tensor.
         dst: destination tensor — shape equals ``data.shape`` with ``axis`` removed.
@@ -31,7 +43,7 @@ class NKITensorReduce(NKIOp):
     INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"data": frozenset({"sbuf", "psum"})}
     RFACTOR_RECIPE: ClassVar[Literal["rmw", "slot"] | None] = "slot"
     AXIS_ROLES: ClassVar[dict[str, AxisRole]] = {"F": AxisRole.ACCUMULATION}
-    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 1, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
 
@@ -62,7 +74,21 @@ def emit_reference_sum(source: TorchValue, node: Node, name: str, body: list[str
     if node.meta.get("arithmetic") == "native":
         imports.add("NKIActivationReduce")
         body.append(f'{name} = NKIActivationReduce(op="copy", reduce_op="add")(data={source.name})')
-        return TorchValue(name, (source.shape[0],), storage_dtype="float32")
+        logical = source.shape
+        total = TorchValue(name, (source.shape[0],), storage_dtype="float32")
+        if isinstance(shape := node.meta.get(PACKING_MARKER), tuple):
+            logical = (int(np.prod(shape[:-1])), shape[-1])
+            total = emit_packed_reduction(
+                name, logical[0], source.shape[0], TorchArithmetic(name, body, imports), "add"
+            )
+        producer = node.args[0]
+        while isinstance(producer, Node) and _operation(producer) in _SHAPE_VIEWS:
+            producer = producer.args[0]
+        if isinstance(producer, Node) and _operation(producer) not in {"square", "abs", "absolute"}:
+            total = correct_overflow_sum(source, total, (logical[0], logical[1]), body, imports)
+        return total
+    if isinstance(shape := node.meta.get(PACKING_MARKER), tuple):
+        return emit_torch_sum(source, name, body, imports, (int(np.prod(shape[:-1])), shape[-1]))
     implementation = (
         emit_pairwise_sum if getattr(node.target, "__name__", "").startswith("wrapped_") else emit_torch_sum
     )

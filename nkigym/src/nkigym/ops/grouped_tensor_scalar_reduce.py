@@ -4,11 +4,31 @@ from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import numpy as np
+from torch.fx import Node
 
+from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import AxisRole, NKIOp, ReductionContract, _operand_role, reduction_combinator
 
 _OPERATIONS = {"equal": np.equal, "less": np.less}
 _REDUCTIONS = {"add": np.sum}
+
+
+def packed_maximum(node: Node) -> bool:
+    """Recognize native row maxima whose result contains values only."""
+    name = str(getattr(node.target, "__name__", node.target)).removeprefix("wrapped_")
+    dimension = node.kwargs.get("dim", node.kwargs.get("axis"))
+    indexed = all(
+        str(getattr(user.target, "__name__", user.target)).removeprefix("wrapped_") == "getitem" for user in node.users
+    )
+    values_only = indexed and all(user.args[1] == 0 for user in node.users)
+    return (
+        name == "max"
+        and node.meta.get("arithmetic") == "native"
+        and isinstance(dimension, int)
+        and dimension == -1
+        and node.kwargs.get("keepdim", node.kwargs.get("keepdims")) is True
+        and (values_only if node.op == "call_method" else not indexed)
+    )
 
 
 class NKIGroupedTensorScalarReduce(NKIOp):
@@ -68,6 +88,34 @@ class NKIGroupedTensorScalarReduce(NKIOp):
         mapped = _OPERATIONS[str(kwargs["op0"])](data, thresholds)
         reduced = _REDUCTIONS[str(kwargs["reduce_op"])](mapped, axis=2)
         return np.asarray(reduced, dtype=np.float32).reshape(groups * partitions, 1)
+
+
+def emit_interval_counts(
+    source: TorchValue, thresholds: tuple[TorchValue, TorchValue], stem: str, body: list[str], imports: set[str]
+) -> tuple[TorchValue, TorchValue]:
+    """Count ordered intervals and their prefixes using two fused comparisons."""
+    if source.shape[1] > 1 << 24:
+        raise ValueError("interval counts require exactly representable float32 integer totals")
+    prefixes = []
+    imports.update(("NKIGroupedTensorScalarReduce", "NKIGroupedCountsTranspose", "NKITensorTensor"))
+    for suffix, threshold in zip(("before", "through"), thresholds, strict=True):
+        value = TorchValue(f"{stem}_{suffix}", (source.shape[0], 1), storage_dtype="float32")
+        body.append(
+            f"{value.name} = NKIGroupedTensorScalarReduce(groups=1, partitions={source.shape[0]}, "
+            "op0='less', reduce_op='add')"
+            f"(data={source.name}, operand0={threshold.name})"
+        )
+        prefixes.append(value)
+    counts = TorchValue(f"{stem}_counts", prefixes[0].shape, storage_dtype="float32")
+    body.append(f"{counts.name} = NKITensorTensor(op='subtract')(data1={prefixes[1].name}, data2={prefixes[0].name})")
+    rows = []
+    for value in (counts, prefixes[0]):
+        row = TorchValue(f"{value.name}_row", (1, source.shape[0]), storage_dtype="float32")
+        body.append(
+            f"{row.name} = NKIGroupedCountsTranspose(groups=1, partitions={source.shape[0]})(data={value.name})"
+        )
+        rows.append(row)
+    return rows[0], rows[1]
 
 
 __all__ = ["NKIGroupedTensorScalarReduce"]

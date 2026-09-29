@@ -5,7 +5,9 @@ from typing import Any, ClassVar
 import numpy as np
 
 from nkigym.codegen.torch_arithmetic import TorchArithmetic
+from nkigym.codegen.torch_values import TorchSegments, TorchValue
 from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.iota import emit_first_match_scores
 
 
 class NKINCGather(NKIOp):
@@ -36,6 +38,30 @@ class NKINCGather(NKIOp):
         if np.any(indices < 0) or np.any(indices >= data.shape[1]):
             raise ValueError("nc_n_gather indices exceed the source free-axis extent")
         return np.take_along_axis(data, indices, axis=1)
+
+
+def _emit_max_with_indices(
+    source: TorchValue, stem: str, body: list[str], imports: set[str]
+) -> tuple[TorchSegments, TorchSegments]:
+    """Gather the first maximum, giving NaNs precedence and preserving the selected value."""
+    rows, width = source.shape
+    emit = TorchArithmetic(f"sbuf_{stem}", body, imports)
+    data = source.name if source.storage_dtype == "float32" else emit.cast("NKIFloat32Cast", source.name)
+    missing = emit.binary("not_equal", data, data)
+    nan_row = emit.emit("NKITensorReduce", f"data={missing}", "op='max', axis=1")
+    maximum = emit.emit("NKITensorReduce", f"data={data}", "op='max', axis=1")
+    matches = emit.scalar("equal", data, maximum)
+    present = emit.scalar("subtract", nan_row, 1.0, reverse=True)
+    selected = emit.binary("maximum", emit.scalar("multiply", matches, present), missing)
+    negative = emit_first_match_scores(emit, selected, rows, width)
+    best = emit.emit("NKITensorReduce", f"data={negative}", "op='max', axis=1")
+    zero = emit.emit("NKIIota", "", f"partitions={rows}, width=1, pattern=[[0, 1]], channel_multiplier=0")
+    indices = emit.cast("NKIUInt32Cast", emit.scalar("subtract", zero, best))
+    values = emit.emit("NKINCGather", f"data={source.name}, indices={indices}")
+    return (
+        TorchSegments((TorchValue(values, (rows, 1), storage_dtype=source.storage_dtype),)),
+        TorchSegments((TorchValue(indices, (rows, 1), storage_dtype="uint32"),)),
+    )
 
 
 def emit_clamped_gather(emit: TorchArithmetic, source: str, position: str, width: int) -> str:

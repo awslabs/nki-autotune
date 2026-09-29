@@ -195,8 +195,7 @@ def _make_hook(state: _TraceState) -> Callable[..., Any]:
     """Build a replacement for :meth:`NKIOp.__call__` that records into ``state`` and synthesizes outputs."""
 
     def hook(op: NKIOp, **kwargs: Any) -> Any:
-        merged = {**getattr(op, "_init_kwargs", {}), **kwargs}
-        cls = type(op)
+        cls, merged = type(op), {**getattr(op, "_init_kwargs", {}), **kwargs}
         input_syms, record = _trace_compute_op(cls, merged, state)
         name = next(state.ssa_names)
         returned = cls.RETURN_RMW_OPERAND
@@ -307,7 +306,6 @@ def _synthesize_outputs(
     output_slots = [slot for slot in cls.OPERAND_AXES if slot not in cls.INPUT_OPERANDS]
     primary_slot = "reduce_res" if "reduce_res" in cls.OPERAND_AXES else "dst"
     default_dtype = cls.OUTPUT_DTYPE or (input_syms[0].dtype if input_syms else None)
-    multiple = isinstance(name, tuple)
     if isinstance(name, str):
         names = tuple(name if slot == primary_slot else f"{name}_scratch" for slot in output_slots)
     else:
@@ -318,6 +316,9 @@ def _synthesize_outputs(
         raise ValueError(f"{cls.__name__}: new outputs require unique SSA names, got {names}")
     primary_sym: _Sym | None = None
     output_syms: list[_Sym] = []
+    inherited = {}
+    for source in reversed(input_syms):
+        inherited.update((axis, factors) for axis, factors in zip(source.dim_ids, source.factor_dim_ids) if factors)
     for slot, slot_name in zip(output_slots, names, strict=True):
         groups = tuple(group for group in cls.operand_axis_groups(slot) if all(a in record.axis_map for a in group))
         shape = tuple(prod(state.dim_sizes[record.axis_map[axis]] for axis in group) for group in groups)
@@ -328,7 +329,8 @@ def _synthesize_outputs(
         sym = _Sym(shape, slot_name)
         sym.dim_ids = list(dim_ids)
         sym.factor_dim_ids = [
-            tuple(record.axis_map[axis] for axis in group) if len(group) > 1 else None for group in groups
+            tuple(record.axis_map[axis] for axis in group) if len(group) > 1 else inherited.get(dimension)
+            for group, dimension in zip(groups, dim_ids)
         ]
         sym.location = cls.OUTPUT_LOCATION
         sym.dtype = cls.OUTPUT_DTYPES.get(slot, default_dtype)
@@ -340,7 +342,7 @@ def _synthesize_outputs(
             primary_sym = sym
     if primary_sym is None:
         raise ValueError(f"{cls.__name__}: no primary output slot {primary_slot!r} in OPERAND_AXES")
-    return tuple(output_syms) if multiple else primary_sym
+    return tuple(output_syms) if isinstance(name, tuple) else primary_sym
 
 
 def _unify(old: str, new: str, state: _TraceState, local: dict[str, str]) -> None:
@@ -385,10 +387,9 @@ def _canonicalize_dim_names(state: _TraceState) -> None:
     dimensions = [dimension for sym in state.sentinels.values() for dimension in sym.dim_ids if dimension is not None]
     dimensions.extend(dimension for rec in state.op_records for dimension in rec.axis_map.values())
     remap = {old: f"d{i}" for i, old in enumerate(dict.fromkeys(dimensions))}
-    if all(old == new for old, new in remap.items()):
-        return
-    state.dim_sizes = {remap[old]: size for old, size in state.dim_sizes.items() if old in remap}
-    _apply_rename(state, remap)
+    if any(old != new for old, new in remap.items()):
+        state.dim_sizes = {remap[old]: size for old, size in state.dim_sizes.items() if old in remap}
+        _apply_rename(state, remap)
 
 
 def _apply_rename(state: _TraceState, remap: dict[str, str]) -> None:

@@ -14,6 +14,7 @@ class NKITensorCopy(NKIOp):
     """Copy ``src`` into ``dst`` element-wise."""
 
     NAME: ClassVar[str] = "tensor_copy"
+    COPY_ENGINES: ClassVar[frozenset[str]] = frozenset({"vector", "scalar"})
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"src": ("P", "F"), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
     INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"src": frozenset({"sbuf", "psum"})}

@@ -13,7 +13,7 @@ from nkigym.ir.arith.expr import Add, Const, Expr, Mul, Var, to_affine
 from nkigym.ir.dependency_rebind import rebind_exact_retile
 from nkigym.ir.program_sharding import configured_program_shards
 from nkigym.ir.tree import BlockNode, Buffer, ForNode, ISANode, KernelTree
-from nkigym.ops.base import ReductionContract
+from nkigym.ops.base import AxisRole, ReductionContract
 from nkigym.transforms.base import (
     Transform,
     TransformLegalityError,
@@ -60,8 +60,6 @@ class Split(Transform[SplitOption]):
             data = ir.tree.data(nid)
             if nid in overlap_nodes or nid in sharded_loops:
                 continue
-            if isinstance(data, (ForNode, ISANode)) and subtree_has_access_patterns(ir.tree, nid):
-                continue
             if isinstance(data, ForNode):
                 for factors in _factorizations(data.extent):
                     options.append(SplitOption(target_nid=nid, factors=factors, target_axis=None))
@@ -74,6 +72,8 @@ class Split(Transform[SplitOption]):
                         sum(axis == concrete for axis in block.axis_map.values()) != 1
                         or _is_static_axis(data, block, concrete)
                         or _is_reduction_axis(ir, nid, concrete)
+                        or data.access_patterns
+                        and _view_axis_plan(ir, nid, concrete) is None
                     ):
                         continue
                     """Tile width currently bound on the leaf (max_tile or full extent)."""
@@ -114,8 +114,12 @@ class Split(Transform[SplitOption]):
             raise TransformLegalityError("Split cannot alter an active software-pipeline scope")
         if option.target_nid in configured_program_shards(ir):
             raise TransformLegalityError("Split cannot replace a loop assigned to logical NeuronCores")
-        if subtree_has_access_patterns(ir.tree, option.target_nid):
-            raise TransformLegalityError("Split cannot rewrite a loop or ISA operand with an explicit access pattern")
+        if (
+            option.target_axis is not None
+            and subtree_has_access_patterns(ir.tree, option.target_nid)
+            and _view_axis_plan(ir, option.target_nid, option.target_axis) is None
+        ):
+            raise TransformLegalityError("Split cannot retile this explicit ISA operand view")
         if option.target_axis is None:
             if not isinstance(target, ForNode):
                 raise TransformLegalityError(
@@ -221,6 +225,8 @@ class Split(Transform[SplitOption]):
         leaf_nid = option.target_nid
         leaf = ir.tree.data(leaf_nid)
         assert isinstance(leaf, ISANode)
+        if leaf.access_patterns:
+            return _split_view_axis(ir, option)
         parent_nid = ir.tree.parent(leaf_nid)
         assert parent_nid is not None
         block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
@@ -360,6 +366,12 @@ def _rebind_tensorized_split(
         for slot in leaf.op_cls.OPERAND_AXES
         if slot in bindings and slot not in leaf.op_cls.INPUT_OPERANDS
     )
+    direct_reads = {
+        region for slot, region in leaf.operand_bindings.items() if slot in leaf.op_cls.INPUT_OPERANDS or slot in rmw
+    }
+    direct_writes = {region for slot, region in leaf.operand_bindings.items() if slot not in leaf.op_cls.INPUT_OPERANDS}
+    reads += tuple(region for region in block.reads if region not in direct_reads)
+    writes += tuple(region for region in block.writes if region not in direct_writes)
     tree.graph.nodes[block_nid]["data"] = replace(block, iter_values=iter_values, reads=reads, writes=writes)
     tree.graph.nodes[leaf_nid]["data"] = replace(leaf, operand_bindings=bindings)
 
@@ -425,6 +437,15 @@ def _build_for_chain(tree: KernelTree, stem_loop_var: str, factors: tuple[int, .
     return top_nid, prev_nid
 
 
+def _view_axis_width(leaf: ISANode, abstract: str | None) -> int | None:
+    """Return one explicit singleton-axis view extent when it is present."""
+    for slot, pattern in leaf.access_patterns.items():
+        for group, (_stride, extent) in zip(leaf.op_cls.operand_view_axis_groups(slot) or (), pattern.pattern):
+            if group == (abstract,) and isinstance(extent, Const):
+                return extent.value
+    return None
+
+
 def _current_tensorize_width(leaf: ISANode, block: BlockNode, concrete_axis: str) -> int | None:
     """Tile width currently on the leaf for the operand axis matching ``concrete_axis``.
 
@@ -437,6 +458,12 @@ def _current_tensorize_width(leaf: ISANode, block: BlockNode, concrete_axis: str
     width: int | None = None
     if abstract is not None:
         op_cls = leaf.op_cls
+        explicit = _view_axis_width(leaf, abstract)
+        if explicit is not None:
+            return explicit
+        maximum = op_cls.TENSORIZE_MAX_TILE_SIZE.get(abstract, op_cls.MAX_TILE_SIZE.get(abstract))
+        if maximum == 1:
+            return 1
         for slot in op_cls.OPERAND_AXES:
             groups = op_cls.operand_axis_groups(slot)
             if not any(abstract in group for group in groups) or slot not in leaf.operand_bindings:
@@ -449,6 +476,125 @@ def _current_tensorize_width(leaf: ISANode, block: BlockNode, concrete_axis: str
                     width = hi.value
                     break
     return width
+
+
+def _view_axis_plan(ir: KernelIR, leaf_nid: int, concrete: str) -> dict[str, tuple[int, int, int, int]] | None:
+    """Match one explicit free-axis view dimension and its logical footprint."""
+    leaf = ir.tree.data(leaf_nid)
+    if not isinstance(leaf, ISANode) or not leaf.access_patterns:
+        return None
+    block_nid, block = _find_enclosing_block(ir.tree, leaf_nid)
+    abstract = next((axis for axis, dimension in block.axis_map.items() if dimension == concrete), None)
+    roles = {item.role for item in block.iter_vars if item.axis == concrete}
+    if (
+        abstract is None
+        or roles != {AxisRole.PARALLEL}
+        or any(isinstance(ir.tree.data(nid), BlockNode) for nid in ir.tree.descendants(block_nid))
+    ):
+        return None
+    width, buffers = _current_tensorize_width(leaf, block, concrete), ir.all_buffers()
+    if width is None:
+        return None
+    plan = {}
+    for slot, region in leaf.operand_bindings.items():
+        groups = leaf.op_cls.operand_axis_groups(slot)
+        stored = any(abstract in group for group in groups)
+        view = leaf.op_cls.operand_view_axis_groups(slot) or ()
+        dimensions = [index for index, group in enumerate(view) if abstract in group]
+        if not dimensions and not stored:
+            continue
+        pattern = leaf.access_patterns.get(slot)
+        if pattern is None and stored:
+            region_dimension = leaf.op_cls.operand_dimension(slot, abstract)
+            buffer = buffers[region.tensor]
+            if (
+                groups[region_dimension] != (abstract,)
+                or view
+                or buffer.location != "shared_hbm"
+                and region_dimension == 0
+                or region.ranges[region_dimension][1] != Const(value=width)
+            ):
+                return None
+            plan[slot] = -1, 0, region_dimension, 1
+            continue
+        if len(dimensions) != 1 or view[dimensions[0]] != (abstract,) or pattern is None:
+            return None
+        dimension = dimensions[0]
+        stride, extent = pattern.pattern[dimension]
+        if not isinstance(stride, Const) or not isinstance(extent, Const) or stride.value < 0 or extent.value != width:
+            return None
+        region_dimension, region_stride = -1, 0
+        if stored:
+            region_dimension = leaf.op_cls.operand_dimension(slot, abstract)
+            buffer = buffers[region.tensor]
+            if buffer.location != "shared_hbm" and region_dimension == 0:
+                return None
+            pitch = prod(buffer.shape[region_dimension + 1 :]) if buffer.location == "shared_hbm" else 1
+            if stride.value % pitch or not isinstance(region.ranges[region_dimension][1], Const):
+                return None
+            region_stride = stride.value // pitch
+        plan[slot] = dimension, stride.value, region_dimension, region_stride
+    writes = any(slot not in leaf.op_cls.INPUT_OPERANDS and entry[3] > 0 for slot, entry in plan.items())
+    return plan if writes else None
+
+
+def _split_view_axis(ir: KernelIR, option: SplitOption) -> int:
+    """Retile one explicit free-axis view without changing other axis widths."""
+    assert option.target_axis is not None
+    plan = _view_axis_plan(ir, option.target_nid, option.target_axis)
+    assert plan is not None
+    tree, leaf_nid = ir.tree, option.target_nid
+    block_nid, block = _find_enclosing_block(tree, leaf_nid)
+    leaf = tree.isa(leaf_nid)
+    old_width = _current_tensorize_width(leaf, block, option.target_axis)
+    assert old_width is not None
+    width = option.factors[-1]
+    occupied = {tree.loop(nid).loop_var for nid in tree.preorder() if isinstance(tree.data(nid), ForNode)}
+    ordinal = 0
+    while (loop_name := f"i_{option.target_axis}_{ordinal}") in occupied:
+        ordinal += 1
+    loop_value = Var(name=loop_name)
+    analyzer = Analyzer()
+    bindings, patterns = dict(leaf.operand_bindings), dict(leaf.access_patterns)
+    for slot, (dimension, stride, region_dimension, region_stride) in plan.items():
+        if dimension >= 0:
+            pattern = patterns[slot]
+            dimensions = list(pattern.pattern)
+            dimensions[dimension] = dimensions[dimension][0], Const(value=width)
+            offset = analyzer.simplify(
+                Add(left=pattern.offset, right=Mul(left=loop_value, right=Const(value=width * stride)))
+            )
+            patterns[slot] = replace(pattern, pattern=tuple(dimensions), offset=offset)
+        if region_dimension >= 0:
+            region = bindings[slot]
+            ranges = list(region.ranges)
+            lower, span = ranges[region_dimension]
+            assert isinstance(span, Const)
+            lower = analyzer.simplify(
+                Add(left=lower, right=Mul(left=loop_value, right=Const(value=width * region_stride)))
+            )
+            ranges[region_dimension] = lower, Const(value=span.value - (old_width - width) * region_stride)
+            bindings[slot] = replace(region, ranges=tuple(ranges))
+    values = tuple(
+        (
+            analyzer.simplify(Add(left=Mul(left=value, right=Const(value=option.factors[0])), right=loop_value))
+            if variable.axis == option.target_axis
+            else value
+        )
+        for variable, value in zip(block.iter_vars, block.iter_values, strict=True)
+    )
+    rmw = leaf.op_cls.rmw_operands(leaf.kwargs)
+    reads = tuple(region for slot, region in bindings.items() if slot in leaf.op_cls.INPUT_OPERANDS or slot in rmw)
+    writes = tuple(region for slot, region in bindings.items() if slot not in leaf.op_cls.INPUT_OPERANDS)
+    tree.graph.nodes[block_nid]["data"] = replace(block, iter_values=values, reads=reads, writes=writes)
+    tree.graph.nodes[leaf_nid]["data"] = replace(leaf, operand_bindings=bindings, access_patterns=patterns)
+    parent = tree.parent(leaf_nid)
+    assert parent is not None
+    loop_nid = tree.add_node(ForNode(loop_var=loop_name, extent=option.factors[0]))
+    tree.graph.add_edge(loop_nid, leaf_nid)
+    _replace_in_parent_children(tree, parent, [leaf_nid], [loop_nid])
+    _normalize_split_block(tree, block_nid)
+    return loop_nid
 
 
 def _tensorized_loop_element_stride(tree: KernelTree, block_nid: int, loop_nid: int) -> Fraction:

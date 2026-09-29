@@ -51,6 +51,7 @@ class NKIActivation(NKIOp):
     """
 
     NAME: ClassVar[str] = "activation"
+    PARTITION_BATCH_OPERANDS: ClassVar[tuple[str, ...]] = ("data", "dst")
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "bias": ("P",), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data", "bias"})
     INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {

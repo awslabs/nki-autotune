@@ -1,5 +1,6 @@
-"""Bit-exact 32-bit strided selection through one Vector Engine tensor copy."""
+"""Bit-exact strided selection through one Vector Engine tensor copy."""
 
+from collections.abc import Mapping
 from math import prod
 from typing import Any, ClassVar
 
@@ -7,17 +8,20 @@ import numpy as np
 
 from nkigym.codegen.torch_arithmetic import TorchArithmetic
 from nkigym.codegen.torch_values import TorchValue
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import NKIOp, SliceContract, _operand_role
+from nkigym.ops.vector_dma_transpose import packed_sum_geometry, restore_partial_rows
 
 
 class NKIStridedTensorCopy(NKIOp):
-    """Copy a strided float32 or uint32 view without numeric conversion."""
+    """Copy a strided floating-point or uint32 view without numeric conversion."""
 
     NAME: ClassVar[str] = "tensor_copy"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"src": ("P", "F"), "dst": ("P", "N")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"src"})
     INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"src": frozenset({"sbuf"})}
-    INPUT_STORAGE_DTYPES: ClassVar[dict[str, frozenset[str]]] = {"src": frozenset({"float32", "uint32"})}
+    INPUT_STORAGE_DTYPES: ClassVar[dict[str, frozenset[str]]] = {
+        "src": frozenset({"float32", "uint32", "bfloat16", "float16"})
+    }
     STRIDED_COPY_INPUTS: ClassVar[frozenset[str]] = frozenset({"src"})
     FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {"N": "width"}
     NON_TILABLE_AXES: ClassVar[frozenset[str]] = frozenset({"F", "N"})
@@ -31,13 +35,18 @@ class NKIStridedTensorCopy(NKIOp):
             raise ValueError("strided tensor copy requires one to four valid free-axis dimensions")
         super().__init__(pattern=pattern, offset=offset, width=prod(n for _, n in pattern), engine="vector")
 
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> SliceContract:
+        """Describe the ordered source positions copied without arithmetic."""
+        return SliceContract("src", "dst", 1, int(kwargs["offset"]), int(kwargs["width"]), kwargs["pattern"])
+
     def _check_roles(self, **kwargs: Any) -> None:
-        """Require 32-bit SBUF storage and a view within its free axis."""
+        """Require supported SBUF storage and a view within its free axis."""
         source = np.asarray(kwargs["src"])
         if _operand_role(kwargs["src"]) not in {None, "sbuf"} or source.ndim != 2:
             raise TypeError("NKIStridedTensorCopy requires a rank-two SBUF source")
-        if source.dtype not in (np.dtype("float32"), np.dtype("uint32")):
-            raise TypeError("NKIStridedTensorCopy requires float32 or uint32 storage")
+        if str(source.dtype) not in self.INPUT_STORAGE_DTYPES["src"]:
+            raise TypeError("NKIStridedTensorCopy requires supported floating-point or uint32 storage")
         if kwargs["engine"] != "vector":
             raise ValueError("NKIStridedTensorCopy requires the Vector Engine")
         last = kwargs["offset"] + sum(stride * (extent - 1) for stride, extent in kwargs["pattern"])
@@ -45,16 +54,18 @@ class NKIStridedTensorCopy(NKIOp):
             raise ValueError("strided tensor copy exceeds the source free-axis extent")
 
     def _run(self, **kwargs: Any) -> np.ndarray:
-        """Select source elements without changing their 32-bit representations."""
+        """Select source elements without changing their representations."""
         indices = np.array([kwargs["offset"]], dtype=np.int64)
         for stride, extent in kwargs["pattern"]:
             indices = (indices[:, None] + stride * np.arange(extent)).reshape(-1)
         return np.asarray(kwargs["src"])[:, indices].copy()
 
 
-def emit_torch_sum(source: TorchValue, name: str, body: list[str], imports: set[str]) -> TorchValue:
+def emit_torch_sum(
+    source: TorchValue, name: str, body: list[str], imports: set[str], original_shape: tuple[int, int] | None = None
+) -> TorchValue:
     """Emit Torch's four-accumulator cascade and ordered vector/scalar tails."""
-    rows, width = source.shape
+    rows, width = source.shape if original_shape is None else original_shape
     emit = TorchArithmetic(name, body, imports)
     data = source.name if source.storage_dtype == "float32" else emit.cast("NKIFloat32Cast", source.name)
     lanes = 8 if width >= 8 else 1
@@ -76,6 +87,11 @@ def emit_torch_sum(source: TorchValue, name: str, body: list[str], imports: set[
 
     partials: list[str] = []
     value, count = data, units
+    if source.shape[0] != rows:
+        parts, groups = packed_sum_geometry(source.shape, (rows, width), step * 4 * lanes)
+        value = fold(data, groups, step, 4 * lanes, 0)
+        value = restore_partial_rows(value, (rows, parts), emit)
+        count //= step
     while count:
         groups, tail = divmod(count, step)
         if tail:
@@ -96,8 +112,12 @@ def emit_torch_sum(source: TorchValue, name: str, body: list[str], imports: set[
     result = take(zero, 1, 1, 1, 0)
     for offset in range(width - width % lanes, width):
         result = emit.binary("add", result, take(data, 1, 1, 1, offset))
-    for lane in range(lanes):
-        result = emit.binary("add", result, take(vector, 1, 1, 1, lane))
+    if lanes == 1 or width % lanes:
+        for lane in range(lanes):
+            result = emit.binary("add", result, take(vector, 1, 1, 1, lane))
+    else:
+        scanned = emit.emit("NKITensorScalarCumulative", f"src={vector}", "op0='add', op1='add', imm0=0.0")
+        result = take(scanned, 1, 1, 1, lanes - 1)
     imports.add("NKIActivationReduce")
     body.append(f'{name} = NKIActivationReduce(op="copy", reduce_op="add")(data={result})')
     return TorchValue(name, (rows,), storage_dtype="float32")

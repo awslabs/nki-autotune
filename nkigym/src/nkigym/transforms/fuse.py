@@ -290,8 +290,42 @@ class Fuse(Transform[FuseOption]):
         if loop_nid in configured_program_shards(ir):
             raise TransformLegalityError("Fuse operation batching requires an unsharded local tile loop")
         contract = leaf.op_cls.partition_tile_batching_contract(leaf.kwargs)
-        if contract is None or set(contract.operands) != set(leaf.operand_bindings):
+        if contract is None or not set(contract.operands) <= set(leaf.operand_bindings):
             raise TransformLegalityError("Fuse operation has no complete partition-tile batching contract")
+        invariant = set(leaf.operand_bindings) - set(contract.operands)
+        written = {
+            region.tensor
+            for slot, region in leaf.operand_bindings.items()
+            if slot not in leaf.op_cls.INPUT_OPERANDS or slot in leaf.op_cls.rmw_operands(leaf.kwargs)
+        }
+        if (
+            not invariant <= leaf.op_cls.INPUT_OPERANDS
+            or any(leaf.operand_bindings[slot].tensor in written for slot in invariant)
+            or any(
+                loop.loop_var in expr_variables(value)
+                for slot in invariant
+                for bounds in leaf.operand_bindings[slot].ranges
+                for value in bounds
+            )
+        ):
+            raise TransformLegalityError("Fuse unbatched operands must remain read-only and loop invariant")
+        row_offsets = {
+            key: leaf.operand_bindings[slot].ranges[0][0]
+            for axis, (key, slot) in getattr(leaf.op_cls, "SPLIT_OFFSET_KWARGS", {}).items()
+            if slot in contract.operands and leaf.op_cls.operand_dimension(slot, axis) == 0
+        }
+        if any(
+            not isinstance(value := leaf.kwargs.get(key, default), Expr) or to_affine(value).get(loop.loop_var) != 1
+            for key, default in row_offsets.items()
+        ):
+            raise TransformLegalityError("Fuse requires the source row offset to advance with the output tile")
+        if any(
+            isinstance(value, Expr)
+            and loop.loop_var in expr_variables(value)
+            and (key not in row_offsets or to_affine(value).get(loop.loop_var) != 1)
+            for key, value in leaf.kwargs.items()
+        ):
+            raise TransformLegalityError("Fuse cannot batch a varying selector or unmatched instruction offset")
         block = ir.tree.block(block_nid)
         _check_ownership_absorption(leaf, block, loop.loop_var)
         roles = [
@@ -304,7 +338,8 @@ class Fuse(Transform[FuseOption]):
         buffer_map = ir.all_buffers() if buffers is None else buffers
         partitions = {
             buffer_map[region.tensor].partition_extent()
-            for region in leaf.operand_bindings.values()
+            for slot, region in leaf.operand_bindings.items()
+            if slot in contract.operands
             if buffer_map[region.tensor].location in {"sbuf", "psum"}
         }
         if len(partitions) != 1:
@@ -354,14 +389,17 @@ class Fuse(Transform[FuseOption]):
         loop = ir.tree.loop(match.loop_nid)
         leaf = ir.tree.isa(match.leaf_nid)
         buffers = ir.all_buffers()
-        bindings = {
-            slot: (
-                _batch_iteration_region(leaf.operand_bindings[slot], loop, 0)
-                if buffers[leaf.operand_bindings[slot].tensor].location == "shared_hbm"
-                else _tile_regions(buffers[leaf.operand_bindings[slot].tensor])[0]
-            )
-            for slot in match.contract.operands
-        }
+        bindings = dict(leaf.operand_bindings)
+        bindings.update(
+            {
+                slot: (
+                    _batch_iteration_region(leaf.operand_bindings[slot], loop, 0)
+                    if buffers[leaf.operand_bindings[slot].tensor].location == "shared_hbm"
+                    else _tile_regions(buffers[leaf.operand_bindings[slot].tensor])[0]
+                )
+                for slot in match.contract.operands
+            }
+        )
         patterns = {
             slot: (
                 _hbm_batch_pattern(buffers[region.tensor], region, loop)
@@ -369,7 +407,9 @@ class Fuse(Transform[FuseOption]):
                 else _full_buffer_pattern(buffers[region.tensor])
             )
             for slot, region in leaf.operand_bindings.items()
+            if slot in match.contract.operands
         }
+        tensors = {leaf.operand_bindings[slot].tensor for slot in match.contract.operands}
 
         def expand(regions: tuple[BufferRegion, ...]) -> tuple[BufferRegion, ...]:
             """Replace each one-tile footprint with its complete logical family."""
@@ -377,9 +417,13 @@ class Fuse(Transform[FuseOption]):
                 tile
                 for region in regions
                 for tile in (
-                    tuple(_batch_iteration_region(region, loop, index) for index in range(loop.extent))
-                    if buffers[region.tensor].location == "shared_hbm"
-                    else _tile_regions(buffers[region.tensor])
+                    (region,)
+                    if region.tensor not in tensors
+                    else (
+                        tuple(_batch_iteration_region(region, loop, index) for index in range(loop.extent))
+                        if buffers[region.tensor].location == "shared_hbm"
+                        else _tile_regions(buffers[region.tensor])
+                    )
                 )
             )
 
@@ -392,7 +436,13 @@ class Fuse(Transform[FuseOption]):
             reads=expand(block.reads),
             writes=expand(block.writes),
         )
-        ir.tree.graph.nodes[match.leaf_nid]["data"] = replace(leaf, operand_bindings=bindings, access_patterns=patterns)
+        kwargs = {
+            key: substitute(value, {loop.loop_var: Const(value=0)}) if isinstance(value, Expr) else value
+            for key, value in leaf.kwargs.items()
+        }
+        ir.tree.graph.nodes[match.leaf_nid]["data"] = replace(
+            leaf, operand_bindings=bindings, access_patterns=patterns, kwargs=kwargs
+        )
         _replace_in_parent_children(ir.tree, match.block_nid, [match.loop_nid], [match.leaf_nid])
         ir.tree.graph.remove_node(match.loop_nid)
 
@@ -738,7 +788,7 @@ def _full_buffer_pattern(buffer: Buffer) -> AccessPattern:
         pattern=(
             (Const(value=tiles * free), Const(value=partition)),
             (Const(value=free), Const(value=tiles)),
-            (Const(value=1), Const(value=free)),
+            (Const(value=1), Const(value=buffer.shape[1])),
         ),
         offset=Const(value=0),
     )

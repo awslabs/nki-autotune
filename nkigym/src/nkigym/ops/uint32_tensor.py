@@ -4,6 +4,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+from nkigym.codegen.torch_arithmetic import TorchArithmetic
 from nkigym.ops.base import NKIOp, _operand_role
 
 _OPERATIONS = {"add": np.add, "subtract": np.subtract}
@@ -33,3 +34,40 @@ class NKIUInt32Tensor(NKIOp):
     def _run(self, **kwargs: Any) -> np.ndarray:
         """Preserve all bits of modulo-32-bit arithmetic."""
         return _OPERATIONS[kwargs["op"]](kwargs["data1"], kwargs["data2"]).astype(np.uint32)
+
+
+def emit_division_quotient(
+    emit: TorchArithmetic, significand: str, remainder: str, denominator: int
+) -> tuple[str, str]:
+    """Emit an exact 24-bit quotient and remainder using FP32 integer steps.
+
+    A radix digit uses at most 21 bits and keeps the constant-denominator
+    product within 24 significant bits. The reciprocal estimate is less than
+    one quarter from the true digit; nearest-even conversion therefore yields
+    the floor or its successor. An exact residual corrects the latter.
+    """
+    op = emit.binary
+    if denominator == 1 << 23:
+        quotient, remainder = significand, op("multiply", significand, 0.0)
+    else:
+        quotient = op("greater_equal", significand, 0)
+        width = min(21, (denominator & -denominator).bit_length() - 1)
+        if width < 4:
+            for _ in range(23):
+                twice = op("multiply", remainder, 2)
+                bit = op("greater_equal", twice, denominator)
+                remainder = op("subtract", twice, op("multiply", bit, denominator))
+                quotient = op("add", op("multiply", quotient, 2), bit)
+        else:
+            reciprocal = float(np.float32(1.0) / np.float32(denominator))
+            for remaining in range(23, 0, -width):
+                radix = float(1 << min(width, remaining))
+                scaled = op("multiply", remainder, radix)
+                estimate = op("multiply", scaled, reciprocal)
+                digit = emit.cast("NKIFloat32Cast", emit.cast("NKIUInt32Cast", estimate))
+                remainder = op("subtract", scaled, op("multiply", digit, float(denominator)))
+                decrement = op("less", remainder, 0.0)
+                digit = op("subtract", digit, decrement)
+                remainder = op("add", remainder, op("multiply", decrement, float(denominator)))
+                quotient = op("add", op("multiply", quotient, radix), digit)
+    return quotient, remainder

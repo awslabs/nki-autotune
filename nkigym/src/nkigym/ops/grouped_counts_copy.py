@@ -73,7 +73,7 @@ def emit_grouped_bincount(
     displacements, zeros = TorchValue(f"{base}_displacements", counts.shape), TorchValue(f"{base}_zeros", counts.shape)
     imports.update(
         "NKIActivation NKIGroupedCountsCopy NKIGroupedCountsTranspose NKIGroupedIota "
-        "NKIGroupedTensorScalarReduce NKIInt32Cast NKIStore NKITensorScalarCumulative NKITensorTensor".split()
+        "NKIGroupedTensorScalarReduce NKIInt32Cast NKITensorScalarCumulative NKITensorTensor".split()
     )
     body.extend(
         (
@@ -88,17 +88,10 @@ def emit_grouped_bincount(
         )
     )
     outputs: list[TorchValue] = []
-    for suffix, value in (("counts", counts), ("displacements", displacements), ("zeros", zeros)):
-        converted, stored = TorchValue(f"{value.name}_int32", value.shape), TorchValue(
-            f"hbm_{stem}_{suffix}", value.shape, is_hbm=True
-        )
-        body.extend(
-            (
-                f"{converted.name} = NKIInt32Cast()(data={value.name})",
-                f"{stored.name} = NKIStore()(src={converted.name})",
-            )
-        )
-        outputs.append(stored)
+    for value in (counts, displacements, zeros):
+        converted = TorchValue(f"{value.name}_int32", value.shape)
+        body.append(f"{converted.name} = NKIInt32Cast()(data={value.name})")
+        outputs.append(converted)
     return (TorchSegments((outputs[0],)), TorchSegments((outputs[1],)), TorchSegments((outputs[2],)))
 
 

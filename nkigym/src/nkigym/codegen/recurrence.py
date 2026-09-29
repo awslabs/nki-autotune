@@ -53,7 +53,7 @@ class _Lowering:
 def _plan_buffers(
     ir: KernelIR, match: _Match, graph: ValueGraph, names: NameSupply, separate_final_current: bool
 ) -> tuple[tuple[_Plan, ...], dict[str, Buffer]]:
-    """Choose state, contribution, and current buffers."""
+    """Retain each stage's storage dtype in its state and chunk buffers."""
     if match.deferred_factor is not None:
         raise ValueError("online lowering does not support deferred recurrence factors")
     plans: list[_Plan] = []
@@ -61,17 +61,17 @@ def _plan_buffers(
     last = len(match.stages) - 1
     for index, stage in enumerate(match.stages):
         state = match.external_outputs[0] if index == last else stage.state_tensor
-        buffers[state] = replace(ir.buffer(state), location="sbuf", storage_dtype="float32")
+        buffers[state] = ir.buffer(state)
         contribution = graph.outputs[stage.reducer_leaf]
         source = ir.buffer(contribution)
         raw_contribution: str | None = None
         if source.location == "psum":
             raw_contribution = names.fresh(f"{stage.state_tensor}_online_partial")
-            buffers[raw_contribution] = replace(source, name=raw_contribution, storage_dtype="float32")
+            buffers[raw_contribution] = replace(source, name=raw_contribution)
             source = replace(source, location="sbuf")
         if raw_contribution is not None or index != last or contribution == state:
             contribution = names.fresh(f"{stage.state_tensor}_online_chunk")
-            buffers[contribution] = replace(source, name=contribution, storage_dtype="float32")
+            buffers[contribution] = replace(source, name=contribution)
         current = state
         if index != last or separate_final_current:
             current = names.fresh(f"{stage.state_tensor}_online_current")
@@ -96,12 +96,13 @@ def _stage_regions(plans: tuple[_Plan, ...], regions: tuple[BufferRegion, ...]) 
 
 
 def _clone_block(context: _Lowering, nid: int, remap: Mapping[str, str], output_override: str | None) -> None:
-    """Clone one canonical operation into the recurrence loop."""
+    """Clone one canonical operation while preserving its local allocation scopes."""
     tree = context.ir.tree
-    old_block_nid = owning_block(tree, nid)
-    old_block, leaf = tree.block(old_block_nid), tree.isa(nid)
+    old_block, leaf = tree.block(owning_block(tree, nid)), tree.isa(nid)
     loops = tuple(tree.loop(ancestor) for ancestor in tree.ancestors(nid) if isinstance(tree.data(ancestor), ForNode))
-    contract = context.graph.contracts[nid]
+    clones = tuple(replace(buffer, name=context.builder.names.fresh(buffer.name)) for buffer in old_block.alloc_buffers)
+    context.builder.buffers.update((buffer.name, buffer) for buffer in clones)
+    remap = {**remap, **{old.name: new.name for old, new in zip(old_block.alloc_buffers, clones, strict=True)}}
     progress_vars: set[str] = set()
     values = list(old_block.iter_values)
     for index, iter_var in enumerate(old_block.iter_vars):
@@ -112,7 +113,7 @@ def _clone_block(context: _Lowering, nid: int, remap: Mapping[str, str], output_
     bindings: dict[str, BufferRegion] = {}
     for slot, region in leaf.operand_bindings.items():
         tensor = remap.get(region.tensor, region.tensor)
-        if slot == contract.output_operand and output_override is not None:
+        if slot == context.graph.contracts[nid].output_operand and output_override is not None:
             tensor = output_override
         bindings[slot] = _localized_region(context, region, tensor)
     kwargs = dict(leaf.kwargs)
@@ -121,7 +122,7 @@ def _clone_block(context: _Lowering, nid: int, remap: Mapping[str, str], output_
             local = bindings[slot].ranges[leaf.op_cls.operand_dimension(slot, abstract)][0]
             kwargs[key] = Add(left=Mul(left=context.progress_index, right=Const(value=context.chunk_size)), right=local)
     reads, writes = _access_regions(leaf.op_cls, bindings, kwargs)
-    block = replace(old_block, iter_values=tuple(values), reads=reads, writes=writes, alloc_buffers=())
+    block = replace(old_block, iter_values=tuple(values), reads=reads, writes=writes, alloc_buffers=clones)
     parent = tree.add_node(block, parent=context.builder.parent)
     for item in loops:
         if item.loop_var not in progress_vars:

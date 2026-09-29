@@ -178,7 +178,7 @@ def _permutation_moves(ir: KernelIR) -> dict[int, _PermutationMove]:
             and _ranges_equal(factor_region.ranges, passthrough_region.ranges[:1])
             and _ranges_equal(target_factor.ranges, permutation_source.ranges[:1])
             and _transpose_broadcast_supports(factor_region)
-            and "operand0" not in bypass.access_patterns
+            and not bypass.access_patterns
             and not intersects_software_pipeline(ir, affected)
             and source_remains_stable(ir, passthrough_region, bypass_leaf, permutation_leaf, positions)
             and source_remains_stable(ir, factor_region, bypass_leaf, permutation_leaf, positions)
@@ -221,6 +221,20 @@ def _is_identity_writer(ir: KernelIR, leaf_nid: int, target_leaf: int, region: B
         and written.tensor == region.tensor
         and _ranges_equal(_rebind_region(ir, leaf_nid, target_leaf, written).ranges, region.ranges)
     )
+
+
+def _broadcast_view_matches_factor(ir: KernelIR, node: ISANode, factor: BufferRegion) -> bool:
+    """Require the broadcast's explicit view to repeat exactly its factor vector."""
+    buffer = ir.buffer(factor.tensor)
+    stride = buffer.logical_tile_count() * buffer.per_tile_physical_shape()[2]
+    expected = AccessPattern(
+        pattern=(
+            (Const(value=stride), factor.ranges[0][1]),
+            (Const(value=0), Const(value=int(node.kwargs["partitions"]))),
+        ),
+        offset=factor.ranges[0][0],
+    )
+    return node.access_patterns in ({}, {"data": expected})
 
 
 def _bilinear_moves(ir: KernelIR) -> dict[int, _BilinearMove]:
@@ -315,6 +329,11 @@ def _bilinear_moves(ir: KernelIR) -> dict[int, _BilinearMove]:
                 node.operand_bindings[broadcast_slots[0]].ranges,
             )
             and ir.buffer(factor).physical_dtype() == "float32"
+            and _broadcast_view_matches_factor(ir, broadcast_node, factor_region)
+            and not node.access_patterns
+            and reducer.left_operand not in reducer_node.access_patterns
+            and drain is not None
+            and "src" not in drain.access_patterns
             and not intersects_software_pipeline(ir, blocks)
             and source_remains_stable(
                 ir, node.operand_bindings[permutation_slots[0]], pointwise_leaf, reducer_leaf, positions

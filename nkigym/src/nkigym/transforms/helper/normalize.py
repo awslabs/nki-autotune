@@ -166,7 +166,7 @@ def _recompute_bindings(
                 buffer_map,
                 None if tensor_axes is None else tensor_axes[region.tensor],
             )
-            if tensor_axes is None or region.tensor in tensor_axes
+            if slot not in leaf.access_patterns and (tensor_axes is None or region.tensor in tensor_axes)
             else region
         )
         for slot, region in leaf.operand_bindings.items()

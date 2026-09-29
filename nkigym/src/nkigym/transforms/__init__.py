@@ -20,17 +20,22 @@ _PUBLIC_TRANSFORMS = (
     ("eliminate_identity_initializer", "EliminateIdentityInitializer"),
     ("fuse", "Fuse"),
     ("fuse_pointwise", "FusePointwise"),
+    ("interleave_contraction", "InterleaveContraction"),
+    ("matmul_column_tiling", "MatmulColumnTiling"),
+    ("onchip_reshape", "OnChipReshape"),
     ("online_fusion", "OnlineFusion"),
     ("program_shard", "ProgramShard"),
     ("program_store_partition", "ProgramStorePartition"),
     ("reorder", "Reorder"),
     ("rfactor", "RFactor"),
+    ("set_buffer_alignment", "SetBufferAlignment"),
+    ("set_copy_engine", "SetCopyEngine"),
     ("set_first_write_overwrite", "SetFirstWriteOverwrite"),
     ("software_pipeline", "SoftwarePipeline"),
     ("split", "Split"),
     ("transpose_pair", "TransposePair"),
     ("transpose_through_matmul", "TransposeThroughMatmul"),
-    ("transpose_through_tensor_copy", "TransposeThroughTensorCopy"),
+    ("transpose_through_pointwise", "TransposeThroughPointwise"),
 )
 _EXPORT_MODULES = {
     "BatchPermutation": "batch_permutation",
@@ -63,6 +68,12 @@ _EXPORT_MODULES = {
     "FuseOption": "fuse",
     "FusePointwise": "fuse_pointwise",
     "FusePointwiseOption": "fuse_pointwise",
+    "InterleaveContraction": "interleave_contraction",
+    "InterleaveContractionOption": "interleave_contraction",
+    "MatmulColumnTiling": "matmul_column_tiling",
+    "MatmulColumnTilingOption": "matmul_column_tiling",
+    "OnChipReshape": "onchip_reshape",
+    "OnChipReshapeOption": "onchip_reshape",
     "InsertTransposePairOption": "transpose_pair",
     "OnlineFusion": "online_fusion",
     "OnlineFusionOption": "online_fusion",
@@ -74,6 +85,10 @@ _EXPORT_MODULES = {
     "ReorderOption": "reorder",
     "RFactor": "rfactor",
     "RFactorOption": "rfactor",
+    "SetBufferAlignment": "set_buffer_alignment",
+    "SetBufferAlignmentOption": "set_buffer_alignment",
+    "SetCopyEngine": "set_copy_engine",
+    "SetCopyEngineOption": "set_copy_engine",
     "SetFirstWriteOverwrite": "set_first_write_overwrite",
     "SetFirstWriteOverwriteOption": "set_first_write_overwrite",
     "SoftwarePipeline": "software_pipeline",
@@ -84,8 +99,8 @@ _EXPORT_MODULES = {
     "TransposePairOption": "transpose_pair",
     "TransposeThroughMatmul": "transpose_through_matmul",
     "TransposeThroughMatmulOption": "transpose_through_matmul",
-    "TransposeThroughTensorCopy": "transpose_through_tensor_copy",
-    "TransposeThroughTensorCopyOption": "transpose_through_tensor_copy",
+    "TransposeThroughPointwise": "transpose_through_pointwise",
+    "TransposeThroughPointwiseOption": "transpose_through_pointwise",
 }
 
 BatchPermutation: type[Transform[Any]]
@@ -118,6 +133,12 @@ Fuse: type[Transform[Any]]
 FuseOption: type[TransformOption]
 FusePointwise: type[Transform[Any]]
 FusePointwiseOption: type[TransformOption]
+InterleaveContraction: type[Transform[Any]]
+InterleaveContractionOption: type[TransformOption]
+MatmulColumnTiling: type[Transform[Any]]
+MatmulColumnTilingOption: type[TransformOption]
+OnChipReshape: type[Transform[Any]]
+OnChipReshapeOption: type[TransformOption]
 InsertTransposePairOption: type[TransformOption]
 OnlineFusion: type[Transform[Any]]
 OnlineFusionOption: type[TransformOption]
@@ -130,6 +151,10 @@ Reorder: type[Transform[Any]]
 ReorderOption: type[TransformOption]
 RFactor: type[Transform[Any]]
 RFactorOption: type[TransformOption]
+SetBufferAlignment: type[Transform[Any]]
+SetBufferAlignmentOption: type[TransformOption]
+SetCopyEngine: type[Transform[Any]]
+SetCopyEngineOption: type[TransformOption]
 SetFirstWriteOverwrite: type[Transform[Any]]
 SetFirstWriteOverwriteOption: type[TransformOption]
 SoftwarePipeline: type[Transform[Any]]
@@ -140,8 +165,8 @@ TransposePair: type[Transform[Any]]
 TransposePairOption: type[TransformOption]
 TransposeThroughMatmul: type[Transform[Any]]
 TransposeThroughMatmulOption: type[TransformOption]
-TransposeThroughTensorCopy: type[Transform[Any]]
-TransposeThroughTensorCopyOption: type[TransformOption]
+TransposeThroughPointwise: type[Transform[Any]]
+TransposeThroughPointwiseOption: type[TransformOption]
 
 
 def _load_export(name: str) -> object:
@@ -207,6 +232,12 @@ __all__ = [
     "FuseOption",
     "FusePointwise",
     "FusePointwiseOption",
+    "InterleaveContraction",
+    "InterleaveContractionOption",
+    "MatmulColumnTiling",
+    "MatmulColumnTilingOption",
+    "OnChipReshape",
+    "OnChipReshapeOption",
     "InsertTransposePairOption",
     "OnlineFusion",
     "OnlineFusionOption",
@@ -219,6 +250,10 @@ __all__ = [
     "ReorderOption",
     "RFactor",
     "RFactorOption",
+    "SetBufferAlignment",
+    "SetBufferAlignmentOption",
+    "SetCopyEngine",
+    "SetCopyEngineOption",
     "SetFirstWriteOverwrite",
     "SetFirstWriteOverwriteOption",
     "SoftwarePipeline",
@@ -232,7 +267,7 @@ __all__ = [
     "TransposePairOption",
     "TransposeThroughMatmul",
     "TransposeThroughMatmulOption",
-    "TransposeThroughTensorCopy",
-    "TransposeThroughTensorCopyOption",
+    "TransposeThroughPointwise",
+    "TransposeThroughPointwiseOption",
     "public_transforms",
 ]

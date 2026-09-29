@@ -257,7 +257,7 @@ def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_
             "Uploading simulation batch",
             [
                 "rsync",
-                "-az" if request_path.stat().st_size >= 1 << 30 else "-a",
+                "-a",
                 "-e",
                 rsync_shell,
                 str(Path(__file__).with_name("simulate_nki_worker.py").resolve()),

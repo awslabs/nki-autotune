@@ -14,6 +14,8 @@ class TorchValue:
     transposed: bool = False
     is_hbm: bool = False
     storage_dtype: str | None = None
+    hbm_source: str | None = None
+    promotion_source: TorchValue | None = None
 
 
 @dataclass(frozen=True)
@@ -37,10 +39,9 @@ def emit_activation(
 def emit_cast(source: TorchValue, class_name: str, name: str, body: list[str], imports: set[str]) -> TorchValue:
     """Emit one activation-backed dtype cast."""
     storage_dtype = {"NKIFloat8Cast": "float8_e4m3", "NKIFloat32Cast": "float32"}.get(class_name)
-    target = TorchValue(name, source.shape, source.transposed, storage_dtype=storage_dtype)
     imports.add(class_name)
-    body.append(f"{target.name} = {class_name}()(data={source.name})")
-    return target
+    body.append(f"{name} = {class_name}()(data={source.name})")
+    return TorchValue(name, source.shape, source.transposed, storage_dtype=storage_dtype)
 
 
 def emit_cumsum(source: TorchValue, name: str, body: list[str], imports: set[str]) -> TorchSegments:

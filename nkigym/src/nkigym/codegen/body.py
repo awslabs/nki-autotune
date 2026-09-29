@@ -14,8 +14,9 @@ ISA leaf's :attr:`ISANode.operand_bindings`.
 
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from functools import partial
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Add, Const, Expr, Mod, Mul, Var, _format_raw, expr_variables, format_expr, substitute
@@ -30,6 +31,7 @@ from nkigym.ir.tree import AccessPattern, BlockNode, Buffer, BufferRegion, ForNo
 from nkigym.ops.base import AxisRole
 
 _INDENT = "    "
+_View = TypeVar("_View", BufferRegion, AccessPattern)
 
 
 class _RenderIR(KernelIR):
@@ -50,7 +52,7 @@ class _RenderIR(KernelIR):
 
     def _emit_child(self, nid: int, depth: int, rotations: dict[str, Expr], substitutions: dict[str, Expr]) -> None:
         """Emit one child after its first-use buffer declarations."""
-        self.code.extend(_INDENT * depth + _emit_alloc(buf) for buf in self.emit_before.get(nid, ()))
+        self.code.extend(_INDENT * depth + _emit_alloc(buf, self.return_names) for buf in self.emit_before.get(nid, ()))
         self._emit_subtree(nid, depth, rotations, substitutions)
 
     def _emit_block(
@@ -274,11 +276,9 @@ def _alloc_emit_anchors(ir: KernelIR, pipeline_map: dict[int, dict[str, Any]]) -
                 for leaf in leaves:
                     if name in ir.dependency.info(leaf).writes:
                         cast(_RenderIR, ir).unscoped_blocks.update(ancestors[leaf][len(ancestors[scope]) + 1 :])
-            version_loop = version_loops.get(name)
-            if version_loop is not None and scope not in ancestors[version_loop]:
+            if (version_loop := version_loops.get(name)) is not None and scope not in ancestors[version_loop]:
                 raise ValueError(f"buffer {name!r} must be placed outside pipeline loop {version_loop}")
-            anchor = _anchor_child(scope, leaves, ancestors)
-            out.setdefault(anchor, []).append(buf)
+            out.setdefault(_anchor_child(scope, leaves, ancestors), []).append(buf)
     return out
 
 
@@ -288,9 +288,8 @@ def _anchor_child(scope: int, leaves: list[int], ancestors: dict[int, tuple[int,
     ``scope`` is the declaration's block and ``leaves`` is in execution order.
     Validate that every access is enclosed, then use the first access's path.
     """
-    for leaf in leaves:
-        if scope not in ancestors[leaf]:
-            raise AssertionError(f"scope {scope} does not enclose touching leaf {leaf}")
+    if any(scope not in ancestors[leaf] for leaf in leaves):
+        raise AssertionError(f"scope {scope} does not enclose touching leaves {leaves}")
     return (*ancestors[leaves[0]], leaves[0])[len(ancestors[scope]) + 1]
 
 
@@ -330,20 +329,21 @@ def _pipeline_rotations(ir: KernelIR, logical_iteration: Expr, versioned_buffers
         buf = ir.buffer(name)
         if buf.versions <= 1:
             raise AssertionError(f"pipeline marks single-version buffer {name!r} as versioned")
+        mod: Expr = Mod(left=logical_iteration, right=Const(value=buf.versions))
         if isinstance(logical_iteration, Const):
-            mod: Expr = Const(value=logical_iteration.value % buf.versions)
-        else:
-            mod = Mod(left=logical_iteration, right=Const(value=buf.versions))
+            mod = Const(value=logical_iteration.value % buf.versions)
         tiles_per_list = buf.tiles_per_list()
         out[name] = mod if tiles_per_list == 1 else Mul(left=mod, right=Const(value=tiles_per_list))
     return out
 
 
-def _emit_alloc(buf: Buffer) -> str:
+def _emit_alloc(buf: Buffer, outputs: tuple[str, ...]) -> str:
     """Emit the buffer declaration for ``buf``.
 
-    ``shared_hbm`` buffers emit a single bare ``nl.ndarray`` of
-    :meth:`Buffer.physical_shape` (no tile axis). Every sbuf/psum buffer emits a
+    HBM temporaries are private to one program; returned buffers remain shared.
+    Program sharding preserves producer/consumer ownership and uses explicit
+    peer exchanges for cross-program values. HBM allocations use a bare
+    ``nl.ndarray`` of :meth:`Buffer.physical_shape`. Every sbuf/psum buffer emits a
     Python list of :attr:`Buffer.list_len` per-tile ndarrays
     (:meth:`Buffer.per_tile_physical_shape`) — uniformly, including ``list_len == 1``
     (a list-of-one), so the call site always indexes with a leading ``[list_idx]``.
@@ -353,7 +353,7 @@ def _emit_alloc(buf: Buffer) -> str:
             raise ValueError(f"{buf.name}: scalar registers require one unversioned element")
         return f"{buf.name} = nisa.register_alloc()"
     if buf.location == "shared_hbm":
-        return f"{buf.name} = nl.ndarray({buf.physical_shape()}, dtype=nl.{buf.physical_dtype()}, buffer=nl.shared_hbm)"
+        return f"{buf.name} = nl.ndarray({buf.physical_shape()}, dtype=nl.{buf.physical_dtype()}, buffer=nl.{'shared_hbm' if buf.name in outputs else 'private_hbm'})"
     return f"{buf.name} = [nl.ndarray({buf.per_tile_physical_shape()}, dtype=nl.{buf.physical_dtype()}, buffer=nl.{buf.location}) for _ in range({buf.list_len})]"
 
 
@@ -375,20 +375,14 @@ def _emit_isa_call(
         if scalar_copy and slot == "offset":
             continue
         if slot in node.operand_bindings:
-            region = _substituted_region(node.operand_bindings[slot], substitutions)
+            region = _substituted_view(node.operand_bindings[slot], substitutions)
             access_pattern = node.access_patterns.get(slot)
             if substitutions and access_pattern is not None:
-                access_pattern = AccessPattern(
-                    pattern=tuple(
-                        (substitute(stride, substitutions), substitute(extent, substitutions))
-                        for stride, extent in access_pattern.pattern
-                    ),
-                    offset=substitute(access_pattern.offset, substitutions),
-                )
+                access_pattern = _substituted_view(access_pattern, substitutions)
             buf = ir.buffer(region.tensor)
             rotation = rotations.get(region.tensor)
             if slot in getattr(op_cls, "STRIDED_COPY_INPUTS", ()):
-                free = buf.shape[1]
+                free = buf.per_tile_physical_shape()[2]
                 access_pattern = AccessPattern(
                     pattern=(
                         (Const(value=buf.logical_tile_count() * free), region.ranges[0][1]),
@@ -405,27 +399,29 @@ def _emit_isa_call(
                     output = None
                     if alignment:
                         (output_slot,) = cast(tuple[str], tuple(alignment))
-                        output = _substituted_region(node.operand_bindings[output_slot], substitutions)
+                        output = _substituted_view(node.operand_bindings[output_slot], substitutions)
                     region = region.with_partition_aligned_slice(axis, start, width, output)
             if access_pattern is None:
                 rendered = render_buffer_region(region, buf, rotation)
             else:
                 rendered = render_access_pattern(region.tensor, access_pattern, buf, rotation)
+            if keys := getattr(op_cls, "PARTITION_SLICES", {}).get(slot):
+                start, width = (_render_kwarg("", node.kwargs[key]) for key in keys)
+                rendered = f"{rendered}[{start}:({start}) + {width}, ...]"
             if dtype := getattr(op_cls, "REINTERPRET_INPUT_DTYPES", {}).get(slot):
                 rendered = f"{rendered}.view(dtype=nl.{dtype})"
             if scalar_copy and slot == scalar_copy:
-                source = _substituted_region(
+                source = _substituted_view(
                     node.operand_bindings["dst" if scalar_copy == "src" else "src"], substitutions
                 )
-                offset = _substituted_region(node.operand_bindings["offset"], substitutions)
+                offset = _substituted_view(node.operand_bindings["offset"], substitutions)
                 if ir.buffer(source.tensor).physical_dtype() != buf.physical_dtype():
                     raise ValueError("dynamic slice copies require matching source and destination storage")
                 partition, width = (_constant_width(source, axis) for axis in (0, 1))
                 stride = math.prod(buf.per_tile_physical_shape()[1:])
                 index = render_buffer_region(offset, ir.buffer(offset.tensor), rotations.get(offset.tensor))
                 rendered = f"{rendered}.ap(pattern=[[{stride}, {partition}], [1, {width}]], scalar_offset={index}, indirect_dim=1)"
-            native_slot = getattr(op_cls, "ISA_OPERAND_NAMES", {}).get(slot, slot)
-            parts.append(f"{native_slot}={rendered}")
+            parts.append(f"{getattr(op_cls, 'ISA_OPERAND_NAMES', {}).get(slot, slot)}={rendered}")
     kwargs = dict(node.kwargs)
     isa_name = op_cls.NAME
     if native_parameters := getattr(op_cls, "native_parameters", None):
@@ -480,7 +476,7 @@ def _emit_isa_call(
 
 def _emit_indirect_dma(node: ISANode, ir: KernelIR, rotations: dict[str, Expr], substitutions: dict[str, Expr]) -> str:
     """Render one row gather or scatter with an SBUF offset."""
-    regions = {slot: _substituted_region(region, substitutions) for slot, region in node.operand_bindings.items()}
+    regions = {slot: _substituted_view(region, substitutions) for slot, region in node.operand_bindings.items()}
     source, indices, destination = (regions[key] for key in ("src", "indices", "dst"))
     mode = node.op_cls.INDIRECT_DMA_MODE
     gather = mode in {"column_gather", "gather", "scalar_gather"}
@@ -488,10 +484,18 @@ def _emit_indirect_dma(node: ISANode, ir: KernelIR, rotations: dict[str, Expr], 
     partition, free = (_constant_width(data_region, axis) for axis in (0, 1))
     scalar = mode in {"scalar_gather", "scalar_scatter"}
     if scalar:
-        indices = indices.with_partition_aligned_slice(1, cast(int | Expr, node.kwargs.get("index", 0)), 1)
+        index = node.kwargs.get("index", 0)
+        index = substitute(index, substitutions) if isinstance(index, Expr) else index
+        indices = indices.with_partition_aligned_slice(1, cast(int | Expr, index), 1)
     free_lower, hbm_buffer = (hbm_region.ranges[1][0], ir.buffer(hbm_region.tensor))
     index_text = render_buffer_region(indices, ir.buffer(indices.tensor), rotations.get(indices.tensor))
     data_text = render_buffer_region(data_region, ir.buffer(data_region.tensor), rotations.get(data_region.tensor))
+    batch = 1
+    if pattern := node.access_patterns.get("dst" if gather else "src"):
+        data_buffer = ir.buffer(data_region.tensor)
+        batch = data_buffer.logical_tile_count()
+        pattern = _substituted_view(pattern, substitutions)
+        data_text = render_access_pattern(data_region.tensor, pattern, data_buffer, rotations.get(data_region.tensor))
     row_stride = hbm_buffer.shape[1]
     if mode == "column_gather":
         free_lower, row_stride = (Const(value=0), 1)
@@ -503,29 +507,26 @@ def _emit_indirect_dma(node: ISANode, ir: KernelIR, rotations: dict[str, Expr], 
         free_lower = Add(
             left=Mul(left=row_lower, right=Const(value=row_stride)), right=Add(left=free_lower, right=column)
         )
-    offset_kind = "scalar_offset" if scalar else "vector_offset"
-    indirect = f"{hbm_region.tensor}.ap(pattern=[[{row_stride}, {partition}], [1, {free}]], offset={format_expr(free_lower)}, {offset_kind}={index_text}, indirect_dim=0)"
+    offset_kind, descriptor_mode = ("scalar_offset", "hwdge") if scalar else ("vector_offset", "swdge")
+    batch_pattern = f"[{row_stride * partition}, {batch}], " if batch > 1 else ""
+    indirect = f"{hbm_region.tensor}.ap(pattern=[[{row_stride}, {partition}], {batch_pattern}[1, {free}]], offset={format_expr(free_lower)}, {offset_kind}={index_text}, indirect_dim=0)"
     source, destination = (indirect, data_text) if gather else (data_text, indirect)
-    descriptor_mode = "hwdge" if scalar else "swdge"
     return f"nisa.dma_copy(src={source}, dst={destination}, oob_mode=oob_mode.error, dge_mode=nisa.dge_mode.{descriptor_mode})"
 
 
-def _substituted_region(region: BufferRegion, substitutions: dict[str, Expr]) -> BufferRegion:
-    """Apply loop substitutions to one operand region."""
+def _substituted_view(view: _View, substitutions: dict[str, Expr]) -> _View:
+    """Apply loop substitutions to one operand's logical or physical view."""
     if not substitutions:
-        return region
-    return BufferRegion(
-        tensor=region.tensor,
-        ranges=tuple(
-            (substitute(lower, substitutions), substitute(width, substitutions)) for lower, width in region.ranges
-        ),
-    )
+        return view
+    rewrite = partial(substitute, subs=substitutions)
+    if isinstance(view, BufferRegion):
+        return replace(view, ranges=tuple((rewrite(a), rewrite(b)) for a, b in view.ranges))
+    return replace(view, pattern=tuple((rewrite(a), rewrite(b)) for a, b in view.pattern), offset=rewrite(view.offset))
 
 
 def _constant_width(region: BufferRegion, axis: int) -> int:
     """Return one statically known region width."""
-    width = region.ranges[axis][1]
-    if not isinstance(width, Const):
+    if not isinstance(width := region.ranges[axis][1], Const):
         raise AssertionError(f"{region.tensor}: indirect DMA requires a constant tile width")
     return width.value
 
@@ -536,12 +537,13 @@ _NL_OP_KWARGS = frozenset({"comp_op0", "comp_op1", "dtype", "op", "op0", "op1", 
 
 def _render_kwarg(key: str, value: Any) -> str:
     """Render one ISA kwarg value, mapping ALU-operator names to ``nl.<name>``."""
+    if key == "tile_position" and isinstance(value, Expr):
+        return f"(0, {_format_raw(value)})"
     value = "maximum" if key in {"op", "reduce_op"} and value == "max" else value
     if key == "reduce_cmd" or (key in {"send_to_rank", "recv_from_rank"} and value == "program_peer"):
         return f"nisa.reduce_cmd.{value}" if key == "reduce_cmd" else "1 - nl.program_id(0)"
     if key in _NL_OP_KWARGS | {"engine"} and isinstance(value, str):
-        namespace = "nisa.engine" if key == "engine" else "nl"
-        return f"{namespace}.{value}"
+        return f"{'nisa.engine' if key == 'engine' else 'nl'}.{value}"
     if isinstance(value, float) and (math.isinf(value) or math.isnan(value)):
         return f"float('{value}')"
     return format_expr(value) if isinstance(value, Expr) else repr(value)
@@ -604,6 +606,7 @@ def render_buffer_region(region: BufferRegion, buf: Buffer, rotation: Expr | Non
             lo_str = _format_raw(lo)
             hi_str = _format_raw(hi)
             parts.append(f"{lo_str}:{lo_str} + {hi_str}")
+    parts += ["0:1"] if list_subscript and len(parts) == 2 and buf.free_alignment > 1 else []
     return f"{region.tensor}{list_subscript}[{', '.join(parts)}]"
 
 

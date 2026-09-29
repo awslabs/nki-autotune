@@ -11,6 +11,7 @@ from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
 from nkigym.ops.reinterpret_float32 import emit_binary32_round, emit_binary32_sign
 from nkigym.ops.reinterpret_uint32 import emit_binary32_parts
+from nkigym.ops.uint32_tensor import emit_division_quotient
 
 
 def emit_tensor_scalar_or_divide(
@@ -25,16 +26,24 @@ def emit_tensor_scalar_or_divide(
 ) -> TorchValue:
     """Emit scalar math, using reciprocal scaling only under the native arithmetic contract.
 
-    Normalized significands are integers below 2**24. Each of 23 restoring
-    steps doubles the remainder, subtracts the divisor when needed, and
-    appends one quotient bit. All these operations are exact in float32.
-    The exact remainder then determines nearest-even rounding, including
-    subnormal outputs, without a rounded reciprocal or a fused operation.
+    Normalized significands are integers below 2**24. Exact residuals correct
+    reciprocal digit estimates when the constant has enough trailing zero bits;
+    other constants retain bitwise restoring division. The exact quotient and
+    remainder determine nearest-even rounding, including subnormal outputs.
 
     Scalars are interpreted as binary32; zero and nonfinite divisors are
     rejected. Infinite numerators retain the quotient sign. NaN numerators
     are quieted while retaining their sign and payload.
     """
+    if operation not in "add divide greater_equal less maximum subtract multiply right_shift".split():
+        raise ValueError(f"unsupported tensor-scalar operator {operation}")
+    if operation == "right_shift":
+        shift = float(operand)
+        if reverse or source.storage_dtype != "uint32" or not shift.is_integer() or shift < 0:
+            raise ValueError("logical right shift requires uint32 data and a nonnegative integer scalar")
+        imports.add("NKIBitwiseScalar")
+        body.append(f"{name} = NKIBitwiseScalar(op0='right_shift', operand0={int(shift)})(data={source.name})")
+        return TorchValue(name, source.shape, source.transposed, storage_dtype="uint32")
     target = TorchValue(name, source.shape, source.transposed, storage_dtype="float32")
     if operation != "divide":
         target = TorchValue(name, source.shape, source.transposed, storage_dtype=source.storage_dtype)
@@ -66,12 +75,7 @@ def emit_tensor_scalar_or_divide(
     below_one = op("less", significand, denominator)
     remainder = op("subtract", op("multiply", significand, op("add", below_one, 1)), denominator)
     exponent = op("subtract", op("subtract", exponent, power - 1), below_one)
-    quotient = op("greater_equal", significand, 0)
-    for _ in range(23):
-        twice = op("multiply", remainder, 2)
-        bit = op("greater_equal", twice, denominator)
-        remainder = op("subtract", twice, op("multiply", bit, denominator))
-        quotient = op("add", op("multiply", quotient, 2), bit)
+    quotient, remainder = emit_division_quotient(emit, significand, remainder, denominator)
     magnitude = emit_binary32_round(emit, quotient, remainder, exponent, denominator)
     result = emit_binary32_sign(emit, magnitude, bits, field, divisor < 0)
     body.append(f"{target.name} = NKIReinterpretFloat32()(src={result})")

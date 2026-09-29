@@ -371,7 +371,7 @@ def _serial_reduction(ir: KernelIR, loop_nid: int, buffers: dict[str, Buffer] | 
     if (
         buffers[state.tensor].location != "sbuf"
         or len(buffers[state.tensor].shape) not in {1, 2}
-        or buffers[partial.tensor].location not in {"sbuf", "psum"}
+        or buffers[partial.tensor].location != "sbuf"
         or any(buffers[r.tensor].physical_dtype() != "float32" for r in (state, partial))
     ):
         return None
@@ -429,7 +429,7 @@ def _owned_operation_scope(ir: KernelIR, leaf_nid: int) -> OperationScope:
 
 
 def _privatize_serial_reduction(ir: KernelIR, match: _SerialReduction) -> None:
-    """Give each factor a private partial slot while retaining the accumulation schedule."""
+    """Give each materialized SBUF contribution a private slot without changing the fold schedule."""
     loop = ir.tree.loop(match.loop_nid)
     state = ir.buffer(match.state.tensor)
     slots = replace(

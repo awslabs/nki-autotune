@@ -25,7 +25,6 @@ from nkigym.ir import KernelIR, KernelTree
 from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ISANode
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.base import PointwiseContract
-from nkigym.ops.reciprocal import NKIReciprocal
 from nkigym.ops.tensor_scalar import NKITensorScalar
 
 _PIPELINE_OVERLAPS: WeakKeyDictionary[KernelTree, frozenset[int]] = WeakKeyDictionary()
@@ -148,7 +147,7 @@ def resolve_activation_composition(
     unique_consumer: Callable[[KernelIR, str, int, int], bool],
     buffers: dict[str, Buffer],
 ) -> ActivationComposition | None:
-    """Resolve one affine or sqrt producer into one activation consumer."""
+    """Resolve one affine producer into one activation consumer."""
     result: ActivationComposition | None = None
     producer_leaf_nid = _sole_isa_leaf(ir, producer_block_nid)
     consumer_leaf_nid = _owned_isa_leaf(ir, consumer_block_nid)
@@ -199,17 +198,7 @@ def _activation_composition(
     result: tuple[BufferRegion, dict[str, Any]] | None = None
     data = producer_leaf.operand_bindings.get("data")
     no_tensor_bias = "bias" not in producer_leaf.operand_bindings and "bias" not in consumer_leaf.operand_bindings
-    reciprocal = consumer.operator == "reciprocal" and consumer.scale == 1.0 and consumer.bias == 0.0
-    if (
-        data is not None
-        and no_tensor_bias
-        and producer_leaf.op_cls is NKIActivation
-        and producer.operator == "sqrt"
-        and consumer_leaf.op_cls in {NKIActivation, NKIReciprocal}
-        and reciprocal
-    ):
-        result = (data, _activation_kwargs("rsqrt", producer.scale, producer.bias))
-    elif data is not None and no_tensor_bias and consumer_leaf.op_cls is NKIActivation:
+    if data is not None and no_tensor_bias and consumer_leaf.op_cls is NKIActivation:
         affine = _literal_affine(producer_leaf, producer)
         if affine is not None:
             affine_data, scale, bias = affine

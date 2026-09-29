@@ -6,8 +6,20 @@ from typing import Any, ClassVar
 import ml_dtypes
 import numpy as np
 
-from nkigym.ops.base import CopyContract, NKIOp, _operand_role
+from nkigym.ops.base import CopyContract, NKIOp, PointwiseContract, _operand_role
 from nkigym.ops.float32_cast import _vector_copy_parameters
+
+
+def supports_fused_rounding(
+    operation: type[NKIOp], contract: PointwiseContract, kwargs: Mapping[str, Any], dtype: str
+) -> bool:
+    """Return native final rounding forms for one FP32 pointwise producer."""
+    return dtype in {"float16", "bfloat16"} or (
+        dtype == "float8_e4m3"
+        and operation.NAME in {"tensor_scalar", "tensor_tensor"}
+        and contract.operator in {"multiply", "add", "subtract", "maximum", "minimum"}
+        and kwargs.get("engine", "unknown") in {"unknown", "vector"}
+    )
 
 
 class NKIFloat8Cast(NKIOp):

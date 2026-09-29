@@ -1,4 +1,4 @@
-"""SBUF → HBM ``nisa.dma_copy`` operation."""
+"""SBUF or HBM → HBM ``nisa.dma_copy`` operation."""
 
 from collections.abc import Mapping
 from typing import Any, ClassVar
@@ -9,7 +9,7 @@ from nkigym.ops.base import CopyContract, NKIOp, PartitionTileBatchingContract, 
 
 
 class NKIStore(NKIOp):
-    """Copy an SBUF buffer back to HBM with identical logical layout."""
+    """Copy an SBUF or HBM buffer to HBM with identical logical layout."""
 
     NAME: ClassVar[str] = "dma_copy"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, str]]] = {"src": ("P", "F"), "dst": ("P", "F")}
@@ -18,9 +18,10 @@ class NKIStore(NKIOp):
     partition axis (128) — the free axis is unbounded."""
     MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+    TENSORIZE_MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"F": 1}
     OUTPUT_ROLE: ClassVar[str] = "stored"
     OUTPUT_LOCATION: ClassVar[str] = "shared_hbm"
-    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"src": frozenset({"sbuf"})}
+    INPUT_LOCATIONS: ClassVar[dict[str, frozenset[str]]] = {"src": frozenset({"sbuf", "shared_hbm"})}
     CODEGEN_ONLY_KWARGS: ClassVar[frozenset[str]] = frozenset({"program_ownership"})
 
     @classmethod
@@ -36,10 +37,10 @@ class NKIStore(NKIOp):
         return PartitionTileBatchingContract(operands=("src", "dst"))
 
     def _check_roles(self, **kwargs: Any) -> None:
-        """``src`` must be SBUF-resident."""
+        """Require a source in SBUF or HBM."""
         role = _operand_role(kwargs["src"])
-        if role is not None and role != "sbuf":
-            raise TypeError(f"NKIStore(src=<role={role}>) expects sbuf; did you forget to stage through SBUF?")
+        if role not in {None, "param", "shared_hbm", "stored", "sbuf"}:
+            raise TypeError(f"NKIStore(src=<role={role}>) expects SBUF or HBM")
 
     def _run(self, **kwargs: Any) -> Any:
         """CPU simulation: allocate and return a copy of ``src`` in HBM."""

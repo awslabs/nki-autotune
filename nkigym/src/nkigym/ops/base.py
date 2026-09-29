@@ -276,6 +276,7 @@ class PartitionTileBatchingContract:
 
     ``operands`` lists every tensor slot whose one-tile region expands to the
     corresponding complete physical allocation when its loop is batched.
+    Other operands must be read-only and invariant over the absorbed loop.
     """
 
     operands: tuple[str, ...]
@@ -301,13 +302,14 @@ class CopyContract:
 
 @dataclass(frozen=True)
 class SliceContract:
-    """Copy one contiguous interval along a source dimension."""
+    """Copy a contiguous interval or a fixed strided view along one dimension."""
 
     input_operand: str
     output_operand: str
     axis: int
     start: int
     width: int
+    pattern: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -575,6 +577,7 @@ def reduction_combinator(name: str) -> ReduceCombinator:
     combinators = {
         "add": ReduceCombinator(combiner="add", identity=0.0),
         "maximum": ReduceCombinator(combiner="maximum", identity=float("-inf")),
+        "minimum": ReduceCombinator(combiner="minimum", identity=float("inf")),
         "multiply": ReduceCombinator(combiner="multiply", identity=1.0),
     }
     if normalized not in combinators:
@@ -748,13 +751,13 @@ class NKIOp:
 
     @classmethod
     def accepts_input_locations(cls, locations: Mapping[str, str]) -> bool:
-        """Return whether the complete input-location assignment is supported."""
-        return all(locations.get(operand) in accepted for operand, accepted in cls.INPUT_LOCATIONS.items())
+        """Validate bound tensor locations; scalar literals have no residency."""
+        return all(value in cls.INPUT_LOCATIONS.get(operand, (value,)) for operand, value in locations.items())
 
     @classmethod
     def accepts_input_storage_dtypes(cls, dtypes: Mapping[str, str]) -> bool:
-        """Return whether the complete input-dtype assignment is supported."""
-        return all(dtypes.get(operand) in accepted for operand, accepted in cls.INPUT_STORAGE_DTYPES.items())
+        """Validate bound tensor storage; scalar literals have no storage dtype."""
+        return all(value in cls.INPUT_STORAGE_DTYPES.get(operand, (value,)) for operand, value in dtypes.items())
 
     def __init__(self, **kwargs: Any) -> None:
         """Stash constructor kwargs for merging into ``__call__`` kwargs."""
@@ -774,8 +777,8 @@ class NKIOp:
     @classmethod
     def partition_tile_batching_contract(cls, kwargs: Mapping[str, Any]) -> PartitionTileBatchingContract | None:
         """Return hardware support for batching a loop of partition tiles."""
-        _ = kwargs
-        return None
+        operands = getattr(cls, "PARTITION_BATCH_OPERANDS", ())
+        return PartitionTileBatchingContract(operands=operands) if operands else None
 
     @classmethod
     def first_write_overwrites(cls, operand: str, kwargs: Mapping[str, Any]) -> bool:

@@ -73,6 +73,7 @@ class NKITensorScalar(NKIOp):
     """
 
     NAME: ClassVar[str] = "tensor_scalar"
+    PARTITION_BATCH_OPERANDS: ClassVar[tuple[str, ...]] = ("data", "dst")
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "operand0": ("P", "B"), "dst": ("P", "F")}
     INPUT_OPERANDS: ClassVar[frozenset[str]] = frozenset({"data", "operand0"})
     FIXED_AXIS_SIZES: ClassVar[dict[str, int | str]] = {"B": 1}
@@ -82,8 +83,9 @@ class NKITensorScalar(NKIOp):
     }
     INPUT_STORAGE_DTYPES: ClassVar[dict[str, frozenset[str]]] = {"data": frozenset({"bfloat16", "float16", "float32"})}
     REQUIRED_INPUT_STORAGE_DTYPES: ClassVar[dict[str, str]] = {"operand0": "float32"}
-    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 128, "F": 128}
+    MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"P": 1, "F": 128}
     MAX_TILE_SIZE: ClassVar[dict[str, int | None]] = {"P": 128, "F": None}
+    TENSORIZE_MIN_TILE_SIZE: ClassVar[dict[str, int]] = {"F": 1}
     OUTPUT_LOCATION: ClassVar[str] = "sbuf"
     INPLACE_OPERANDS: ClassVar[dict[str, frozenset[str]]] = {"dst": frozenset({"data"})}
 
@@ -123,15 +125,15 @@ class NKITensorScalar(NKIOp):
 def emit_scan_stop(
     emit: TorchArithmetic, values: str, positions: str, bounds: tuple[str, str], pivot: str, reverse: bool
 ) -> str:
-    """Mark interval elements where a NaN-first comparator scan must stop."""
+    """Mark interval elements where the configured comparator scan must stop."""
     low, high = bounds
     inside = emit.binary("multiply", emit.scalar("greater_equal", positions, low), emit.scalar("less", positions, high))
     finite, pivot_finite = emit.binary("equal", values, values), emit.binary("equal", pivot, pivot)
     ordinary = emit.scalar("less" if reverse else "greater", values, pivot)
     missing = emit.scalar(
         "multiply",
-        finite if reverse else emit.scalar("subtract", finite, 1.0, True),
-        emit.scalar("subtract", pivot_finite, 1.0, True) if reverse else pivot_finite,
+        finite if reverse == emit.nan_first else emit.inverse(finite),
+        emit.inverse(pivot_finite) if reverse == emit.nan_first else pivot_finite,
     )
     return emit.binary(
         "multiply", inside, emit.scalar("subtract", emit.binary("maximum", ordinary, missing), 1.0, True)

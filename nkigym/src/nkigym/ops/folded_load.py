@@ -4,8 +4,13 @@ from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import numpy as np
+import torch
+from torch.fx import Node
 
+from nkigym.codegen.torch_arithmetic import TorchArithmetic
 from nkigym.ops.base import CopyContract, NKIOp, _operand_role
+from nkigym.ops.grouped_tensor_scalar_reduce import packed_maximum
+from nkigym.ops.vector_dma_transpose import full_partition_packing, packed_shape, repeat_partition_rows
 
 
 class NKIFoldedLoad(NKIOp):
@@ -68,3 +73,72 @@ def grouped_context_input(array: np.ndarray, shape: tuple[int, ...], transform: 
 
 
 __all__ = ["NKIFoldedLoad", "grouped_context_input"]
+
+
+PACKING_MARKER = "nkigym_partition_pack"
+_BINARY = frozenset({"add", "sub", "subtract", "mul", "multiply", "maximum", "minimum"})
+_CASTS = frozenset({"float", "to", "astype", "view_as"})
+
+
+def _operation(node: Node) -> str:
+    """Return one normalized FX operation name."""
+    return str(getattr(node.target, "__name__", node.target)).removeprefix("wrapped_")
+
+
+def _shape(node: Node) -> tuple[int, ...]:
+    """Return the propagated tensor shape, if available."""
+    metadata = node.meta.get("tensor_meta", node.meta.get("example_value"))
+    shape = tuple(int(value) for value in getattr(metadata, "shape", ()))
+    while len(shape) > 2 and shape[0] == 1:
+        shape = shape[1:]
+    return shape
+
+
+def _candidate_shape(node: Node) -> tuple[int, ...] | None:
+    """Recognize shape-preserving arithmetic on a short matrix."""
+    shape = _shape(node)
+    native = node.meta.get("arithmetic") == "native"
+    operations = _BINARY | _CASTS | {"square", "imul", "iadd", "truediv", "clamp"}
+    if native and all(packed_maximum(user) for user in node.users):
+        operations |= {"abs", "absolute"}
+    if node.op not in {"call_function", "call_method"} or _operation(node) not in operations:
+        return None
+    broadcasts = {shape, (), (*shape[:-1], 1), (shape[-1],), (1, shape[-1])} if len(shape) >= 2 else {shape}
+    if len(shape) < 2 or any(_shape(argument) not in broadcasts for argument in node.all_input_nodes):
+        return None
+    for argument in node.all_input_nodes:
+        metadata = argument.meta.get("tensor_meta", argument.meta.get("example_value"))
+        dtype = getattr(metadata, "dtype", None)
+        if _shape(argument) != shape and dtype is not None and str(dtype) not in {"torch.float32", "float32"}:
+            return None
+    return shape if packed_shape(shape, native) is not None else None
+
+
+def packing_operation(node: Node) -> bool:
+    """Count arithmetic operations whose packing amortizes layout changes."""
+    return _operation(node) in _BINARY | {"imul", "iadd", "truediv"}
+
+
+def packing_component(component: set[Node]) -> bool:
+    """Amortize reference packing at a reduction boundary with enough arithmetic."""
+    native = all(node.meta.get("arithmetic") == "native" for node in component)
+    maximum = any(packed_maximum(user) for node in component for user in node.users)
+    reduction = any(_operation(user) == "mean" for node in component for user in node.users)
+    if native and not reduction and not full_partition_packing(_shape(next(iter(component))), maximum):
+        return False
+    uniform = all(_shape(arg) == _shape(node) for node in component for arg in node.all_input_nodes)
+    return (native or reduction or uniform) and sum(packing_operation(node) for node in component) + maximum >= 2
+
+
+def direct_hbm_user(node: Node) -> bool:
+    """Recognize operations whose lowering reads the placeholder directly."""
+    return bool(node.meta.get(PACKING_MARKER)) or node.target in {torch.cumsum, torch.topk, torch.max}
+
+
+def emit_loaded_feature(source: str, shape: tuple[int, int], parts: int, emit: TorchArithmetic) -> str:
+    """Load one feature vector once and repeat its partition chunks."""
+    width = shape[1]
+    configuration = f"partitions={parts}, width={width}, pattern=[[0, {width}]], channel_multiplier=0"
+    chunks = emit.emit("NKIIota", "", configuration)
+    chunks = emit.emit("NKIPartitionSliceLoad", f"src={source}, dst={chunks}", f"start=0, rows={parts}")
+    return repeat_partition_rows(chunks, shape, parts, emit)

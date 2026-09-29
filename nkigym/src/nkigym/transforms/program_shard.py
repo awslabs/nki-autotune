@@ -389,7 +389,7 @@ class ProgramShard(Transform[ProgramShardOption]):
                 if (slot := _drain_operand(ir.tree.isa(leaf))) is not None
                 and ir.tree.isa(leaf).operand_bindings[slot].tensor == tensor
                 and (
-                    ir.tree.isa(leaf).op_cls is NKITensorCopy
+                    isinstance(ir.tree.isa(leaf).op_cls.algebraic_contract(ir.tree.isa(leaf).kwargs), CopyContract)
                     or facts.buffers[ir.tree.isa(leaf).operand_bindings["dst"].tensor].physical_dtype()
                     == facts.buffers[tensor].physical_dtype()
                 )
@@ -787,14 +787,20 @@ class ProgramShard(Transform[ProgramShardOption]):
             partial_region = replace(match.local_region, tensor=extra.name)
             drain_leaf = ir.tree.isa(match.drain_leaf)
             drain_bindings = dict(drain_leaf.operand_bindings)
-            drain_bindings["dst"] = partial_region
-            ir.tree.graph.nodes[match.drain_leaf]["data"] = replace(drain_leaf, operand_bindings=drain_bindings)
+            source_slot = _drain_operand(drain_leaf)
+            assert source_slot is not None
+            drain_bindings[source_slot] = partial_region
+            copy_kwargs = dict(drain_leaf.kwargs)
+            if native := getattr(drain_leaf.op_cls, "native_parameters", None):
+                _, copy_kwargs = native(copy_kwargs, frozenset(drain_leaf.operand_bindings))
+            ir.tree.graph.nodes[match.drain_leaf]["data"] = replace(
+                drain_leaf,
+                op_cls=NKITensorCopy,
+                operand_bindings={"src": match.accumulator_region, "dst": partial_region},
+                kwargs=copy_kwargs,
+            )
             drain_block = replace(drain_block, writes=(*drain_block.writes, partial_region))
-            inserted = [
-                builder.append(
-                    NKITensorCopy, {"src": partial_region, "dst": match.local_region}, dict(drain_leaf.kwargs), scope
-                )
-            ]
+            inserted = [builder.append(drain_leaf.op_cls, drain_bindings, dict(drain_leaf.kwargs), scope)]
         else:
             extra = replace(local_buffer, name=fresh_name(ir, f"{match.local_region.tensor}_peer"))
             peer_region = replace(match.local_region, tensor=extra.name)
@@ -825,8 +831,14 @@ class ProgramShard(Transform[ProgramShardOption]):
 def _drain_operand(leaf: ISANode) -> str | None:
     """Return the input of a plain copy or copy activation drain."""
     contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
-    if leaf.op_cls is NKITensorCopy:
-        return "src"
+    if (
+        isinstance(contract, CopyContract)
+        and not leaf.access_patterns
+        and contract.output_operand == "dst"
+        and leaf.op_cls.OPERAND_AXES[contract.input_operand] == leaf.op_cls.OPERAND_AXES["dst"] == ("P", "F")
+        and set(leaf.operand_bindings) == {contract.input_operand, "dst"}
+    ):
+        return contract.input_operand
     if (
         leaf.op_cls.NAME == "activation"
         and isinstance(contract, PointwiseContract)

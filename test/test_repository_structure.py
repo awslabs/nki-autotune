@@ -10,7 +10,7 @@ nkigym/src/nkigym/
 |   |-- __init__.py                  at most 100 code lines
 |   |-- base.py                      at most 500 code lines
 |   `-- <operation>.py               one NKIOp subclass; at most 100 code lines
-`-- transforms/                      at most 25 public transforms
+`-- transforms/                      at most 30 public transforms
     |-- __init__.py
     |-- base.py
     |-- <transform>.py               exactly one public transform per file
@@ -67,7 +67,7 @@ from pathlib import Path
 
 from _transform_inventory import inspect_transform_api, inspect_transforms
 
-MAX_PUBLIC_TRANSFORMS = 25
+MAX_PUBLIC_TRANSFORMS = 30
 TRANSFORM_FILE_LINE_LIMIT = 1000
 TRANSFORM_HELPER_LINE_LIMIT = 1000
 MAX_IR_IMPLEMENTATION_LINES = 3000

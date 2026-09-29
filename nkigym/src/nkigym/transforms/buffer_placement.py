@@ -9,7 +9,7 @@ from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.analyzer import Analyzer
-from nkigym.ir.arith.expr import Add, Const, Mul, Sub, Var
+from nkigym.ir.arith.expr import Add, Const, Mod, Mul, Sub, Var
 from nkigym.ir.buffer_placement import buffer_placement_targets, place_buffer
 from nkigym.ir.dependency import Dependency
 from nkigym.ir.dependency_rebind import rebind_unchanged_dependency
@@ -358,7 +358,7 @@ def _lifetime(
                 ir.tree.root,
             )
             end = max(end, subtree_ends[scope] + 1)
-        if node.access_patterns or any(
+        if any(node.operand_bindings[slot].tensor == tensor for slot in node.access_patterns) or any(
             isinstance((owner := ir.tree.data(nid)), BlockNode)
             and owner.annotations.keys() - {"program_shards", "predicate"}
             for nid in ancestors[leaf]
@@ -395,7 +395,7 @@ def _complete_free_axis_write(
     if not scopes[0] or len(buffer.shape) != 2 or buffer.shape[0] != buffer.partition_extent():
         return None
     loop_nid, outer = scopes[0][-1], scopes[0][:-1]
-    if loop_nid in shards or any(loop_nid in scope or scope[: len(outer)] != outer for scope in scopes[1:]):
+    if any(loop_nid in scope or scope[: len(outer)] != outer for scope in scopes[1:]):
         return None
     if any(buffer.name in ir.dependency.info(nid).writes - ir.dependency.info(nid).reads for nid in leaves[1:]):
         return None
@@ -417,14 +417,22 @@ def _complete_free_axis_write(
         return None
     region = leaf.operand_bindings[output]
     loop = ir.tree.loop(loop_nid)
+    programs = shards.get(loop_nid, 1)
+    if loop.extent % programs:
+        return None
+    local_extent = loop.extent // programs
+    """A normalized sharded loop writes every local slot once on each program."""
+    selector = (
+        Var(name=loop.loop_var) if programs == 1 else Mod(left=Var(name=loop.loop_var), right=Const(value=local_extent))
+    )
     lower, width = region.ranges[1]
     complete = (
         region.tensor == buffer.name
         and region.ranges[0] == (Const(value=0), Const(value=buffer.shape[0]))
         and isinstance(width, Const)
         and width.value > 0
-        and width.value * loop.extent == buffer.shape[1]
-        and Analyzer().can_prove_equal(lower, Mul(left=Var(name=loop.loop_var), right=width))
+        and width.value * local_extent == buffer.shape[1]
+        and Analyzer().can_prove_equal(lower, Mul(left=selector, right=width))
     )
     return (
         (

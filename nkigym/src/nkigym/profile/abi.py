@@ -9,6 +9,7 @@ import torch
 from torch.fx import GraphModule, Node
 
 from nkigym.codegen.torch_abi import (
+    astype,
     block_diagonal,
     convolution_columns,
     cross_entropy_backward,
@@ -17,7 +18,6 @@ from nkigym.codegen.torch_abi import (
     nonzero_compact,
     normalize_topk_output,
     pad_array,
-    routed_input,
     sorted_prefix,
     sparse_topk_affinity,
     standard_rope_coeff,
@@ -25,30 +25,14 @@ from nkigym.codegen.torch_abi import (
     synthetic_graph,
     token_attention_input,
 )
+from nkigym.codegen.torch_arrays import ArrayResult, _cast_output_dtypes
 from nkigym.codegen.torch_arrays import as_numpy as _as_numpy
 from nkigym.codegen.torch_arrays import flatten_output_array as _flatten_output_array
 from nkigym.codegen.torch_arrays import logical_output_shape
 from nkigym.codegen.torch_layout import Layouts
 from nkigym.ops.grouped_store import adapt_topk_input
 from nkigym.ops.hbm_column_gather import generated_kernel_inputs
-from nkigym.profile.types import InputSpecs, _physical_numpy_dtype
-
-ArrayResult = np.ndarray | tuple[np.ndarray, ...]
-
-
-def _cast_output(array: np.ndarray, name: str) -> np.ndarray:
-    """Cast one output through its physical ABI dtype."""
-    value = np.asarray(array).astype(_physical_numpy_dtype(name), copy=False)
-    return value.astype(np.float32, copy=False) if "float" in name else value
-
-
-def _cast_output_dtypes(result: ArrayResult, output_dtypes: tuple[str, ...]) -> ArrayResult:
-    """Cast adapted outputs to the dtypes allocated by the generated kernel."""
-    arrays = result if isinstance(result, tuple) else (result,)
-    if len(arrays) != len(output_dtypes):
-        raise ValueError(f"generated ABI has {len(output_dtypes)} output dtypes for {len(arrays)} arrays")
-    casted = tuple(_cast_output(array, name) for array, name in zip(arrays, output_dtypes, strict=True))
-    return casted[0] if len(casted) == 1 else casted
+from nkigym.profile.types import InputSpecs
 
 
 def reference_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | None:
@@ -72,7 +56,7 @@ def reference_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | N
         if "w_bias" in inputs:
             logits = call(operator.add, (logits, inputs["w_bias"]), shape)
         k, activation = int(bound["k"]), str(getattr(bound["act_fn"], "name", bound["act_fn"])).lower()
-        selected = graph.call_function(sorted_prefix, (logits,), {"k": k, "dim": -1, "largest": True, "sorted": True})
+        selected = graph.call_function(sorted_prefix, (logits,), {"k": k, "nan_first": False})
         values = call(operator.getitem, (selected, 0), (shape[0], k))
         indices = call(operator.getitem, (selected, 1), (shape[0], k))
         affinity = call(
@@ -87,6 +71,7 @@ def reference_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | N
         if not bool(bound.get("descending", False)):
             data = call(operator.neg, (data,), shape)
         ordered = graph.call_function(torch.argsort, (data,), {"dim": -1, "descending": True})
+        ordered.meta["native_index_order"] = True
         output = [call(operator.getitem, (ordered, (Ellipsis, slice(None, shape[-1]))), shape)]
     elif nonzero:
         shape = input_specs["input_tensor"][0]
@@ -103,26 +88,24 @@ def reference_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | N
         result = call(torch.bincount, (data,), (3, padded), groups=groups, minlength=experts)
         output = [call(operator.getitem, (result, index), (1, padded)) for index in range(3)]
     else:
-        rows = int(np.prod(input_specs["hidden"][0][:-1]))
-        hidden_width, projected = input_specs["qkv_w"][0]
+        rows, (hidden_width, projected) = int(np.prod(input_specs["hidden"][0][:-1])), input_specs["qkv_w"][0]
         matrix, row = (rows, hidden_width), (rows, 1)
-        squared = call(torch.square, (inputs["hidden"],), matrix)
-        mean = call(torch.mean, (squared,), row, dim=-1, keepdim=True)
+        hidden = call(astype, (inputs["hidden"], "float32"), matrix)
+        mean = call(torch.mean, (call(torch.square, (hidden,), matrix),), row, dim=-1, keepdim=True)
         rms = call(torch.sqrt, (call(operator.add, (mean, float(bound["eps"])), row),), row)
         inverse = call(torch.reciprocal, (rms,), row)
-        normalized = call(
-            operator.mul, (call(operator.mul, (inputs["hidden"], inverse), matrix), inputs["norm_w"]), matrix
-        )
+        gamma = call(astype, (inputs["norm_w"], "float32"), input_specs["norm_w"][0])
+        normalized = call(operator.mul, (call(operator.mul, (hidden, inverse), matrix), gamma), matrix)
         input_scale = call(operator.getitem, (inputs["qkv_in_scale"], (0, 0)), ())
         scaled = call(operator.truediv, (normalized, input_scale), matrix)
         quantized = call(torch.clamp, (scaled, -240.0, 240.0), matrix)
-        projection = call(operator.matmul, (quantized, inputs["qkv_w"]), (rows, projected))
+        weight = call(astype, (inputs["qkv_w"], "float32"), (hidden_width, projected))
+        projection = call(operator.matmul, (quantized, weight), (rows, projected))
         scales = call(operator.getitem, (inputs["qkv_w_scale"], ("scale_rows", rows)), (rows, 3))
         scales = call(operator.mul, (scales, input_scale), (rows, 3))
         q_end = min(projected, int(bound["num_q_heads"]) * int(bound["d_head"]))
         k_end = min(projected, q_end + int(bound["num_kv_heads"]) * int(bound["d_head"]))
-        ends = tuple(dict.fromkeys((0, q_end, k_end, projected)))
-        parts = []
+        ends, parts = tuple(dict.fromkeys((0, q_end, k_end, projected))), []
         for index, (start, stop) in enumerate(zip(ends, ends[1:])):
             value = call(operator.getitem, (projection, (Ellipsis, slice(start, stop))), (rows, stop - start))
             scale = call(operator.getitem, (scales, (Ellipsis, slice(index, index + 1))), (rows, 1))
@@ -170,9 +153,8 @@ def adapt_inputs(
             elif str(transform[0]).startswith("block_diagonal"):
                 array = block_diagonal(array, shape, False)
             elif transform[0] == "routed_tokens":
-                array = routed_input(
-                    f"routed_{transform[1]}", array, _as_numpy(inputs["expert_index"]), cast(int, transform[2]), shape
-                )
+                array = array.reshape(shape)
+                array = array.astype(np.float32) if transform[1] == "keys" else array
             elif transform[0] == "grouped_context":
                 array = grouped_context_input(array, shape, transform)
             elif transform[0] == "token_attention":

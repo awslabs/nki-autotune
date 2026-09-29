@@ -6,10 +6,13 @@ from typing import Any, ClassVar
 import numpy as np
 from torch.fx import Node
 
-from nkigym.codegen.torch_values import TorchValue, emit_activation
-from nkigym.ops.base import NKIOp, PointwiseContract, _operand_role
+from nkigym.codegen.torch_values import TorchValue
+from nkigym.ops.base import CopyContract, NKIOp, _operand_role
 from nkigym.ops.float32_cast import _matmul_only_uses, _vector_copy_parameters
+from nkigym.ops.float32_fma import _operation, positive_normal_sqrt_input
 from nkigym.ops.reciprocal import emit_activation_or_reciprocal
+from nkigym.ops.reinterpret_uint32 import emit_binary32_sqrt
+from nkigym.ops.rsqrt import emit_native_sqrt
 
 
 def emit_activation_with_storage(
@@ -21,8 +24,13 @@ def emit_activation_with_storage(
         raise ValueError(f"Unsupported activation storage dtype {dtype!r}")
     name = f"sbuf_{node.name}"
     native = operation == "sqrt" and node.meta.get("arithmetic") == "native"
-    activation = emit_activation if native else emit_activation_or_reciprocal
-    target = activation(source, operation, f"{name}_fp32" if dtype else name, scale, body, imports)
+    activation = emit_native_sqrt if native else emit_activation_or_reciprocal
+    output = f"{name}_fp32" if dtype else name
+    target = (
+        emit_binary32_sqrt(source, output, body, imports, positive_normal=True)
+        if operation == "sqrt" and not native and scale == 1.0 and positive_normal_sqrt_input(node, _fp32_expression)
+        else activation(source, operation, output, scale, body, imports)
+    )
     if dtype:
         imports.add("NKIBF16Cast")
         body.append(f"{name} = NKIBF16Cast()(data={target.name})")
@@ -43,6 +51,27 @@ def emit_activation_with_storage(
     return target
 
 
+def _fp32_expression(node: Node) -> bool:
+    """Resolve FP32 metadata or an explicit cast in a statically shaped graph."""
+    metadata = node.meta.get("tensor_meta", node.meta.get("example_value"))
+    dtype = getattr(metadata, "dtype", None)
+    if dtype is not None:
+        return str(dtype) in {"torch.float32", "float32"}
+    operation = _operation(node)
+    dtype = node.kwargs.get("dtype")
+    if operation in {"to", "astype"} and len(node.args) > 1:
+        dtype = node.args[1]
+    if dtype is not None or operation == "float":
+        return operation == "float" or str(dtype) in {"torch.float32", "float32"}
+    inherited = frozenset(
+        "add iadd square abs absolute sum mean reshape view detach unsqueeze squeeze contiguous "
+        "truediv div true_divide var".split()
+    )
+    return bool(
+        operation in inherited and node.args and isinstance(node.args[0], Node) and _fp32_expression(node.args[0])
+    )
+
+
 def cast_matmul_producer(source: TorchValue, node: Node, body: list[str], imports: set[str]) -> TorchValue:
     """Round an explicitly configured matmul-only producer before its layout views."""
     dtype = node.meta.get("matmul_input_dtype")
@@ -60,6 +89,8 @@ class NKIBF16Cast(NKIOp):
     """Copy one tile into a bfloat16 destination."""
 
     NAME: ClassVar[str] = "activation"
+    PARTITION_BATCH_OPERANDS: ClassVar[tuple[str, ...]] = ("data", "dst")
+    COPY_ENGINES: ClassVar[frozenset[str]] = frozenset({"vector", "scalar"})
     ISA_OPERAND_NAMES: ClassVar[dict[str, str]] = {"data": "src"}
     native_parameters = staticmethod(_vector_copy_parameters)
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {"data": ("P", "F"), "dst": ("P", "F")}
@@ -75,10 +106,10 @@ class NKIBF16Cast(NKIOp):
         super().__init__(op="copy")
 
     @classmethod
-    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> PointwiseContract:
-        """Return the value-preserving cast contract."""
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> CopyContract:
+        """Return the cast's copy dataflow contract."""
         _ = kwargs
-        return PointwiseContract(operator="copy", input_operands=("data",), output_operand="dst")
+        return CopyContract(input_operand="data", output_operand="dst")
 
     def _check_roles(self, **kwargs: Any) -> None:
         """Require an on-chip source tile."""

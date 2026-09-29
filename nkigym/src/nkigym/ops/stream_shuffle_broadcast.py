@@ -69,11 +69,12 @@ def emit_local_sort_permutation(emit: ControlEmitter, source: str, width: int, s
     data = emit.emit("NKIStreamShuffleBroadcast", f"src={source}", f"partitions={span - 1}")
     right, left = positions(span - 1, 1, 1), positions(span - 1, -1, -1)
     later = emit_clamped_gather(emit, data, right, width)
-    missing = emit.scalar("subtract", emit.binary("equal", later, later), 1.0, reverse=True)
+    missing, present = (later, data) if emit.nan_first else (data, later)
+    missing = emit.scalar("subtract", emit.binary("equal", missing, missing), 1.0, reverse=True)
     before = emit.binary(
         "maximum",
         emit.binary("greater", later, data),
-        emit.binary("multiply", missing, emit.binary("equal", data, data)),
+        emit.binary("multiply", missing, emit.binary("equal", present, present)),
     )
     inverted = emit.binary("multiply", before, emit.scalar("less", right, float(width)))
     incoming = emit_clamped_gather(emit, inverted, left, width)

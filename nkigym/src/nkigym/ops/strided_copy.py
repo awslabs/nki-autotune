@@ -1,11 +1,12 @@
 """Regular within-row selection through one native DMA copy."""
 
+from collections.abc import Mapping
 from math import prod
 from typing import Any, ClassVar
 
 import numpy as np
 
-from nkigym.ops.base import NKIOp, _operand_role
+from nkigym.ops.base import NKIOp, SliceContract, _operand_role
 
 
 class NKIStridedCopy(NKIOp):
@@ -27,6 +28,11 @@ class NKIStridedCopy(NKIOp):
         if not pattern or len(pattern) > 4 or offset < 0 or any(s < 0 or n < 1 for s, n in pattern):
             raise ValueError("strided copy requires one to four valid free-axis dimensions")
         super().__init__(pattern=pattern, offset=offset, width=prod(n for _, n in pattern))
+
+    @classmethod
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> SliceContract:
+        """Describe the ordered source positions copied without arithmetic."""
+        return SliceContract("src", "dst", 1, int(kwargs["offset"]), int(kwargs["width"]), kwargs["pattern"])
 
     def _check_roles(self, **kwargs: Any) -> None:
         """Require a rank-two SBUF source and a view within its free axis."""
