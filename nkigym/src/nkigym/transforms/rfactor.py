@@ -134,10 +134,18 @@ class _SlotRFactor:
             )
             for suffix in ("partial", "accumulator")
         )
-        append_root_buffers(ir, (partial, state))
+        leaf = ir.tree.isa(leaf_nid)
+        direct = output.physical_dtype() == "float32" and all(
+            region.tensor != output.name
+            for slot, region in leaf.operand_bindings.items()
+            if slot != match.contract.output_operand
+        )
+        if direct:
+            state = output
+        append_root_buffers(ir, (partial,) if direct else (partial, state))
         partial_region = replace(match.output_region, tensor=partial.name)
         state_region = replace(match.output_region, tensor=state.name)
-        block, leaf = ir.tree.block(match.block_nid), ir.tree.isa(leaf_nid)
+        block = ir.tree.block(match.block_nid)
         parent = ir.tree.parent(leaf_nid)
         if parent is None:
             raise AssertionError("native reduction has no enclosing scope")
@@ -181,8 +189,14 @@ class _SlotRFactor:
             {"value": match.contract.combinator.identity},
             OperationScope(row_scope, ()),
         )
-        drain = builder.append(
-            NKITensorCopy, {"src": state_region, "dst": match.output_region}, {}, OperationScope(row_scope, ())
+        drains = (
+            []
+            if direct
+            else [
+                builder.append(
+                    NKITensorCopy, {"src": state_region, "dst": match.output_region}, {}, OperationScope(row_scope, ())
+                )
+            ]
         )
         builder.parent = loop
         builder.append(leaf.op_cls, bindings, kwargs, OperationScope(replace(block, iter_values=values), ()))
@@ -198,7 +212,7 @@ class _SlotRFactor:
             {"op": match.contract.combinator.combiner},
             OperationScope(update_scope, ()),
         )
-        _replace_in_parent_children(ir.tree, parent, [leaf_nid], [initializer, loop, drain])
+        _replace_in_parent_children(ir.tree, parent, [leaf_nid], [initializer, loop, *drains])
         ir.tree.graph.remove_node(leaf_nid)
         finalize_rewrite(ir)
 

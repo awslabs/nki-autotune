@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.expr import Const, Var
+from nkigym.ir.buffer_placement import layout_satisfies_alignment
 from nkigym.ir.program_sharding import configured_program_shards
 from nkigym.ir.tree import BlockNode, Buffer, ISANode
 from nkigym.ops.base import AxisRole, CopyContract, PointwiseContract, PointwiseSequenceContract
@@ -151,11 +152,19 @@ def _match(ir: KernelIR, option: TransposeThroughPointwiseOption, children: tupl
     block = ir.tree.block(producer)
     if axes != output_axes or len(axes) != 2 or tuple(block.axis_map[axis] for axis in axes) != chain.source_axes:
         return None
-    intermediate = replace(ir.buffer(chain.output), name=produced.name)
+    representation = produced if chain.drain_block is not None else source
+    intermediate = replace(
+        ir.buffer(chain.output),
+        name=produced.name,
+        dtype=representation.dtype,
+        storage_dtype=representation.physical_dtype(),
+    )
     if (
         intermediate.partition_size is not None
         and intermediate.shape[0] % intermediate.partition_size
         or intermediate.logical_tile_count() % intermediate.list_len
+        or chain.drain_block is None
+        and not layout_satisfies_alignment(intermediate, NKIDMATranspose.OUTPUT_TILE_ALIGNMENT_BYTES["dst"])
     ):
         return None
     mapping = _swapped_axes(block.axis_map, axes)

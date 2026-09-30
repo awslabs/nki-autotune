@@ -8,19 +8,9 @@ import subprocess
 import time
 from pathlib import Path
 
-_SSH_OPTIONS = (
-    "-o",
-    "BatchMode=yes",
-    "-o",
-    "ConnectTimeout=15",
-    "-o",
-    "StrictHostKeyChecking=no",
-    "-o",
-    "ControlMaster=auto",
-    "-o",
-    "ControlPersist=30",
-    "-o",
-    "ControlPath=~/.ssh/nkigym-%C",
+_SSH_OPTIONS = tuple(
+    "-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=no "
+    "-o ControlMaster=auto -o ControlPersist=30 -o ControlPath=~/.ssh/nkigym-%C".split()
 )
 _REMOTE_PYTHON = '"$HOME"/venvs/kernel-env/bin/python'
 _REMOTE_RUN_ROOT = ".cache/nkigym-profile/runs"
@@ -120,57 +110,30 @@ def profile_over_ssh(host: str, input_path: Path, request_path: Path, output_dir
     remote_output = f"{remote_run}/output"
     remote_backend = f"{remote_run}/backend"
     rsync_shell = shlex.join(("ssh", *_SSH_OPTIONS))
+    ssh = ["ssh", *_SSH_OPTIONS, host]
+    rsync = ["rsync", "-az", "-e", rsync_shell]
     runner = _CommandRunner(timeout_s)
     upload_source = f"{input_path}/" if directory_input else str(input_path)
     upload_target = f"{host}:{remote_input}/" if directory_input else f"{host}:{remote_input}"
     try:
-        runner.run(
-            "Preparing remote profile run",
-            [
-                "ssh",
-                *_SSH_OPTIONS,
-                host,
-                (
-                    f"test -x {_REMOTE_PYTHON} && "
-                    f'mkdir -p "$HOME"/{remote_input if directory_input else remote_run} '
-                    f'"$HOME"/{remote_backend}/nkigym'
-                ),
-            ],
-            None,
+        prepare = (
+            f"test -x {_REMOTE_PYTHON} && "
+            f'mkdir -p "$HOME"/{remote_input if directory_input else remote_run} "$HOME"/{remote_backend}/nkigym'
         )
-        runner.run(
-            "Uploading current profile backend",
-            [
-                "rsync",
-                "-az",
-                *"--exclude=.cache --exclude=__pycache__ --include=*/ --include=*.py --exclude=*".split(),
-                "-e",
-                rsync_shell,
-                f"{Path(__file__).resolve().parents[1]}/",
-                f"{host}:{remote_backend}/nkigym/",
-            ],
-            None,
+        backend_files = [
+            *"--exclude=.cache --exclude=__pycache__ --include=*/ --include=*.py --exclude=*".split(),
+            f"{Path(__file__).resolve().parents[1]}/",
+            f"{host}:{remote_backend}/nkigym/",
+        ]
+        execute = (
+            f'PYTHONPATH="$HOME"/{remote_backend} {_REMOTE_PYTHON} -m nkigym.profile.worker '
+            f'{"--input" if directory_input else "--kernel"} "$HOME"/{remote_input} --output "$HOME"/{remote_output}'
         )
-        runner.run("Uploading kernel request", ["rsync", "-az", "-e", rsync_shell, upload_source, upload_target], None)
-        runner.run(
-            "Executing and profiling kernel",
-            [
-                "ssh",
-                *_SSH_OPTIONS,
-                host,
-                (
-                    f'PYTHONPATH="$HOME"/{remote_backend} {_REMOTE_PYTHON} -m nkigym.profile.worker '
-                    f'{"--input" if directory_input else "--kernel"} "$HOME"/{remote_input} '
-                    f'--output "$HOME"/{remote_output}'
-                ),
-            ],
-            request_text,
-        )
-        runner.run(
-            "Downloading profile artifacts",
-            ["rsync", "-az", "-e", rsync_shell, f"{host}:{remote_output}/", f"{output_dir}/"],
-            None,
-        )
+        runner.run("Preparing remote profile run", [*ssh, prepare], None)
+        runner.run("Uploading current profile backend", [*rsync, *backend_files], None)
+        runner.run("Uploading kernel request", [*rsync, upload_source, upload_target], None)
+        runner.run("Executing and profiling kernel", [*ssh, execute], request_text)
+        runner.run("Downloading profile artifacts", [*rsync, f"{host}:{remote_output}/", f"{output_dir}/"], None)
     finally:
         runner.cleanup(host, remote_run, False)
         (output_dir / "transport.log").write_text(runner.log, encoding="utf-8")

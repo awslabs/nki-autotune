@@ -46,15 +46,9 @@ def _main() -> None:
     inputs = _load_exact_inputs(input_dir, request.config) if args.input else None
     shutil.rmtree(output_dir, ignore_errors=True)
     output_dir.mkdir(parents=True)
+    core = available_logical_cores(request.config.lnc)[0]
     result = run_profile(
-        kernel_path=kernel_path,
-        func_name=request.func_name,
-        config=request.config,
-        output_dir=output_dir,
-        visible_core=available_logical_cores(request.config.lnc)[0],
-        compiler_jobs=None,
-        inputs=inputs,
-        capture_outputs=inputs is not None,
+        kernel_path, request.func_name, request.config, output_dir, core, None, inputs, inputs is not None
     )
     (output_dir / "result.json").write_text(json.dumps(vars(result), indent=2) + "\n", encoding="utf-8")
     if result.profiler_summary is not None:

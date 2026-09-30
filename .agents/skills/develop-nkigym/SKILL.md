@@ -1,6 +1,6 @@
 ---
 name: develop-nkigym
-description: Start or continue a persistent goal to debug and improve the NKIGym backend until all tests pass, modifying nkigym/src/nkigym and recording or updating best NKIGym ladders in kernel_library.
+description: Start or continue a persistent goal to debug and improve the NKIGym backend until all tests pass, prioritizing workload configurations with the worst NKIGym/NAKB latency ratios, modifying nkigym/src/nkigym and recording or updating best NKIGym ladders in kernel_library.
 ---
 
 # Develop NKIGym
@@ -12,6 +12,7 @@ When explicitly invoked:
 
    ```text
    Debug and improve the NKIGym backend until all repository tests pass.
+   Prioritize workload configurations with the largest NKIGym/NAKB latency ratios.
    Modify only files under nkigym/src/nkigym and kernel_library. Limit
    kernel_library edits to recording or updating best NKIGym ladders.
    Write generated runtime measurements under artifacts/nakb_latency_comparison/.
@@ -52,15 +53,38 @@ When explicitly invoked:
    result belongs to the installed ladder and backend. Preserve any source
    hashes captured with the measurement; do not stamp today's hashes onto old
    results. Keep older timings as diagnostics when freshness is unverified.
-6. Read aggregate progress from the shared record, including after resuming:
+6. On startup or resume, before choosing the next optimization target, and after
+   publishing accepted updates, read progress from the shared record:
 
    ```bash
    ~/venvs/kernel-env/bin/python -m kernel_library.nakb_comparison
    ```
 
-   Use its run ID, saved mean, coverage, and diagnostic status in summaries.
-   Do not maintain a
-   separate aggregate in `.cache/equal-weight/current-measurements.json` or
+   Rank all recorded workload configurations in
+   `artifacts/nakb_latency_comparison/measurements.json` by decreasing
+   `nkigym_latency_ms / nakb_latency_ms`. The largest ratio is the worst result
+   relative to NAKB. Include regressions and keep configurations separate so
+   family averages cannot hide a poorly performing shape. This development
+   ranking is independent of the comparison figures' display order.
+
+   Make the worst configuration the default next optimization target and
+   concentrate diagnosis, experiments, and profiling effort on the largest
+   ratios. Compare its structure with the matching expert NAKB implementation
+   and close gaps through generic atomic transformations. If another task takes
+   priority, explain the concrete reason, such as a correctness failure or a
+   shared backend fix, and retain an explicit next action for the worst case.
+   Recompute the ranking after accepted updates so attention follows the
+   current worst configurations.
+
+   In progress summaries, show the leading worst configurations in rank order
+   with configuration IDs, both latencies, ratios, and percentage latency
+   reduction, `100 * (1 - ratio)`; negative values are regressions. Report the
+   targeted configuration's before/after ratio and next action alongside the
+   run ID, saved mean, coverage, and diagnostic status. Label stale or unverified
+   rows as diagnostic, and list missing timings as unknown rather than assigning
+   them a rank.
+   Do not maintain a separate aggregate in
+   `.cache/equal-weight/current-measurements.json` or
    publish unaccepted candidate timings as measurements of installed ladders.
    Regenerate figures with:
 
@@ -81,4 +105,7 @@ When explicitly invoked:
    accepted validation results and preserve required reproduction data and
    measurement provenance. Keep reusable compiler caches and the authoritative
    records under `artifacts/nakb_latency_comparison/`.
-8. Call `update_goal` with `complete` only after all repository tests pass.
+8. Call `update_goal` with `complete` only after all repository tests pass,
+   including fresh full-registry performance acceptance:
+   `mean(nkigym_latency_ms / nakb_latency_ms) <= 0.9`, with every configuration
+   equally weighted.

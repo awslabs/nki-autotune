@@ -104,9 +104,7 @@ def _metrics(result: ProfileResult, compiler_log: str, outputs: tuple[np.ndarray
     if mfu is None or latency is None:
         missing = "mfu_estimated_percent" if mfu is None else "total_time"
         raise RuntimeError(f"profiler summary has no valid {missing}")
-    return ProfileMetrics(
-        mfu_percent=mfu * 100.0, latency_ms=latency * 1000.0, profiler_summary=summary, outputs=outputs
-    )
+    return ProfileMetrics(mfu * 100.0, latency * 1000.0, summary, outputs)
 
 
 def _summary_number(summary: dict[str, object], name: str) -> float | None:
