@@ -777,11 +777,14 @@ def _complete_prefix(ir: KernelIR, match: _Match, graph: ValueGraph, prefix: _Pr
         _rewrite_reducer_as_map(ir, final_stage, contract)
     else:
         removed_leaves |= {final_stage.reducer_leaf}
-    old = {owning_block(ir.tree, leaf) for leaf in removed_leaves if leaf in ir.tree.graph}
-    for block in old:
-        if block not in ir.tree.graph:
+    for leaf in removed_leaves:
+        if leaf not in ir.tree.graph:
             continue
-        ir.tree.graph.remove_nodes_from({block, *ir.tree.descendants(block)})
+        parent = ir.tree.parent(leaf)
+        ir.tree.graph.remove_node(leaf)
+        while parent is not None and parent != ir.tree.root and not ir.tree.children(parent):
+            node, parent = parent, ir.tree.parent(parent)
+            ir.tree.graph.remove_node(node)
     _seed_buffers(ir, buffers, frozenset())
     finalize_rewrite(ir)
 

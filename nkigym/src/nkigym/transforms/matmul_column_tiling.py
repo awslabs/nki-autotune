@@ -1,6 +1,7 @@
 """Place independent output tiles in separate Tensor Engine column groups."""
 
 from dataclasses import dataclass, replace
+from math import gcd
 
 from nkigym.ir import KernelIR
 from nkigym.ir.arith.analyzer import Analyzer
@@ -142,13 +143,9 @@ def _valid_touch(node: ISANode, slot: str, region: BufferRegion, buffer: Buffer,
     affine = affine_terms(lower)
     if not isinstance(remainder, Const) and all(value % width == 0 for value in affine.values()):
         remainder = Const(value=0)
-    return (
-        isinstance(span, Const)
-        and isinstance(remainder, Const)
-        and 0 <= remainder.value
-        and 1 <= span.value
-        and remainder.value + span.value <= width
-    )
+    alignment = gcd(width, *(abs(coefficient) for name, coefficient in affine.items() if name is not None))
+    upper = remainder.value if isinstance(remainder, Const) else width - alignment + affine.get(None, 0) % alignment
+    return isinstance(span, Const) and 0 <= upper and 1 <= span.value and upper + span.value <= width
 
 
 def _apply(ir: KernelIR, option: MatmulColumnTilingOption, match: _Layout) -> None:

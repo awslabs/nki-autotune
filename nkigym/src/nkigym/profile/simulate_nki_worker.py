@@ -155,8 +155,9 @@ def _coalesced_operand(node: ast.expr, loops: tuple[tuple[str, int], ...]) -> tu
 def _loop_info(node: ast.For) -> tuple[str, int] | None:
     """Return one simple positive constant-range loop."""
     match node:
-        case ast.For(ast.Name(id=name), ast.Call(ast.Name(id="range"), [ast.Constant(value=value)]), _, []):
-            return (name, int(value)) if isinstance(value, int) and value > 0 else None
+        case ast.For(ast.Name(id=name), ast.Call(ast.Name(id="range"), [value]), _, []):
+            form = _affine_form(value)
+            return (name, form[None]) if form and set(form) == {None} and form[None] > 0 else None
     return None
 
 
@@ -216,17 +217,114 @@ def _coalesced_call(node: ast.For) -> ast.stmt | None:
     return ast.copy_location(result, node)
 
 
+def _copy_bindings(node: ast.stmt) -> dict[str, ast.expr] | None:
+    """Recognize an ordinary unpredicated copy with explicit indexed operands."""
+    if _coalescible_call(node) != ("src", "dst"):
+        return None
+    call = cast(ast.Call, cast(ast.Expr, node).value)
+    bindings = {keyword.arg: keyword.value for keyword in call.keywords}
+    allowed = {"src", "dst", "engine", "name", "dge_mode", "oob_mode"}
+    if call.args or not {"src", "dst"} <= bindings.keys() or bindings.keys() - allowed:
+        return None
+    for name in ("src", "dst"):
+        operand = bindings[name]
+        while isinstance(operand, ast.Subscript):
+            if any(isinstance(part, (ast.Call, ast.Subscript, ast.NamedExpr)) for part in ast.walk(operand.slice)):
+                return None
+            operand = operand.value
+        if not isinstance(operand, ast.Name):
+            return None
+    if any(
+        not isinstance(value, (ast.Constant, ast.Attribute))
+        or any(isinstance(part, ast.Call) for part in ast.walk(value))
+        for name, value in bindings.items()
+        if name not in {"src", "dst"}
+    ):
+        return None
+    return {"src": bindings["src"], "dst": bindings["dst"]}
+
+
+def _copy_arrays(tree: ast.Module) -> tuple[set[str], set[str]]:
+    """Identify unshadowed input parameters and uniquely assigned fresh arrays."""
+    functions = [item for item in tree.body if isinstance(item, ast.FunctionDef)]
+    parameters = {argument.arg for item in functions for argument in item.args.args} if len(functions) == 1 else set()
+    stores: dict[str, int] = {}
+    fresh = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            stores[node.id] = stores.get(node.id, 0) + 1
+            parameters.discard(node.id)
+        if isinstance(node, ast.FunctionDef) and node not in functions:
+            parameters.difference_update(argument.arg for argument in node.args.args)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            value = node.value.elt if isinstance(node.value, ast.ListComp) else node.value
+            if (
+                isinstance(value, ast.Call)
+                and ast.unparse(value.func) == "nl.ndarray"
+                and not any(keyword.arg == "address" for keyword in value.keywords)
+            ):
+                fresh.add(node.targets[0].id)
+    return parameters, {name for name in fresh if stores[name] == 1}
+
+
+def _invariant_copy_nest(node: ast.For, parameters: set[str], fresh: set[str]) -> list[ast.stmt] | None:
+    """Hoist identical complete loads out of a positive copy-only loop.
+
+    Every other copy writes a distinct fresh allocation, so parameters cannot
+    change or alias the destination. References to the source, destination, or
+    locally bound indices outside the identical load nests reject the rewrite.
+    """
+    if _loop_info(node) is None:
+        return None
+    statements = [item for item in ast.walk(node) if isinstance(item, ast.stmt)]
+    calls = [item for item in statements if not isinstance(item, ast.For)]
+    if any(_loop_info(item) is None for item in statements if isinstance(item, ast.For)):
+        return None
+    bindings = [_copy_bindings(item) for item in calls]
+    if any(
+        bound is None or _array_root(bound["dst"]) not in fresh or _array_root(bound["src"]) not in fresh | parameters
+        for bound in bindings
+    ):
+        return None
+    groups: dict[str, list[ast.For]] = {}
+    for candidate in node.body:
+        if not isinstance(candidate, ast.For) or cast(ast.Name, node.target).id in _node_names(candidate):
+            continue
+        leaf: ast.stmt = candidate
+        while isinstance(leaf, ast.For) and len(leaf.body) == 1:
+            leaf = leaf.body[0]
+        bound = _copy_bindings(leaf)
+        if bound is None or _array_root(bound["src"]) not in parameters:
+            continue
+        groups.setdefault(ast.dump(candidate), []).append(candidate)
+    for copies in groups.values():
+        excluded = ast.Module(body=list(copies), type_ignores=[])
+        outside = _node_names(node, excluded)
+        names = _node_names(copies[0]) - {"range", "nisa", "nl", "oob_mode"}
+        if names & outside:
+            continue
+        node.body = [child for child in node.body if child not in copies] or [ast.Pass()]
+        return [copies[0], node]
+    return None
+
+
 class _CoalesceDMACopies(ast.NodeTransformer):
     """Coalesce contiguous CPU simulator calls."""
 
-    def visit_For(self, node: ast.For) -> ast.stmt:
-        """Collapse complete contiguous copy nests without moving memory accesses."""
-        return _coalesced_call(cast(ast.For, self.generic_visit(node))) or node
+    def __init__(self, tree: ast.Module) -> None:
+        """Collect allocation and parameter identities before rewriting loops."""
+        self.parameters, self.fresh = _copy_arrays(tree)
+
+    def visit_For(self, node: ast.For) -> ast.stmt | list[ast.stmt]:
+        """Coalesce contiguous copies and remove proven invariant repetitions."""
+        node = cast(ast.For, self.generic_visit(node))
+        return _invariant_copy_nest(node, self.parameters, self.fresh) or _coalesced_call(node) or node
 
 
 def _coalesce_dma_copies(source: str) -> str:
     """Coalesce proven contiguous tensor calls in standalone simulator source."""
-    tree = _CoalesceDMACopies().visit(ast.parse(source))
+    parsed = ast.parse(source)
+    tree = _CoalesceDMACopies(parsed).visit(parsed)
     return ast.unparse(ast.fix_missing_locations(tree)) + "\n"
 
 

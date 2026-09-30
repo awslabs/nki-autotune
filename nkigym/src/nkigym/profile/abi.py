@@ -8,23 +8,7 @@ import numpy as np
 import torch
 from torch.fx import GraphModule, Node
 
-from nkigym.codegen.torch_abi import (
-    astype,
-    block_diagonal,
-    convolution_columns,
-    cross_entropy_backward,
-    grouped_context_input,
-    head_grouped,
-    nonzero_compact,
-    normalize_topk_output,
-    pad_array,
-    sorted_prefix,
-    sparse_topk_affinity,
-    standard_rope_coeff,
-    standard_rope_data,
-    synthetic_graph,
-    token_attention_input,
-)
+from nkigym.codegen import torch_abi as abi
 from nkigym.codegen.torch_arrays import ArrayResult, _cast_output_dtypes
 from nkigym.codegen.torch_arrays import as_numpy as _as_numpy
 from nkigym.codegen.torch_arrays import flatten_output_array as _flatten_output_array
@@ -47,7 +31,7 @@ def reference_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | N
     static_qkv = name == "qkv_tkg_torch_ref" and getattr(bound.get("quantization_type"), "name", "") == "STATIC"
     if not (router or backward or unstable_sort or nonzero or static_qkv or metadata):
         return None
-    graph, inputs, call = synthetic_graph(input_specs)
+    graph, inputs, call = abi.synthetic_graph(input_specs)
     if router:
         rows = ((input_specs["x"][0][0] + 15) // 16) * 16
         data = call(operator.getitem, (inputs["x"], ("edge_rows", rows)), (rows, input_specs["x"][0][1]))
@@ -56,16 +40,18 @@ def reference_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | N
         if "w_bias" in inputs:
             logits = call(operator.add, (logits, inputs["w_bias"]), shape)
         k, activation = int(bound["k"]), str(getattr(bound["act_fn"], "name", bound["act_fn"])).lower()
-        selected = graph.call_function(sorted_prefix, (logits,), {"k": k, "nan_first": False})
+        selected = graph.call_function(abi.sorted_prefix, (logits,), {"k": k, "nan_first": False})
         values = call(operator.getitem, (selected, 0), (shape[0], k))
         indices = call(operator.getitem, (selected, 1), (shape[0], k))
         affinity = call(
-            sparse_topk_affinity, (logits, values, indices, activation, bool(bound.get("norm_topk_prob", False))), shape
+            abi.sparse_topk_affinity,
+            (logits, values, indices, activation, bool(bound.get("norm_topk_prob", False))),
+            shape,
         )
         output = [logits, indices, affinity]
     elif backward:
         kwargs = {"reduction": bound.get("reduction", "mean"), "positions": next(iter(input_specs.values()))[0][0]}
-        output = [graph.call_function(cross_entropy_backward, tuple(inputs.values()), kwargs)]
+        output = [graph.call_function(abi.cross_entropy_backward, tuple(inputs.values()), kwargs)]
     elif unstable_sort:
         data, shape = inputs["data"], input_specs["data"][0]
         if not bool(bound.get("descending", False)):
@@ -79,7 +65,7 @@ def reference_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | N
         columns, tokens = (1, shape[-1]) if combined else (shape[1], shape[0])
         transform = ("nonzero_flat", columns, tokens)
         data = call(operator.getitem, (inputs["input_tensor"], transform), (1, columns * tokens))
-        output = [call(nonzero_compact, (data, columns, tokens), (1, columns * (tokens + 1)))]
+        output = [call(abi.nonzero_compact, (data, columns, tokens), (1, columns * (tokens + 1)))]
     elif metadata:
         groups, experts = int(bound["replica_group_size"]), int(bound["E"])
         elements, padded = int(np.prod(input_specs["expert_index"][0])), ((groups + 127) // 128) * 128
@@ -90,16 +76,16 @@ def reference_graph(f_torch: object, input_specs: InputSpecs) -> GraphModule | N
     else:
         rows, (hidden_width, projected) = int(np.prod(input_specs["hidden"][0][:-1])), input_specs["qkv_w"][0]
         matrix, row = (rows, hidden_width), (rows, 1)
-        hidden = call(astype, (inputs["hidden"], "float32"), matrix)
+        hidden = call(abi.astype, (inputs["hidden"], "float32"), matrix)
         mean = call(torch.mean, (call(torch.square, (hidden,), matrix),), row, dim=-1, keepdim=True)
         rms = call(torch.sqrt, (call(operator.add, (mean, float(bound["eps"])), row),), row)
         inverse = call(torch.reciprocal, (rms,), row)
-        gamma = call(astype, (inputs["norm_w"], "float32"), input_specs["norm_w"][0])
+        gamma = call(abi.astype, (inputs["norm_w"], "float32"), input_specs["norm_w"][0])
         normalized = call(operator.mul, (call(operator.mul, (hidden, inverse), matrix), gamma), matrix)
         input_scale = call(operator.getitem, (inputs["qkv_in_scale"], (0, 0)), ())
         scaled = call(operator.truediv, (normalized, input_scale), matrix)
         quantized = call(torch.clamp, (scaled, -240.0, 240.0), matrix)
-        weight = call(astype, (inputs["qkv_w"], "float32"), (hidden_width, projected))
+        weight = call(abi.astype, (inputs["qkv_w"], "float32"), (hidden_width, projected))
         projection = call(operator.matmul, (quantized, weight), (rows, projected))
         scales = call(operator.getitem, (inputs["qkv_w_scale"], ("scale_rows", rows)), (rows, 3))
         scales = call(operator.mul, (scales, input_scale), (rows, 3))
@@ -130,7 +116,7 @@ def adapt_inputs(
         if name in layouts:
             transform, shape = layouts[name]
             if transform[0] == "edge_rows":
-                array = pad_array(array, shape, frozenset({0}))
+                array = abi.pad_array(array, shape, frozenset({0}))
             elif transform[0] == "scale_rows":
                 array = np.tile(array[0, :], (shape[0], 1))
             elif transform[0] == "nonzero_flat":
@@ -151,23 +137,23 @@ def adapt_inputs(
             elif transform[0] in {"wide_topk", "rotational_topk"}:
                 array = adapt_topk_input(array, transform, shape)
             elif str(transform[0]).startswith("block_diagonal"):
-                array = block_diagonal(array, shape, False)
+                array = abi.block_diagonal(array, shape, False)
             elif transform[0] == "routed_tokens":
                 array = array.reshape(shape)
                 array = array.astype(np.float32) if transform[1] == "keys" else array
             elif transform[0] == "grouped_context":
-                array = grouped_context_input(array, shape, transform)
+                array = abi.grouped_context_input(array, shape, transform)
             elif transform[0] == "token_attention":
                 kind, dimensions = cast(str, transform[1]), cast(tuple[int, int, int, int], transform[2:])
                 active_name = {"k": "k_active", "v": "v_active"}.get(kind)
                 active = None if active_name is None else _as_numpy(inputs[active_name])
-                array = token_attention_input(kind, array, active, shape, dimensions)
+                array = abi.token_attention_input(kind, array, active, shape, dimensions)
             elif transform[0] == "block_bounds":
                 sequence = cast(int, transform[1])
                 values = array.reshape(-1, sequence)
                 array = (values + np.arange(values.shape[0])[:, None] * sequence).reshape(shape)
             elif transform[0] == "im2col":
-                array = convolution_columns(array, transform, shape)
+                array = abi.convolution_columns(array, transform, shape)
             elif transform[0] == "one_hot":
                 indices = array.reshape(-1).astype(np.int64)
                 if np.any(indices < 0) or np.any(indices >= shape[1]):
@@ -183,11 +169,11 @@ def adapt_inputs(
                 view[np.arange(array.shape[0]), :, np.arange(array.shape[0])] = array.reshape(array.shape[0], -1)
                 array = matrix
             elif str(transform[0]).startswith("head_grouped"):
-                array = head_grouped(array, shape, str(transform[0]).endswith("coeff"))
+                array = abi.head_grouped(array, shape, str(transform[0]).endswith("coeff"))
             elif str(transform[0]).startswith("rope_data"):
-                array = standard_rope_data(array, shape, str(transform[0]).endswith("interleaved"))
+                array = abi.standard_rope_data(array, shape, str(transform[0]).endswith("interleaved"))
             elif transform[0] == "rope_coeff":
-                array = standard_rope_coeff(array, shape)
+                array = abi.standard_rope_coeff(array, shape)
             else:
                 permutation = tuple(item for item in transform if type(item) is int)
                 array = (
@@ -208,7 +194,7 @@ def adapt_inputs(
                 array = array.reshape(shape)
         elif kernel_specs[name][0] != input_specs[name][0]:
             array = array.reshape(-1) if len(kernel_specs[name][0]) == 1 else array.reshape(-1, array.shape[-1])
-        adapted[name] = pad_array(array, kernel_specs[name][0], edge_axes.get(name, frozenset()))
+        adapted[name] = abi.pad_array(array, kernel_specs[name][0], edge_axes.get(name, frozenset()))
     return generated_kernel_inputs(kernel_specs, adapted)
 
 
@@ -232,7 +218,7 @@ def adapt_output(
         elif isinstance(value, (torch.Tensor, np.ndarray)):
             array = _as_numpy(value)
             if output_layout is not None and output_layout.startswith("block_diagonal") and array.ndim == 3:
-                array = block_diagonal(
+                array = abi.block_diagonal(
                     array, logical_output_shape(output_shapes, output_groups, len(leaves)), output_layout.endswith("_t")
                 )
             elif output_layout == "token_attention" and array.ndim == 4:
@@ -242,12 +228,12 @@ def adapt_output(
                     .reshape(logical_output_shape(output_shapes, output_groups, len(leaves)))
                 )
             elif output_layout == "head_grouped" and array.ndim == 4:
-                array = head_grouped(array, logical_output_shape(output_shapes, output_groups, len(leaves)), False)
+                array = abi.head_grouped(array, logical_output_shape(output_shapes, output_groups, len(leaves)), False)
             elif output_layout == "cross_entropy_rows" and array.ndim == 1:
                 shape = logical_output_shape(output_shapes, output_groups, len(leaves))
                 array = array.reshape(shape[1], shape[0]).T
             elif output_layout is not None and output_layout.startswith("rope_data") and array.ndim == 4:
-                array = standard_rope_data(
+                array = abi.standard_rope_data(
                     array,
                     logical_output_shape(output_shapes, output_groups, len(leaves)),
                     output_layout.endswith("interleaved"),
@@ -276,7 +262,7 @@ def adapt_output(
         result = tuple(array[index : index + 1] for index in range(3))
     append(result)
     if sort_topk_output is not None and len(leaves) == 2 and leaves[0].shape == leaves[1].shape:
-        leaves[:2] = normalize_topk_output(leaves[0], leaves[1], sort_topk_output)
+        leaves[:2] = abi.normalize_topk_output(leaves[0], leaves[1], sort_topk_output)
     if len(leaves) != len(output_groups):
         raise ValueError(f"Torch output has {len(leaves)} tensors, expected {len(output_groups)} logical outputs")
     expanded: list[np.ndarray] = []
@@ -290,7 +276,7 @@ def adapt_output(
         expanded.extend(np.split(array, ends[:-1], axis=axis))
         shape_index += group_size
     leaves = [
-        pad_array(
+        abi.pad_array(
             array.reshape(shape) if array.size == int(np.prod(shape)) else array, shape, frozenset(range(len(shape)))
         )
         for array, shape in zip(expanded, output_shapes, strict=True)

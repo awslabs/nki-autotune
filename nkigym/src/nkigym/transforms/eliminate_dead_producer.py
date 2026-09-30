@@ -65,10 +65,10 @@ class EliminateDeadProducer(Transform[EliminateDeadProducerOption]):
         shards = configured_program_shards(result)
         _replace_in_parent_children(result.tree, parent, [copied.block_nid], [])
         result.tree.graph.remove_nodes_from(removed)
-        while isinstance(result.tree.data(parent), ForNode) and not result.tree.children(parent):
+        while parent != result.tree.root and not result.tree.children(parent):
             ancestor = result.tree.parent(parent)
             if ancestor is None:
-                raise AssertionError("an empty loop has no parent")
+                raise AssertionError("an empty scope has no parent")
             removed.add(parent)
             result.tree.graph.remove_node(parent)
             parent = ancestor

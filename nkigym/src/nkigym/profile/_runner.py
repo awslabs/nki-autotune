@@ -77,11 +77,7 @@ def _capture_outputs(
     command = [
         "neuron-explorer",
         "capture",
-        "--disable-profile",
-        "--save-output",
-        "--num-exec=1",
-        "--profile-nth-exec=0",
-        "--neff",
+        *"--disable-profile --save-output --num-exec=1 --profile-nth-exec=0 --neff".split(),
         str(neff_path),
         *input_args,
     ]
@@ -162,10 +158,4 @@ def run_profile(
             except Exception:
                 error_text = traceback.format_exc()
             profile_s = time.monotonic() - profile_started
-    return ProfileResult(
-        profiler_summary=summary,
-        error=error_text,
-        elapsed_s=time.monotonic() - started,
-        compile_s=compile_s,
-        profile_s=profile_s,
-    )
+    return ProfileResult(summary, error_text, time.monotonic() - started, compile_s, profile_s)

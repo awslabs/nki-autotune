@@ -239,29 +239,15 @@ def _run_remote_batch(host: str, request_path: Path, result_path: Path, timeout_
         subprocess.run(("pigz", "-1", "-f", str(request_path)), check=True)
         request_path = Path(f"{request_path}.gz")
     try:
-        runner.run(
-            "Checking remote simulation environment",
-            [
-                "ssh",
-                *_SSH_WORKER_OPTIONS,
-                host,
-                (
-                    f"test -x {_REMOTE_PYTHON} && "
-                    f"{_REMOTE_PYTHON} -c 'import nki, numpy' && "
-                    f'mkdir -p "$HOME"/{remote_run}'
-                ),
-            ],
-            None,
+        prepare = (
+            f"test -x {_REMOTE_PYTHON} && "
+            f"{_REMOTE_PYTHON} -c 'import nki, numpy' && "
+            f'mkdir -p "$HOME"/{remote_run}'
         )
+        runner.run("Checking remote simulation environment", ["ssh", *_SSH_WORKER_OPTIONS, host, prepare], None)
+        worker = str(Path(__file__).with_name("simulate_nki_worker.py").resolve())
         runner.run(
-            "Uploading simulation batch",
-            [
-                *rsync_command,
-                str(Path(__file__).with_name("simulate_nki_worker.py").resolve()),
-                str(request_path),
-                f"{host}:{remote_run}/",
-            ],
-            None,
+            "Uploading simulation batch", [*rsync_command, worker, str(request_path), f"{host}:{remote_run}/"], None
         )
         _start_remote_worker(host, remote_run, runner)
         _wait_for_remote_result(host, remote_run, runner)
