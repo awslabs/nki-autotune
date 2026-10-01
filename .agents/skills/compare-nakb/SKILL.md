@@ -105,5 +105,5 @@ results is a separate operation, not a prerequisite for plotting.
 Keep the plotting implementation in `scripts/plot_nakb_comparison.py` and reuse
 statistics and validation from `kernel_library/nakb_comparison.py`. Do not create
 duplicate plotting scripts or aggregate measurement records. See the
-[saved-measurements documentation](../../../README.md#saved-measurements-and-comparison-figures)
+[saved-measurements documentation](../../../docs/validation.md#read-saved-measurements)
 for the maintained schema and environment setup.

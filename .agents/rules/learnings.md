@@ -5,7 +5,7 @@
 3. **Prioritize individual configurations by descending NKIGym/NAKB latency ratio.** Target the worst and re-rank after accepted updates. Explain diversions for correctness or shared fixes; retain the worst case's next action. Missing timings remain unknown. *(2026-09-30 22:00 ET)*
 4. **The optimization target is the literal manual-ladder endpoint.** Verify the expert source branch matches the frozen configuration. When MFU is flat, diff against that endpoint and close structural differences through atomic actions. *(2026-09-30 22:00 ET)*
 5. **Respect execution scope.** Optimization progress means current NAKB comparison. Test status requests need pass/fail, durations, and seeds without fixes or coverage changes. Stop implement-only requests before execution; preserve expected failures until fixes are requested. *(2026-09-30 22:00 ET)*
-6. **Use only `gym-trn2-1` for remote work, including CPU simulation and profiling.** *(2026-09-30 22:00 ET)*
+6. **Use caller-supplied hosts for remote work, including CPU simulation and profiling.** Keep hostnames and access configuration outside tracked project guidance. *(2026-10-01)*
 7. **`$develop-nkigym` limits source edits to `nkigym/src/nkigym/` and best-ladder records in `kernel_library/`.** Measurements, figures, and stale-cache cleanup are allowed exceptions; current authorization overrides resumed tracker restrictions. *(2026-09-30 22:00 ET)*
 8. **Run `$develop-nkigym` as a persistent Codex goal until all repository tests pass.** Start immediately with goal tools; checkpoints are not completion. Explicit resume overrides stale tracker status. Pytest owns acceptance; add no second prompt. *(2026-09-30 22:00 ET)*
 9. **Performance acceptance requires full-registry `mean(nkigym_latency_ms / nakb_latency_ms) <= 0.9`.** Equally weight configurations, including regressions. Require correctness and a fresh complete run; draw a random 63-bit seed per benchmark and reserve `NKIGYM_NAKB_VALIDATION_SEED` for reproduction. *(2026-09-30 22:00 ET)*
@@ -23,7 +23,7 @@
 21. **Capture source hashes when measuring runtimes.** `updated_utc` records saving. Regenerated kernels cannot establish the original backend version; never attach current hashes to historical timings. *(2026-09-30 22:00 ET)*
 22. **Check `nkigym.__file__` and the transform registry under pytest.** Editable installs pin worktrees; pytest's configured `pythonpath` can override `PYTHONPATH`. *(2026-09-30 22:00 ET)*
 23. **Keep acceptance uninterrupted and isolate timed rollouts.** Pausing the controller leaves SSH deadlines running. Competing simulations consume the fixed 600-second budget. *(2026-09-30 22:00 ET)*
-24. **Promptly remove stale generated caches.** During `$develop-nkigym`, check on startup/resume, after batches, and before checkpoints, locally and on `gym-trn2-1`. Delete only unused paths; retain reusable caches, active/planned run inputs, and validation/reproduction evidence. *(2026-09-30 22:00 ET)*
+24. **Promptly remove stale generated caches.** During `$develop-nkigym`, check on startup/resume, after batches, and before checkpoints, locally and on the configured workers. Delete only unused paths; retain reusable caches, active/planned run inputs, and validation/reproduction evidence. *(2026-10-01)*
 25. **Isolate repository structure scans from Torch jobs and experimental sources.** Scans include ignored Python and live Torch temporaries. Archive intentionally invalid fixtures; keep transient snapshots outside scanned paths. *(2026-09-30 22:00 ET)*
 26. **Public transforms define typed `analyze(ir)` and `apply(ir, option)` directly.** `apply` rechecks legality, copies, and fails loudly. Preserve independent settings such as `no_reorder`. The ordered `PUBLIC_TRANSFORM_TYPES`/`public_transforms()` registry must match source-discovered transforms. *(2026-09-30 22:00 ET)*
 27. **Analyze all transforms in the worker owning the rollout IR.** Avoid per-transform serialization. Cache topology/access/pipeline facts per `KernelTree` in `WeakKeyDictionary`; invalidate mutation-sensitive facts after rewrites. Performance changes must preserve option order for seed reproduction. *(2026-09-30 22:00 ET)*
@@ -76,4 +76,4 @@
 74. **Git skills must not add a Claude co-author.** Consolidate unpushed commits non-interactively with `git commit-tree` on each group's end tree; preserve the final tree byte-for-byte and verify an empty diff before moving the ref. *(2026-09-30 22:00 ET)*
 75. **Mention dates in progress updates only when they affect the task.** *(2026-09-30 22:00 ET)*
 
-*Last updated: 2026-09-30 21:33 ET*
+*Last updated: 2026-10-01*
