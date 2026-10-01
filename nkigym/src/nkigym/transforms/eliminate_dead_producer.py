@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from nkigym.ir import KernelIR
-from nkigym.ir.arith import Const
 from nkigym.ir.program_sharding import PROGRAM_SHARDS_ANNOTATION, configured_program_shards
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode
 from nkigym.ops.base import CopyContract, PermutationContract, PointwiseContract, ReductionContract, SliceContract
@@ -135,24 +134,37 @@ class EliminateDeadProducer(Transform[EliminateDeadProducerOption]):
 
 
 def _plain_full_write(ir: KernelIR, leaf_nid: int, region: BufferRegion) -> bool:
-    """Require one unconditional root-level instruction writing an exact region."""
+    """Require a contract-declared, non-accumulating write of the exact region."""
     leaf = ir.tree.isa(leaf_nid)
-    block_nid = ir.tree.parent(leaf_nid)
-    if block_nid is None or not isinstance(ir.tree.data(block_nid), BlockNode):
-        return False
-    if (
-        ir.tree.parent(block_nid) != ir.tree.root
-        or ir.tree.children(block_nid) != [leaf_nid]
-        or ir.tree.block(block_nid).annotations
-        or leaf.op_cls.rmw_operands(leaf.kwargs)
-        or any(not isinstance(expr, Const) for pair in region.ranges for expr in pair)
-    ):
+    if leaf.op_cls.rmw_operands(leaf.kwargs):
         return False
     contract = leaf.op_cls.algebraic_contract(leaf.kwargs)
-    return (
-        isinstance(contract, (CopyContract, PermutationContract, PointwiseContract, SliceContract))
-        and leaf.operand_bindings.get(contract.output_operand) == region
-        and contract.output_operand not in leaf.access_patterns
+    if not isinstance(
+        contract, (CopyContract, PermutationContract, PointwiseContract, SliceContract, ReductionContract)
+    ):
+        return False
+    outputs = (contract.output_operand,)
+    if isinstance(contract, ReductionContract) and contract.mapped_output_operand is not None:
+        outputs += (contract.mapped_output_operand,)
+    return any(
+        leaf.operand_bindings.get(operand) == region and operand not in leaf.access_patterns for operand in outputs
+    )
+
+
+def _same_execution_scope(ir: KernelIR, left: int, right: int) -> bool:
+    """Require identical loop and predicate scopes without per-operation sharding."""
+    scopes = [
+        tuple(
+            nid
+            for nid in ir.tree.ancestors(leaf)
+            if isinstance(ir.tree.data(nid), ForNode)
+            or isinstance(ir.tree.data(nid), BlockNode)
+            and ir.tree.block(nid).annotations
+        )
+        for leaf in (left, right)
+    ]
+    return scopes[0] == scopes[1] and all(
+        ir.tree.isa(leaf).kwargs.get("program_ownership") is None for leaf in (left, right)
     )
 
 
@@ -163,8 +175,8 @@ def _unobserved_write(
 
     The candidate owns no allocations, so deleting its block cannot move or
     remove live storage. A later read of any part of the tensor rejects the
-    match. The first later write must unconditionally cover the exact same
-    region. A trailing write is removable only when every read precedes its
+    match. The first later write must cover the exact same region in the same
+    execution scope. A trailing write is removable only when every read precedes its
     entire enclosing loop region, excluding reads from later iterations.
     """
     if ir.tree.block(block_nid).alloc_buffers or ir.buffer(output.tensor).location not in {"sbuf", "psum"}:
@@ -188,8 +200,8 @@ def _unobserved_write(
         if output.tensor in access.reads:
             return False
         if output.tensor in access.writes:
-            return _plain_full_write(ir, nid, output)
-    return True
+            return _same_execution_scope(ir, leaf_nid, nid) and _plain_full_write(ir, nid, output)
+    return False
 
 
 __all__ = ["EliminateDeadProducer", "EliminateDeadProducerOption"]

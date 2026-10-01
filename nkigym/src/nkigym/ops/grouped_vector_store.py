@@ -5,8 +5,10 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+from nkigym.codegen.torch_arithmetic import TorchArithmetic
 from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import CopyContract, NKIOp, _operand_role
+from nkigym.ops.flat_chunk_load import repeat_row_vector, restore_chunk_rows
 from nkigym.ops.grouped_vector_broadcast import emit_grouped_compensated_sum
 
 
@@ -61,9 +63,14 @@ def emit_grouped_cross_entropy(
         raise ValueError("grouped cross entropy requires uniformly packed vocabulary chunks")
     width, base = vocab // chunks, f"sbuf_{stem}"
     config = f"groups={groups}, partitions={partitions}"
-    chunked = f"{config}, chunks={chunks}, width={width}"
+    max_chunked = f"{config}, chunks={chunks}, width={width}"
+    factor = max(value for value in range(1, 128 // partitions + 1) if chunks % value == 0) if groups == 1 else 1
+    partial_config = f"groups={groups}, partitions={partitions * factor}, chunks={chunks // factor}"
+    chunked = f"{partial_config}, width={width}"
+    load_op, source = ("NKIFlatChunkLoad", flat_logits.name) if factor > 1 else ("NKIGroupedChunkLoad", logits.name)
+    emit = TorchArithmetic(f"{base}_layout", body, imports)
     imports.update(
-        "NKIGroupedChunkLoad NKIGroupedMapReduce NKIGroupedVectorActivation NKIGroupedVectorBinary "
+        f"NKIGroupedChunkLoad {load_op} NKIGroupedMapReduce NKIGroupedVectorActivation NKIGroupedVectorBinary "
         "NKIGroupedVectorStore NKIHBMColumnGather NKILoad".split()
     )
     maximum = f"{base}_max_parts"
@@ -71,8 +78,8 @@ def emit_grouped_cross_entropy(
         (
             f"{base}_targets = NKILoad()(src={targets.name})",
             f"{base}_target = NKIHBMColumnGather({config})(src={flat_logits.name}, indices={base}_targets)",
-            f"{base}_max_logits = NKIGroupedChunkLoad({chunked})(src={logits.name})",
-            f'{base}_max_values, {base}_max_parts = NKIGroupedMapReduce({chunked}, op="copy", reduce_op="max")'
+            f"{base}_max_logits = NKIGroupedChunkLoad({max_chunked})(src={logits.name})",
+            f'{base}_max_values, {base}_max_parts = NKIGroupedMapReduce({max_chunked}, op="copy", reduce_op="max")'
             f"(data={base}_max_logits)",
         )
     )
@@ -82,28 +89,26 @@ def emit_grouped_cross_entropy(
         body.append(f'{maximum} = NKIGroupedTileReduce({config}, chunks={chunks}, op="max")(data={base}_max_parts)')
     body.extend(
         (
-            f"{base}_logits = NKIGroupedChunkLoad({chunked})(src={logits.name})",
+            f"{base}_logits = {load_op}({chunked})(src={source})",
             f'{base}_negative_maximum = NKIGroupedVectorActivation({config}, op="copy", scale=-1.0)'
             f"(data={maximum})",
-            f'{base}_exp, {base}_sum_parts = NKIGroupedMapReduce({chunked}, op="exp", reduce_op="add")'
-            f"(data={base}_logits, bias={base}_negative_maximum)",
         )
+    )
+    bias = repeat_row_vector(f"{base}_negative_maximum", partitions, factor, emit)
+    body.append(
+        f'{base}_exp, {base}_sum_parts = NKIGroupedMapReduce({chunked}, op="exp", reduce_op="add")'
+        f"(data={base}_logits, bias={bias})"
     )
     total = f"{base}_sum_parts"
     if chunks > 1:
-        total = emit_grouped_compensated_sum(
-            base, logits.name, f"{base}_negative_maximum", chunked, width, body, imports
-        )
+        total = emit_grouped_compensated_sum(base, partial_config, width, body, imports)
+        total = restore_chunk_rows(total, partitions, factor, emit)
         body.append(f'{base}_total = NKIGroupedTileReduce({config}, chunks={chunks}, op="add")(data={total})')
         total = f"{base}_total"
     body.extend(
         (
             f'{base}_logged = NKIGroupedVectorActivation({config}, op="log")(data={total})',
             f'{base}_lse = NKIGroupedVectorBinary({config}, op="add")' f"(data1={base}_logged, data2={maximum})",
-        )
-    )
-    body.extend(
-        (
             f'{base}_loss = NKIGroupedVectorBinary({config}, op="subtract")' f"(data1={base}_lse, data2={base}_target)",
             f"hbm_{stem}_loss = NKIGroupedVectorStore({config})(src={base}_loss)",
             f"hbm_{stem}_lse = NKIGroupedVectorStore({config})(src={base}_lse)",

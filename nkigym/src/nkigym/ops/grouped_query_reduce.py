@@ -3,10 +3,29 @@
 from typing import Any, ClassVar
 
 import numpy as np
+from torch.fx import Node
 
 from nkigym.ops.base import AxisRole, NKIOp, _operand_role
 
 _REDUCTIONS = {"add": np.sum, "max": np.max, "maximum": np.max}
+
+
+def packed_maximum(node: Node) -> bool:
+    """Recognize native row maxima whose result contains values only."""
+    name = str(getattr(node.target, "__name__", node.target)).removeprefix("wrapped_")
+    dimension = node.kwargs.get("dim", node.kwargs.get("axis"))
+    indexed = all(
+        str(getattr(user.target, "__name__", user.target)).removeprefix("wrapped_") == "getitem" for user in node.users
+    )
+    values_only = indexed and all(user.args[1] == 0 for user in node.users)
+    return (
+        name == "max"
+        and node.meta.get("arithmetic") == "native"
+        and isinstance(dimension, int)
+        and dimension == -1
+        and node.kwargs.get("keepdim", node.kwargs.get("keepdims")) is True
+        and (values_only if node.op == "call_method" else not indexed)
+    )
 
 
 class NKIGroupedQueryReduce(NKIOp):
