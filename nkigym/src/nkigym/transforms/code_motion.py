@@ -19,7 +19,7 @@ from nkigym.ir.dependency import (
 from nkigym.ir.interval import regions_disjoint
 from nkigym.ir.tree import BlockNode, BufferRegion, ForNode, ISANode, KernelTree
 from nkigym.ops.base import AxisRole
-from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, block_moves, copy_for_rewrite
+from nkigym.transforms.base import Transform, TransformLegalityError, TransformOption, copy_for_rewrite
 from nkigym.transforms.copy_propagation import independent_loop_accesses
 from nkigym.transforms.helper.access_pattern import subtree_has_access_patterns
 from nkigym.transforms.helper.normalize import _substitute_block_regions
@@ -161,7 +161,7 @@ def _move(ir: KernelIR, block_nid: int, target_loop_nid: int, index: int) -> Non
     """Relocate a block while preserving its required loop iterations."""
     tree = ir.tree
     same_parent = tree.parent(block_nid) == target_loop_nid
-    if same_parent or (block_nid, target_loop_nid, index) in block_moves(ir):
+    if same_parent:
         _splice_under_target(tree, block_nid, target_loop_nid, index)
     else:
         plan = _prefix_plan(tree, block_nid, target_loop_nid)
@@ -1075,12 +1075,10 @@ class CodeMotionOption(TransformOption):
 
 
 class CodeMotion(Transform[CodeMotionOption]):
-    """Relocate one block under a target loop (the merged former ComputeAt/ReverseComputeAt).
+    """Move one ISA operation across one loop, block, or sibling boundary.
 
-    Legality is dependency-ordering (span-promotion) + the structural same-prefix
-    merge + the reduction-replication guard. There is NO output-block guard: the
-    block writing the return tensor is relocatable when ordering permits (e.g. the
-    k11->k12 store-sink under the matmul's N loop).
+    The selected subtree contains exactly one ISA leaf. Enclosing loops retain
+    that operation's iteration domain; allocation placement is a separate action.
     """
 
     def apply(self, ir: KernelIR, option: CodeMotionOption) -> KernelIR:
@@ -1160,7 +1158,7 @@ class CodeMotion(Transform[CodeMotionOption]):
                     CodeMotionOption(block_nid=block_nid, target_loop_nid=target_nid, index=index)
                     for index in selected_indices
                 )
-        return [*options, *(CodeMotionOption(*fields) for fields in block_moves(ir))]
+        return options
 
     def _legal_indices(self, ir: KernelIR, block_nid: int, target_nid: int) -> list[int]:
         """Slots in the insertion gap (lp, fc] among the target loop's children.
@@ -1218,8 +1216,6 @@ class CodeMotion(Transform[CodeMotionOption]):
     def _check_legality(self, ir: KernelIR, option: CodeMotionOption) -> None:
         """Structural checks (target/block in graph, target a ForNode, target not a
         descendant of the block) then span-promotion ordering. No output guard."""
-        if (option.block_nid, option.target_loop_nid, option.index) in block_moves(ir):
-            return
         self._check_static_legality(ir, option.block_nid, option.target_loop_nid, None)
         if ir.tree.parent(option.block_nid) != option.target_loop_nid:
             legal_indices = self._legal_indices(ir, option.block_nid, option.target_loop_nid)

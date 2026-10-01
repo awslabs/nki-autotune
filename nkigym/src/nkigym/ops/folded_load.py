@@ -9,7 +9,7 @@ from torch.fx import Node
 
 from nkigym.codegen.torch_arithmetic import TorchArithmetic
 from nkigym.ops.base import CopyContract, NKIOp, _operand_role
-from nkigym.ops.grouped_tensor_scalar_reduce import packed_maximum
+from nkigym.ops.grouped_query_reduce import packed_maximum
 from nkigym.ops.vector_dma_transpose import full_partition_packing, packed_shape, repeat_partition_rows
 
 

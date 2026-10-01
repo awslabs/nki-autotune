@@ -66,9 +66,11 @@ def emit_small_prefix(
     indices = emit.emit("NKIFindIndex8", f"data={working}, vals={values}")
     selected = emit.slice(values, 0, count)
     strict = emit.binary("greater", selected, emit.slice(values, 1, count))
-    scanned = emit.emit("NKITensorScalarCumulative", f"src={strict}", "op0='add', op1='add', imm0=0.0")
-    strict_count = emit.slice(scanned, count - 1, 1)
-    guard = emit.scalar("multiply", emit.scalar("equal", strict_count, float(count)), valid)
+    guard = emit.emit(
+        "NKIGroupedTensorScalarReduce",
+        f"data={strict}, operand0={valid}",
+        f"groups=1, partitions={partitions}, op0='multiply', reduce_op='minimum'",
+    )
     if partitions > 1 and not per_partition:
         guard = emit.scalar("equal", emit_partition_sum(emit, guard), float(partitions))
     return selected, emit.slice(indices, 0, count), guard

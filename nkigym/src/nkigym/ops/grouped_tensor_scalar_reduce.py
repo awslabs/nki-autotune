@@ -1,38 +1,21 @@
 """Grouped tensor-scalar maps with fused free-axis reductions."""
 
 from collections.abc import Mapping
+from functools import partial
 from typing import Any, ClassVar
 
 import numpy as np
-from torch.fx import Node
 
 from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import AxisRole, NKIOp, ReductionContract, _operand_role, reduction_combinator
+from nkigym.ops.tensor_reduce import _minimum_reduce
 
-_OPERATIONS = {"equal": np.equal, "less": np.less}
-_REDUCTIONS = {"add": np.sum}
-
-
-def packed_maximum(node: Node) -> bool:
-    """Recognize native row maxima whose result contains values only."""
-    name = str(getattr(node.target, "__name__", node.target)).removeprefix("wrapped_")
-    dimension = node.kwargs.get("dim", node.kwargs.get("axis"))
-    indexed = all(
-        str(getattr(user.target, "__name__", user.target)).removeprefix("wrapped_") == "getitem" for user in node.users
-    )
-    values_only = indexed and all(user.args[1] == 0 for user in node.users)
-    return (
-        name == "max"
-        and node.meta.get("arithmetic") == "native"
-        and isinstance(dimension, int)
-        and dimension == -1
-        and node.kwargs.get("keepdim", node.kwargs.get("keepdims")) is True
-        and (values_only if node.op == "call_method" else not indexed)
-    )
+_OPERATIONS = {"equal": np.equal, "less": np.less, "multiply": np.multiply}
+_REDUCTIONS = {"add": np.sum, "minimum": partial(_minimum_reduce, reset=True)}
 
 
 class NKIGroupedTensorScalarReduce(NKIOp):
-    """Reduce comparisons against grouped thresholds over one shared matrix."""
+    """Map grouped scalar operands across shared rows, then reduce each row."""
 
     NAME: ClassVar[str] = "tensor_scalar_reduce"
     OPERAND_AXES: ClassVar[dict[str, tuple[str, ...]]] = {
@@ -60,13 +43,15 @@ class NKIGroupedTensorScalarReduce(NKIOp):
 
     def __init__(self, groups: int, partitions: int, op0: str, reduce_op: str) -> None:
         """Configure grouped thresholds and the fused reduction."""
-        if op0 not in _OPERATIONS or reduce_op not in _REDUCTIONS:
+        if (op0, reduce_op) not in {("equal", "add"), ("less", "add"), ("multiply", "minimum")}:
             raise ValueError(f"unsupported grouped tensor-scalar reduction {op0!r}/{reduce_op!r}")
         super().__init__(groups=groups, partitions=partitions, op0=op0, reduce_op=reduce_op)
 
     @classmethod
-    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> ReductionContract:
-        """Return the configured comparison-reduction contract."""
+    def algebraic_contract(cls, kwargs: Mapping[str, Any]) -> ReductionContract | None:
+        """Describe comparisons; grouped broadcast products remain opaque."""
+        if kwargs["op0"] == "multiply":
+            return None
         return ReductionContract(
             input_operand="data",
             output_operand="reduce_res",

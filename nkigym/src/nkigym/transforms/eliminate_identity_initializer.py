@@ -188,7 +188,7 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             initializer_region is None
             or reduction_region is None
             or initializer_region.tensor != option.tensor
-            or not self._regions_equal(initializer_region, reduction_region)
+            or reduction_region.tensor != option.tensor
             or initializer_contract.value != identity
             or not reduction.op_cls.first_write_overwrites(output_operand, reduction.kwargs)
             or not _overwrite_is_bank_aligned(ir, reduction, output_operand)
@@ -198,7 +198,7 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
         buffer_owner = self._buffer_owner(ir, option.tensor)
         if (
             not self._matching_output_domains(
-                ir, initializer_leaf_nid, reduction_leaf_nid, initializer_region, reduction_axis
+                ir, initializer_leaf_nid, reduction_leaf_nid, (initializer_region, reduction_region), reduction_axis
             )
             or buffer_owner is None
             or buffer_owner not in ir.tree.ancestors(initializer_leaf_nid)
@@ -225,18 +225,6 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
             reduction_axis=reduction_axis,
         )
         return result
-
-    def _regions_equal(self, lhs: BufferRegion, rhs: BufferRegion) -> bool:
-        """Return whether two regions denote the same tensor coordinates."""
-        analyzer = Analyzer()
-        return (
-            lhs.tensor == rhs.tensor
-            and len(lhs.ranges) == len(rhs.ranges)
-            and all(
-                analyzer.can_prove_equal(lhs_lower, rhs_lower) and analyzer.can_prove_equal(lhs_width, rhs_width)
-                for (lhs_lower, lhs_width), (rhs_lower, rhs_width) in zip(lhs.ranges, rhs.ranges, strict=True)
-            )
-        )
 
     def _reduction_fields(self, contract: object) -> tuple[str, str, float] | None:
         """Return output, reduction axis, and identity for supported contracts."""
@@ -272,41 +260,57 @@ class EliminateIdentityInitializer(Transform[EliminateIdentityInitializerOption]
         ir: KernelIR,
         initializer_leaf_nid: int,
         reduction_leaf_nid: int,
-        region: BufferRegion,
+        regions: tuple[BufferRegion, BufferRegion],
         reduction_axis: str,
     ) -> bool:
-        """Return whether initializer and reduction cover the same output tiles."""
-        initializer_form = self._output_domain_form(ir, initializer_leaf_nid, region)
-        reduction_form = self._output_domain_form(ir, reduction_leaf_nid, region)
-        if initializer_form is None or initializer_form != reduction_form:
-            return False
+        """Match output tiles and reset frequency within shared enclosing loops."""
         initializer_loops = self._ancestor_loops(ir, initializer_leaf_nid)
         reduction_loops = self._ancestor_loops(ir, reduction_leaf_nid)
-        output_variables = self._region_variables(region)
-        initializer_repeats = [loop for loop in initializer_loops.values() if loop.loop_var not in output_variables]
-        reduction_repeats = [loop for loop in reduction_loops.values() if loop.loop_var not in output_variables]
+        shared_loops = frozenset(initializer_loops.keys() & reduction_loops.keys())
+        initializer_form = self._output_domain_form(ir, initializer_leaf_nid, regions[0], shared_loops)
+        reduction_form = self._output_domain_form(ir, reduction_leaf_nid, regions[1], shared_loops)
+        if initializer_form is None or initializer_form != reduction_form:
+            return False
+        initializer_repeats = [
+            loop
+            for nid, loop in initializer_loops.items()
+            if nid not in shared_loops and loop.loop_var not in self._region_variables(regions[0])
+        ]
+        reduction_repeats = [
+            loop
+            for nid, loop in reduction_loops.items()
+            if nid not in shared_loops and loop.loop_var not in self._region_variables(regions[1])
+        ]
         reduction_block = ir.tree.block(owning_block(ir.tree, reduction_leaf_nid))
         concrete_axis = reduction_block.axis_map.get(reduction_axis, reduction_axis)
-        return not initializer_repeats and all(
-            self._loop_binds_axis(reduction_block, loop.loop_var, concrete_axis) for loop in reduction_repeats
+        shared_reduction = any(
+            self._loop_binds_axis(reduction_block, reduction_loops[nid].loop_var, concrete_axis) for nid in shared_loops
+        )
+        return (
+            not initializer_repeats
+            and not shared_reduction
+            and all(self._loop_binds_axis(reduction_block, loop.loop_var, concrete_axis) for loop in reduction_repeats)
         )
 
     def _output_domain_form(
-        self, ir: KernelIR, leaf_nid: int, region: BufferRegion
+        self, ir: KernelIR, leaf_nid: int, region: BufferRegion, shared_loops: frozenset[int]
     ) -> tuple[tuple[int, ...], tuple[tuple[Expr, Expr], ...]] | None:
-        """Return an alpha-normalized output iteration domain."""
+        """Normalize private output loops while retaining shared loop identities."""
         loops = self._ancestor_loops(ir, leaf_nid)
         variables = self._region_variables(region)
-        selected = [loop for loop in loops.values() if loop.loop_var in variables]
-        if len(selected) != len(variables):
+        selected = [(nid, loop) for nid, loop in loops.items() if loop.loop_var in variables]
+        if len(selected) != len(variables) or len({loop.loop_var for loop in loops.values()}) != len(loops):
             return None
         substitutions: dict[str, Expr] = {
-            loop.loop_var: Var(name=f"_output_loop_{index}") for index, loop in enumerate(selected)
+            loop.loop_var: Var(name=f"_shared_loop_{nid}" if nid in shared_loops else f"_output_loop_{index}")
+            for index, (nid, loop) in enumerate(selected)
         }
+        analyzer = Analyzer()
         ranges = tuple(
-            (substitute(lower, substitutions), substitute(width, substitutions)) for lower, width in region.ranges
+            (analyzer.simplify(substitute(lower, substitutions)), analyzer.simplify(substitute(width, substitutions)))
+            for lower, width in region.ranges
         )
-        return tuple(loop.extent for loop in selected), ranges
+        return tuple(loop.extent for _, loop in selected), ranges
 
     def _ancestor_loops(self, ir: KernelIR, leaf_nid: int) -> dict[int, ForNode]:
         """Return materialized loops enclosing one ISA leaf in execution order."""

@@ -22,7 +22,7 @@ from weakref import WeakKeyDictionary
 import networkx as nx
 
 from nkigym.ir import KernelIR, KernelTree
-from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ForNode, ISANode
+from nkigym.ir.tree import BlockNode, Buffer, BufferRegion, ISANode
 from nkigym.ops.activation import NKIActivation
 from nkigym.ops.base import PointwiseContract
 from nkigym.ops.tensor_scalar import NKITensorScalar
@@ -95,117 +95,6 @@ def software_pipeline_overlap_nodes(ir: KernelIR) -> frozenset[int]:
 def invalidate_software_pipeline_overlap(tree: KernelTree) -> None:
     """Discard cached overlap facts after pipeline annotations change."""
     _PIPELINE_OVERLAPS.pop(tree, None)
-
-
-def block_moves(ir: KernelIR) -> list[tuple[int, int, int]]:
-    """Offer compound motion across one sibling or unconditional block boundary."""
-    tree = ir.tree
-    staged = {
-        nid
-        for owner in tree.blocks()
-        if (annotation := tree.block(owner).annotations.get("software_pipeline")) is not None
-        for nid in tree.preorder(annotation["loop_nid"])
-    }
-    options = []
-    for parent in tree.preorder():
-        node = tree.data(parent)
-        if not isinstance(node, (BlockNode, ForNode)) or parent in staged:
-            continue
-        if parent != tree.root and isinstance(node, BlockNode) and node.annotations:
-            continue
-        options.extend(_sibling_block_moves(ir, parent))
-    return [*options, *_trailing_block_moves(ir)]
-
-
-def _sibling_block_moves(ir: KernelIR, parent: int) -> list[tuple[int, int, int]]:
-    """Offer independent swaps and order-preserving entry into an adjacent block."""
-    children = ir.tree.children(parent)
-    if len(children) < 2:
-        return []
-    facts: dict[int, tuple[frozenset[str], frozenset[str], frozenset[int], bool, bool]] = {}
-    owners: dict[int, int] = {}
-    for block in children:
-        if not isinstance(ir.tree.data(block), BlockNode):
-            continue
-        nodes = tuple(ir.tree.preorder(block))
-        leaves = frozenset(nid for nid in nodes if isinstance(ir.tree.data(nid), ISANode))
-        if not leaves:
-            continue
-        reads = frozenset(tensor for leaf in leaves for tensor in ir.dependency.info(leaf).reads)
-        writes = frozenset(tensor for leaf in leaves for tensor in ir.dependency.info(leaf).writes)
-        fixed = any(
-            bool(ir.tree.block(nid).annotations) for nid in nodes if isinstance(ir.tree.data(nid), BlockNode)
-        ) or any(ir.tree.isa(leaf).kwargs.get("no_reorder", False) for leaf in leaves)
-        exchange = any(ir.tree.isa(leaf).op_cls.NAME == "sendrecv" for leaf in leaves)
-        facts[block] = reads, writes, leaves, fixed, exchange
-        owners.update((leaf, block) for leaf in leaves)
-    connected = {
-        frozenset((owners[source], owners[target]))
-        for source, target in ir.dependency.graph.edges
-        if source in owners and target in owners and owners[source] != owners[target]
-    }
-    options = []
-    for index, block in enumerate(children):
-        if block not in facts:
-            continue
-        reads, writes, leaves, fixed, exchange = facts[block]
-        if fixed or len(leaves) <= 1:
-            continue
-        for target in (index - 1, index + 1):
-            if not 0 <= target < len(children) or children[target] not in facts:
-                continue
-            other = children[target]
-            other_reads, other_writes, _leaves, other_fixed, other_exchange = facts[other]
-            if not other_fixed:
-                slot = 0 if target > index else len(ir.tree.children(other))
-                options.append((block, other, slot))
-            if (
-                not other_fixed
-                and not (exchange and other_exchange)
-                and not writes & (other_reads | other_writes)
-                and not other_writes & reads
-                and frozenset((block, other)) not in connected
-            ):
-                options.append((block, parent, target))
-    return options
-
-
-def _trailing_block_moves(ir: KernelIR) -> list[tuple[int, int, int]]:
-    """Lift one trailing compound block across an unconditional allocation scope.
-
-    A BlockNode binds no executable loop variable. Moving its final child directly
-    after it preserves every ISA leaf's order and all enclosing loop iterations.
-    Buffers allocated by the crossed scope must first be placed elsewhere.
-    """
-    tree = ir.tree
-    pipeline_nodes = software_pipeline_overlap_nodes(ir)
-    options = []
-    for parent in tree.blocks():
-        target = tree.parent(parent)
-        children = tree.children(parent)
-        if target is None or len(children) < 2 or tree.block(parent).annotations:
-            continue
-        child = children[-1]
-        if not isinstance(tree.data(child), BlockNode) or child in pipeline_nodes:
-            continue
-        nodes = tuple(tree.preorder(child))
-        leaves = [nid for nid in nodes if isinstance(tree.data(nid), ISANode)]
-        if len(leaves) < 2 or any(
-            tree.block(nid).annotations for nid in nodes if isinstance(tree.data(nid), BlockNode)
-        ):
-            continue
-        if any(
-            tree.isa(nid).kwargs.get("no_reorder", False)
-            for nid in tree.preorder(parent)
-            if isinstance(tree.data(nid), ISANode)
-        ):
-            continue
-        touched = {
-            tensor for leaf in leaves for tensor in ir.dependency.info(leaf).reads | ir.dependency.info(leaf).writes
-        }
-        if touched.isdisjoint(buffer.name for buffer in tree.block(parent).alloc_buffers):
-            options.append((child, target, tree.children(target).index(parent) + 1))
-    return options
 
 
 def intersects_software_pipeline(

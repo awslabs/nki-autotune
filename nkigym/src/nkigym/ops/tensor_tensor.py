@@ -15,7 +15,7 @@ from nkigym.codegen.torch_arithmetic import TorchArithmetic
 from nkigym.codegen.torch_values import TorchValue
 from nkigym.ops.base import NKIOp, PartitionTileBatchingContract, PointwiseContract, _operand_role
 from nkigym.ops.folded_load import PACKING_MARKER, _operation
-from nkigym.ops.grouped_tensor_scalar_reduce import packed_maximum
+from nkigym.ops.grouped_query_reduce import packed_maximum
 from nkigym.ops.partition_slice_load import prepare_packed_binary
 from nkigym.ops.rsqrt import centered_variance_input
 from nkigym.ops.vector_dma_transpose import emit_packed_reduction
