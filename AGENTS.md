@@ -1,5 +1,15 @@
 Read `.agents/rules/learnings.md` before project work.
 
+## Project Documentation
+
+- `README.md` states the target goal and local quick start.
+- `docs/usage.md` covers synthesis, transformations, simulation, and profiling.
+- `CONTRIBUTING.md` describes the architecture, development workflow, and tests.
+- `docs/validation.md` defines acceptance and saved-result workflows.
+
+Remote hosts are supplied by the caller. Keep machine-specific access
+instructions, credentials, and personal checkout paths out of tracked files.
+
 ## Benchmark and Kernel Records
 
 `benchmark/` is a frozen snapshot of the NAKB targets, reference computations,

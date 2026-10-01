@@ -24,7 +24,7 @@ def _row(name: str, digest: str, seed: int, ratio: float) -> comparison.Measurem
         "source_sha256": digest,
         "kernel_sha256": "a" * 64,
         "measured_utc": "2026-09-28T00:00:00+00:00",
-        "trn2_host": "gym-trn2-1",
+        "trn2_host": "trn2-worker.example.org",
     }
 
 
@@ -53,7 +53,7 @@ def measured_repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tupl
     """Write a complete synthetic run with controllable source identities."""
     hashes = {name: "1" * 64 for name in comparison.BASELINES}
     monkeypatch.setattr(comparison, "source_state", lambda: ("initial", hashes.copy()))
-    with comparison.record_run(tmp_path, 1, ("gym-trn2-1",), ("gym-trn2-1",)) as measurements:
+    with comparison.record_run(tmp_path, 1, ("cpu-worker.example.org",), ("trn2-worker.example.org",)) as measurements:
         measurements["workloads"].update({name: _row(name, digest, 1, 0.8) for name, digest in hashes.items()})
     return tmp_path, hashes
 
@@ -153,7 +153,7 @@ def test_publisher_cannot_overwrite_active_benchmark(measured_repository: tuple[
     """Keep an ongoing explicit benchmark's checkpoint intact."""
     directory, hashes = measured_repository
     rows = {name: _row(name, digest, 2, 0.8) for name, digest in hashes.items()}
-    with comparison.record_run(directory, 2, ("gym-trn2-1",), ("gym-trn2-1",)) as active:
+    with comparison.record_run(directory, 2, ("cpu-worker.example.org",), ("trn2-worker.example.org",)) as active:
         active["workloads"].update(rows)
         with pytest.raises(RuntimeError, match="already running"):
             comparison.publish_measurements(directory, rows)

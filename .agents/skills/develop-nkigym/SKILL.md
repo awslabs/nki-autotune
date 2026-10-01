@@ -17,7 +17,7 @@ When explicitly invoked:
    kernel_library edits to recording or updating best NKIGym ladders.
    Write generated runtime measurements under artifacts/nakb_latency_comparison/.
    Save comparison figures and their JSON metadata directly under kernel_library/.
-   Promptly delete stale generated NKIGym caches locally and on gym-trn2-1
+   Promptly delete stale generated NKIGym caches locally and on configured workers
    when no active job or future run needs them, preserving validation evidence.
    Keep benchmark/ and its checksum in test/test_repository_structure.py unchanged.
    Do not modify any other repository files except for this cache cleanup.
@@ -100,7 +100,7 @@ When explicitly invoked:
    a checkpoint, promptly delete generated caches and scratch directories
    that no active job, planned run, or unresolved diagnosis needs. This includes
    obsolete local experiment and compiler outputs and completed remote run
-   directories on `gym-trn2-1`. Verify that each selected path is unused; do
+   directories on the configured workers. Verify that each selected path is unused; do
    not clear shared cache roots. Before deleting cached evidence, publish any
    accepted validation results and preserve required reproduction data and
    measurement provenance. Keep reusable compiler caches and the authoritative

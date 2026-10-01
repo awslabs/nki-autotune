@@ -1,8 +1,10 @@
 # TVM TensorIR Knowledge (for the nkigym port)
 
-Findings from reading the TVM (TIRx fork) source at `/home/weittang/workplace/tvm`
-(symlinked from `/workplace/weittang/tvm`). Namespace is `tvm.s_tir` / `tvm.tirx`,
-NOT classic `tvm.tir`. Every claim is tagged with its evidence level:
+Historical findings from a TVM TIRx fork using the `tvm.s_tir` / `tvm.tirx`
+namespaces rather than classic `tvm.tir`. Source paths below are relative to
+that checkout. The exact revision was not recorded here; verify paths and line
+numbers against the source being investigated. Every claim is tagged with its
+evidence level:
 
 - **[SRC]** — read directly in TVM source, file:line cited.
 - **[PROBE]** — confirmed by RUNNING TVM (built). The strongest evidence.
@@ -24,7 +26,7 @@ TVM is not a project dependency, and `install.sh` does not build or install it.
 The optional TVM oracle and probe tests were removed after native arithmetic
 coverage replaced them. The source findings below remain historical evidence;
 future TVM experiments require a separately built checkout and normal local test
-commands. There is no remote test transport in this repository.
+commands. There is no TVM-specific remote test transport in this repository.
 
 ## Reduction block `init` — the model [SRC]
 
@@ -134,10 +136,10 @@ guarantee is preserved (memset-into-reduction-loop → backward → reject) and 
 RFactor→fused fold is UNBLOCKED (`_check_no_reduction_axis_covered` DELETED; the narrowing
 it needed is subsumed by the init-breaks-carry clause: a memset sinks into `ko` (re-init,
 legal) but not `ki` (live accumulation)). No TVM build was needed — the ladder CPU-sim +
-an exhaustive pure-vs-simulation cross-check on gym-1 drove the decision, not a TVM oracle.
-The unrun TVM probe question is moot for our purposes: our correctness rests on the
-ladder, not on matching TVM's `region_cover` behavior. See the learnings "Code-motion
-legality = SPAN-PROMOTION" bullet.
+an exhaustive pure-vs-simulation cross-check drove the decision, not a TVM oracle.
+The unrun TVM probe was not used as acceptance evidence. For the current
+implementation, consult the
+[code-motion legality notes](../../nkigym/src/nkigym/transforms/code_motion_legality.md).
 
 ### Original parked framing (historical)
 

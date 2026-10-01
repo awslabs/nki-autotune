@@ -1,43 +1,37 @@
-## External References
+# References
 
-- **Neuronxcc compiler**: `/workplace/weittang/KaenaCompiler/neuronxcc` — source may differ slightly from the version in the Python venv, but offers a rough guide.
-- **NKI Python source and documentation**: `/home/weittang/workplace/venvs/kernel-env/lib/python3.12/site-packages/nki`
-`/workplace/weittang/private-nki-staging`
-- **NKI CPU simulator driver**: `/home/weittang/workplace/venvs/kernel-env/lib/python3.12/site-packages/nki/simulator.py`
-- **Official NKI documentation**: `https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/index.html`
-- **NKI environment setup**: `https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/get-started/setup-env.html`
-- **NKI CPU simulation**: `https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.simulate.html`
-- **NKI kernel profiling**: `https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/use-neuron-profile.html`
-- **Online Fusion Math Derivation**: `/home/weittang/workplace/online_fusion/paper`
-- **TVM Source codes**: `/home/weittang/workplace/tvm`
+## Public documentation and source
 
-## Manually Written Kernels
+- [Official NKI documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/index.html)
+- [NKI environment setup](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/get-started/setup-env.html)
+- [NKI CPU simulation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.simulate.html)
+- [NKI kernel profiling](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/guides/use-neuron-profile.html)
+- [NKI Library](https://github.com/aws-neuron/nki-library)
+- [Apache TVM](https://github.com/apache/tvm)
 
-Paths below are relative to `/home/weittang/workplace/KaenaNeuronKernelLibrary`.
+Use `python -m pip show nki neuronx-cc` in the active environment to locate
+installed packages and identify their versions. Match API and source
+investigations to those versions; current online documentation may describe a
+different release.
 
-### Attention CTE (Context Encoding / Prefill)
+The [TVM notes](tvm_knowledge.md) contain historical source findings and mark
+their evidence levels. NKIGym does not require TVM to be installed.
 
-Computes full attention for context encoding: `Output = softmax(scale * Q @ K^T) @ V`.
+## Expert-kernel reference paths
 
-- Source: `src/nkilib_src/nkilib/core/attention/attention_cte.py`
-- Golden: `src/nkilib_src/nkilib/core/attention/attention_cte_torch.py`
-- Test: `test/integration/nkilib/core/attention/test_attention_cte.py`
+These relative paths were recorded during development. Resolve them against a
+separately obtained NKI Library checkout and verify its revision and workload
+configuration before using it as an optimization reference. Upstream paths
+and implementations may change.
 
-### BWMM Shard-on-Block (MoE Blockwise MatMul, BF16)
+| Operation | Recorded source path |
+| --- | --- |
+| Attention context encoding / prefill | `src/nkilib_src/nkilib/core/attention/attention_cte.py` |
+| Attention PyTorch reference | `src/nkilib_src/nkilib/core/attention/attention_cte_torch.py` |
+| MoE blockwise matrix multiplication, BF16 | `src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_block.py` |
+| MoE blockwise matrix multiplication, MXFP4/MXFP8 | `src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_block_mx.py` |
+| Nonzero indexing | `src/nkilib_src/nkilib/experimental/subkernels/find_nonzero_indices.py` |
 
-Blockwise matrix multiplication for MoE layers with block-level sharding.
-
-- Source: `src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_block.py`
-- Test: `test/integration/nkilib/core/moe/moe_tkg/test_moe_tkg.py`
-
-### BWMM Shard-on-Block MX (MoE Blockwise MatMul, MXFP4/MXFP8)
-
-Blockwise matrix multiplication for MoE layers using MXFP4 or MXFP8 quantization.
-
-- Source: `src/nkilib_src/nkilib/core/moe/moe_cte/bwmm_shard_on_block_mx.py`
-- Test: `test/integration/nkilib/core/moe/moe_cte/test_moe_bwmm_mx_cte.py`
-
-### find_indices_non_zero (MoE Indexing Mapping)
-
-- Source: `src/nkilib_src/nkilib/experimental/subkernels/find_nonzero_indices.py`
-- Test: `test/integration/nkilib/experimental/subkernels/test_find_nonzero_indices.py`
+The in-repository `benchmark/` snapshot remains authoritative for input
+contracts, accuracy rules, and baseline latencies. External source code does
+not authorize changing that snapshot.
